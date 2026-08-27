@@ -10,8 +10,12 @@ wird alle drei Minuten überwacht. Zum Ändern von Domains startet man sie wiede
 ## Was passiert beim Start
 
 1. Windows fragt nach Administratorrechten (nötig für Aufgabenplanung, Firewall und `C:\caddy`).
-2. Eine bereits vorhandene `C:\caddy\caddyfile` wird eingelesen und in die Domainliste übernommen.
-3. Im Konsolenfenster steht eine Adresse wie `http://127.0.0.1:8787/?t=…` – der Browser öffnet sich automatisch.
+2. Eine bereits vorhandene `C:\caddy\caddyfile` wird eingelesen und in die Domainliste übernommen –
+   samt Bausteinen `(name) { … }`, `import`-Zeilen und allem, was der Manager nicht selbst kennt.
+3. Vorhandene Zertifikate werden aus dem bisherigen Speicher nach `C:\caddy\data` übernommen.
+   Ohne diesen Schritt würde Caddy alles neu beantragen und könnte in die Mengenbegrenzung
+   von Let's Encrypt laufen.
+4. Im Konsolenfenster steht eine Adresse wie `http://127.0.0.1:8787/?t=…` – der Browser öffnet sich automatisch.
 
 Fenster schließen oder Strg+C beendet nur die Oberfläche. Der Webserver läuft weiter.
 

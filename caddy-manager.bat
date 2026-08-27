@@ -587,6 +587,7 @@ function New-DefaultConfig {
             rollSize    = '10MiB'
             rollKeep    = 7
             extra       = ''
+            snippets    = ''
         }
         php     = [ordered]@{
             enabled              = $false
@@ -672,6 +673,9 @@ function Merge-Config {
         $ge = Get-StringField $g 'extra' ''
         if ($ge.Length -gt 8000) { $ge = $ge.Substring(0, 8000) }
         $out.global.extra       = $(if (Test-BalancedBraces $ge) { $ge } else { '' })
+        $sn = Get-StringField $g 'snippets' ''
+        if ($sn.Length -gt 16000) { $sn = $sn.Substring(0, 16000) }
+        $out.global.snippets    = $(if (Test-BalancedBraces $sn) { $sn } else { '' })
     }
 
     $p = Get-Field $Loaded 'php' $null
@@ -1021,7 +1025,8 @@ function Build-Caddyfile {
     Add-Line $sb 2 'format json'
     Add-Line $sb 2 ('level ' + $Config.global.logLevel)
     Add-Line $sb 1 '}'
-    if (Test-CaddyAtLeast 2 7) {
+    # Nur ergaenzen, wenn nicht schon ein eigener servers-Block uebernommen wurde
+    if ((Test-CaddyAtLeast 2 7) -and ($Config.global.extra -notmatch '(?m)^\s*servers\b')) {
         Add-Line $sb 1 'servers {'
         Add-Line $sb 2 'trusted_proxies static private_ranges'
         Add-Line $sb 1 '}'
@@ -1029,6 +1034,13 @@ function Build-Caddyfile {
     Add-RawBlock $sb 1 $Config.global.extra
     Add-Line $sb 0 '}'
     Add-Line $sb 0 ''
+
+    # Bausteine und Importe muessen vor ihrer Verwendung stehen
+    if ($Config.global.snippets -and $Config.global.snippets.Trim()) {
+        Add-Line $sb 0 '# Bausteine und Importe aus der urspruenglichen Caddyfile'
+        Add-RawBlock $sb 0 $Config.global.snippets
+        Add-Line $sb 0 ''
+    }
 
     $active = @($Config.sites | Where-Object { $_.enabled })
     if ($active.Count -eq 0) {
@@ -1298,9 +1310,22 @@ function Import-Caddyfile {
     $sites = New-Object System.Collections.ArrayList
     $skipped = New-Object System.Collections.ArrayList
 
+    $snippets = New-Object System.Collections.ArrayList
+
     foreach ($st in $statements) {
         if ($null -eq $st.body) {
+            # Ein import ausserhalb aller Bloecke gehoert unveraendert erhalten
+            if ($st.head -match '^(?i)import\s') { [void]$snippets.Add($st.head); continue }
             if ($st.head) { [void]$skipped.Add((Get-SafeString $st.head 120)) }
+            continue
+        }
+
+        # Baustein: (name) { ... } - wird woertlich uebernommen, weil Site-Bloecke
+        # ihn per import verwenden koennen.
+        if ($st.head -match '^\([A-Za-z0-9_\-\.]+\)$') {
+            $inner = @(($st.body -replace "`r`n", "`n").Split("`n") |
+                       Where-Object { $_.Trim() } | ForEach-Object { "`t" + $_.Trim() })
+            [void]$snippets.Add($st.head + ' {' + "`n" + ($inner -join "`n") + "`n" + '}')
             continue
         }
 
@@ -1314,7 +1339,6 @@ function Import-Caddyfile {
                     'admin'   { if ($tk.Count -gt 1) { $cfg.global.adminListen = (Get-SafeString $tk[1] 120) } }
                     'storage' { }
                     'log'     { }
-                    'servers' { }
                     default {
                         if ($null -eq $g.body) {
                             $cfg.global.extra = ($cfg.global.extra + "`n" + $g.head).Trim()
@@ -1361,6 +1385,10 @@ function Import-Caddyfile {
     }
 
     $cfg.sites = $sites.ToArray()
+    $joinedSnippets = ($snippets.ToArray() -join "`n`n")
+    if ($joinedSnippets.Length -le 16000 -and (Test-BalancedBraces $joinedSnippets)) {
+        $cfg.global.snippets = $joinedSnippets
+    }
     return [pscustomobject]@{ config = $cfg; imported = $sites.Count; skipped = @($skipped.ToArray()) }
 }
 
@@ -1429,6 +1457,66 @@ function Initialize-Directories {
         }
     }
     return @{ ok = $true; message = "Verzeichnisse bereit ($($created.Count) neu angelegt)"; created = @($created.ToArray()) }
+}
+
+# ---------------------------------------------------------------------------
+#  Vorhandenen Zertifikatsspeicher uebernehmen
+#
+#  Ohne "storage"-Zeile legt Caddy seine Zertifikate im Profil des ausfuehrenden
+#  Kontos ab. Der Manager setzt die Zeile auf C:\caddy\data - ohne Umzug wuerde
+#  Caddy alle Zertifikate neu beantragen und koennte in die Mengenbegrenzung von
+#  Let's Encrypt laufen. Deshalb wird ein vorhandener Speicher einmalig kopiert.
+# ---------------------------------------------------------------------------
+function Get-DefaultStorageDirs {
+    $dirs = New-Object System.Collections.ArrayList
+    try {
+        $win = $env:SystemRoot
+        if (-not $win) { $win = 'C:\Windows' }
+        $win = $win.TrimEnd('\')
+        # Bewusst ohne Join-Path: das wirft, wenn das Laufwerk nicht existiert.
+        $candidates = @(
+            ($win + '\System32\config\systemprofile\AppData\Roaming\Caddy'),
+            ($win + '\ServiceProfiles\LocalService\AppData\Roaming\Caddy'),
+            ($win + '\ServiceProfiles\NetworkService\AppData\Roaming\Caddy')
+        )
+        if ($env:AppData) { $candidates += ($env:AppData.TrimEnd('\') + '\Caddy') }
+        if ($env:LocalAppData) { $candidates += ($env:LocalAppData.TrimEnd('\') + '\Caddy') }
+        foreach ($d in $candidates) {
+            try { if (Test-Path -LiteralPath $d) { [void]$dirs.Add($d) } } catch { }
+        }
+    } catch { }
+    return ,@($dirs.ToArray())
+}
+
+function Import-CertificateStore {
+    try {
+        $target = $Paths.Data
+        if (Test-Path -LiteralPath ($target + '\certificates')) {
+            return @{ ok = $true; message = 'Zertifikatsspeicher ist bereits vorhanden.'; changed = $false }
+        }
+        foreach ($src in (Get-DefaultStorageDirs)) {
+            $certs = $src.TrimEnd('\') + '\certificates'
+            if (-not (Test-Path -LiteralPath $certs)) { continue }
+            $found = @(Get-ChildItem -LiteralPath $certs -Filter '*.crt' -Recurse -ErrorAction SilentlyContinue)
+            if ($found.Count -eq 0) { continue }
+            if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
+            Copy-Item -LiteralPath $src -Destination $target -Recurse -Force -Container -ErrorAction Stop
+            # Copy-Item legt einen Unterordner an, wenn das Ziel existiert
+            $nested = $target + '\' + (Split-Path -Leaf $src)
+            if (Test-Path -LiteralPath ($nested + '\certificates')) {
+                foreach ($item in @(Get-ChildItem -LiteralPath $nested -Force -ErrorAction SilentlyContinue)) {
+                    Move-Item -LiteralPath $item.FullName -Destination $target -Force -ErrorAction SilentlyContinue
+                }
+                Remove-Item -LiteralPath $nested -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Write-Audit 'certs.migrated' "$src -> $target ($($found.Count) Zertifikate)"
+            return @{ ok = $true; changed = $true
+                      message = "$($found.Count) vorhandene Zertifikate uebernommen - es wird nichts neu beantragt." }
+        }
+        return @{ ok = $true; message = 'Kein vorhandener Zertifikatsspeicher gefunden.'; changed = $false }
+    } catch {
+        return @{ ok = $false; message = "Zertifikate konnten nicht uebernommen werden: $($_.Exception.Message)" }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -2325,13 +2413,32 @@ function Get-CachedCertificates {
     return ,$script:CertCache
 }
 
+# Bei "storage file_system <pfad>" legt Caddy die Zertifikate unter
+# <pfad>/certificates/<aussteller>/<domain>/ ab.
+function Get-CertificateRoots {
+    $roots = New-Object System.Collections.ArrayList
+    try {
+        foreach ($c in @(($Paths.Data + '\certificates'), ($Paths.Data + '\caddy\certificates'))) {
+            if (Test-Path -LiteralPath $c) { [void]$roots.Add($c) }
+        }
+        if ($roots.Count -eq 0) {
+            foreach ($d in (Get-DefaultStorageDirs)) {
+                $c = $d.TrimEnd('\') + '\certificates'
+                if (Test-Path -LiteralPath $c) { [void]$roots.Add($c) }
+            }
+        }
+    } catch { }
+    return ,@($roots.ToArray())
+}
+
 function Get-Certificates {
     $list = New-Object System.Collections.ArrayList
-    $certRoot = Join-Path $Paths.Data 'caddy\certificates'
-    if (-not (Test-Path -LiteralPath $certRoot)) { return ,@() }
+    $roots = Get-CertificateRoots
+    if ($roots.Count -eq 0) { return ,@() }
     try {
-        $files = @(Get-ChildItem -LiteralPath $certRoot -Filter '*.crt' -Recurse -ErrorAction SilentlyContinue |
-                   Select-Object -First 200)
+        $files = @(foreach ($r in $roots) {
+                       Get-ChildItem -LiteralPath $r -Filter '*.crt' -Recurse -ErrorAction SilentlyContinue
+                   }) | Select-Object -First 200
         foreach ($f in $files) {
             try {
                 $c = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($f.FullName)
@@ -3079,6 +3186,9 @@ function Invoke-ApiRoute {
             $ge = Get-StringField $data 'globalExtra' $cfg.global.extra
             if ($ge.Length -le 8000 -and (Test-BalancedBraces $ge)) { $cfg.global.extra = $ge }
             else { Send-Json $Ctx @{ ok = $false; message = 'Die zus{ae}tzlichen globalen Zeilen haben unpaarige geschweifte Klammern.' } 400; return }
+            $sn = Get-StringField $data 'snippets' $cfg.global.snippets
+            if ($sn.Length -le 16000 -and (Test-BalancedBraces $sn)) { $cfg.global.snippets = $sn }
+            else { Send-Json $Ctx @{ ok = $false; message = 'Die Bausteine haben unpaarige geschweifte Klammern.' } 400; return }
 
             $cfg.php.enabled = Get-BoolField $data 'phpEnabled' $cfg.php.enabled
             $psz = 0
@@ -3411,6 +3521,9 @@ function Invoke-SetupStep {
             $r = Install-Automation $cfg
             [void]$notes.Add($r.message)
             foreach ($n in @($r.notes)) { [void]$notes.Add($n) }
+
+            $mig = Import-CertificateStore
+            if ($mig.changed) { [void]$notes.Add($mig.message) }
 
             $apply = Write-CaddyfileAndReload -NewText (Build-Caddyfile $cfg) -Reason 'setup'
             [void]$notes.Add($apply.message)
@@ -4493,6 +4606,14 @@ function renderSettings(el){
       <p class="sub">Landen unver{ae}ndert im globalen Optionsblock. F{ue}r Sonderf{ae}lle.</p>
       <textarea id="sExtra" rows="4">${esc(c.global.extra)}</textarea>
     </div>
+    <div class="card">
+      <h3>Bausteine und Importe</h3>
+      <p class="sub">Wiederverwendbare Bl{oe}cke in der Form <code>(name) { ... }</code> und
+         <code>import</code>-Zeilen. Sie stehen in der erzeugten Datei vor allen Domains und
+         lassen sich in einer Domain unter "Zus{ae}tzliche Caddyfile-Zeilen" mit
+         <code>import name</code> einbinden.</p>
+      <textarea id="sSnippets" rows="6" placeholder="(gemeinsam) {&#10;    encode gzip zstd&#10;}">${esc(c.global.snippets||"")}</textarea>
+    </div>
     <div class="row"><button class="btn primary" data-act="savesettings">Einstellungen speichern</button></div>`;
 }
 
@@ -4677,6 +4798,7 @@ document.addEventListener("click", async (e)=>{
       rollSize: $("#sRoll").value.trim(),
       rollKeep: $("#sKeep").value,
       globalExtra: $("#sExtra").value,
+      snippets: $("#sSnippets").value,
       phpEnabled: $("#sPhp").checked,
       phpPoolSize: $("#sPool").value,
       phpDisableRisky: $("#sRisky").checked,
@@ -4791,6 +4913,12 @@ try {
     Write-Host2 '  L{ae}uft das Fenster wirklich als Administrator?' 'DarkGray'
     exit 1
 }
+
+# --- Vorhandene Zertifikate uebernehmen, damit nichts neu beantragt wird ---
+try {
+    $mig = Import-CertificateStore
+    if ($mig.changed) { Write-Host2 ('  ' + $mig.message) 'Green'; Write-Host '' }
+} catch { }
 
 # --- Konfiguration laden, beim ersten Start vorhandene Caddyfile uebernehmen ---
 $firstRun = -not (Test-Path -LiteralPath $Paths.State)
