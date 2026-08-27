@@ -1125,7 +1125,12 @@ function Build-SiteBlock {
     if ($Site.blockSensitive -and $Site.type -ne 'proxy' -and (Test-CaddyAtLeast 2 5)) {
         Add-Line $Sb 1 '@geschuetzt {'
         Add-Line $Sb 2 'not path /.well-known/*'
-        Add-Line $Sb 2 'path */.* *.env *.log *.sql *.bak *.ini *.sqlite /composer.json /composer.lock /package-lock.json'
+        # Reihenfolge nach Herkunft: versteckte Dateien, Ablagen von Editoren,
+        # Datenbanken, Schluessel und Zertifikate, Konfigurationsreste.
+        Add-Line $Sb 2 ('path */.* *~ *.env *.log *.sql *.sqlite *.sqlite3 *.db ' +
+                        '*.bak *.old *.orig *.save *.swp *.swo *.tmp ' +
+                        '*.ini *web.config *.pem *.key *.crt *.pfx *.p12 ' +
+                        '/composer.json /composer.lock /package-lock.json')
         Add-Line $Sb 1 '}'
         Add-Line $Sb 1 'handle @geschuetzt {'
         Add-Line $Sb 2 'error 404'
@@ -2376,7 +2381,9 @@ function Get-WeakDirectoryAccess {
 }
 
 function Invoke-Icacls {
-    param([string[]]$Arguments, [int]$TimeoutSec = 300)
+    # Grosszuegig bemessen: bei vielen tausend Dateien laeuft icacls mit /T lange,
+    # und ein Abbruch mittendrin liesse den Baum halb umgestellt zurueck.
+    param([string[]]$Arguments, [int]$TimeoutSec = 1800)
     return (Invoke-Exe -FilePath "$env:SystemRoot\System32\icacls.exe" -Arguments $Arguments -TimeoutSec $TimeoutSec)
 }
 
@@ -3390,7 +3397,7 @@ function New-PasswordHash {
 # ===========================================================================
 $script:ForeignCache = $null
 $script:ForeignCacheAt = [datetime]::MinValue
-$CacheSecForeign = 300
+$CacheSecForeign = 1800
 
 function Get-CaddyProcessPaths {
     $list = New-Object System.Collections.ArrayList
@@ -3410,9 +3417,17 @@ function Get-ForeignSetup {
     $services = New-Object System.Collections.ArrayList
     $tasks = New-Object System.Collections.ArrayList
 
-    # Dienste, die caddy ausfuehren - typisch nach einer Einrichtung mit nssm oder WinSW
+    # Dienste, die caddy ausfuehren - typisch nach einer Einrichtung mit nssm oder
+    # WinSW. Der Filter laeuft in der Abfrage selbst, das ist deutlich billiger,
+    # als alle Dienste zu holen und hier zu sieben.
+    $svcList = @()
     try {
-        foreach ($s in @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue)) {
+        $svcList = @(Get-CimInstance -ClassName Win32_Service -Filter "PathName LIKE '%caddy%'" -ErrorAction Stop)
+    } catch {
+        try { $svcList = @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue) } catch { }
+    }
+    try {
+        foreach ($s in $svcList) {
             $pn = [string]$s.PathName
             if ($pn -and $pn -match '(?i)caddy') {
                 [void]$services.Add(@{ name = [string]$s.Name; display = [string]$s.DisplayName
@@ -4878,7 +4893,13 @@ document.addEventListener("click",async ev=>{
     toast(r.message,r.ok?"ok":"bad");await refresh();draw();return;}
   if(a==="sv"){const r=await api("/api/service",{action:x},"...");toast(r.message,r.ok?"ok":"bad");
     await refresh();draw();return;}
-  if(a==="fx"){const r=await api("/api/fix",{id:x},"...");toast(r.message,r.ok?"ok":"bad");
+  if(a==="fx"){
+    const FM={"harden-acl":"Dateirechte werden gesetzt. Bei vielen Dateien dauert das etwas...",
+      "setup-all":"Vollst{ae}ndige Einrichtung...","setup-tasks":"Aufgaben...",
+      "setup-firewall":"Firewall...","setup-caddy-update":"Caddy wird aktualisiert...",
+      "harden-runas":"Wird umgestellt...","create-roots":"Verzeichnisse werden angelegt...",
+      "harden-sites":"Wird angepasst...","php-ini":"php.ini wird geschrieben..."};
+    const r=await api("/api/fix",{id:x},FM[x]||"...");toast(r.message,r.ok?"ok":"bad");
     await refresh();if(view==="sec")vSec($("#vw"));else draw();return;}
   if(a==="imp"){if(!confirm("Caddyfile einlesen? Die Domainliste wird ersetzt."))return;
     const r=await api("/api/import",{},"Einlesen...");if(r.config)C=r.config;
@@ -4901,7 +4922,8 @@ document.addEventListener("click",async ev=>{
   if(a==="hs"){const r=await api("/api/hash",{password:$("#hp").value},"...");
     const o=$("#ho");o.classList.remove("hide");o.textContent=r.ok?r.hash:(r.message||"");
     if(r.ok)$("#hp").value="";return;}
-  if(a==="gw"){const r=await api("/api/acl",{account:$("#ac").value},"...");
+  if(a==="gw"){const r=await api("/api/acl",{account:$("#ac").value},
+      "Rechte werden gesetzt. Bei vielen Dateien dauert das etwas...");
     toast(r.message,r.ok?"ok":"bad");return;}
   if(a==="gs"){const r=await api("/api/settings",{email:$("#gE").value.trim(),logLevel:$("#gL").value,
       rollSize:$("#gR").value.trim(),rollKeep:$("#gK").value,globalExtra:$("#gX").value,
