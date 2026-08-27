@@ -160,7 +160,13 @@ function del(string $t, string $w, array $a = []): int { return q("DELETE FROM $
 function schema(PDO $pdo): void {
     $pdo->exec("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
     $v = (int)($pdo->query("SELECT v FROM meta WHERE k='schema'")->fetchColumn() ?: 0);
-    if ($v >= 2) { if ($v < 3) schema_v3($pdo); if ($v < 4) schema_v4($pdo); return; }
+    if ($v >= 2) {
+        if ($v < 3) schema_v3($pdo);
+        if ($v < 4) schema_v4($pdo);
+        if ($v < 5) schema_v5($pdo);
+        if ($v < 6) schema_v6($pdo);
+        return;
+    }
     $pdo->exec(<<<SQL
 CREATE TABLE users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -389,6 +395,88 @@ function schema_v4(PDO $pdo): void {
         try { $pdo->exec($sql); } catch (Throwable $e) { /* schon da */ }
     }
     $pdo->exec("INSERT INTO meta (k,v) VALUES ('schema','4') ON CONFLICT(k) DO UPDATE SET v='4'");
+    schema_v5($pdo);
+}
+/** v5: Klasse in ihre Bestandteile zerlegt, dazu Links zum Teilen. */
+function schema_v5(PDO $pdo): void {
+    foreach (["ALTER TABLE users ADD COLUMN kl_kuerzel TEXT NOT NULL DEFAULT ''",
+              "ALTER TABLE users ADD COLUMN kl_nr TEXT NOT NULL DEFAULT ''",
+              "ALTER TABLE users ADD COLUMN verkuerzt INTEGER NOT NULL DEFAULT 0"] as $sql) {
+        try { $pdo->exec($sql); } catch (Throwable $e) { /* schon da */ }
+    }
+    $pdo->exec("CREATE TABLE IF NOT EXISTS shares (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token TEXT NOT NULL UNIQUE,
+        art TEXT NOT NULL,            -- notiz | fach | bericht
+        ref INTEGER NOT NULL,
+        titel TEXT NOT NULL DEFAULT '',
+        sichtbar TEXT NOT NULL DEFAULT 'link',   -- link = jeder mit Adresse, konten = nur angemeldet
+        ablauf TEXT,
+        aufrufe INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')))");
+    // vorhandene Klassenbezeichnungen zerlegen
+    foreach ($pdo->query("SELECT id, klasse FROM users WHERE klasse <> '' AND kl_kuerzel = ''") as $r) {
+        if (preg_match('/^(\d|W)\s*([A-Za-z]{1,4})\s*(\d*?)(\d)$/', trim((string)$r['klasse']), $m)) {
+            $st = $pdo->prepare("UPDATE users SET kl_kuerzel = ?, kl_nr = ?, zeitgruppe = ?, verkuerzt = ? WHERE id = ?");
+            $st->execute([strtoupper($m[2]), $m[3], (int)$m[4], $m[1] === 'W' ? 1 : 0, (int)$r['id']]);
+        }
+    }
+    $pdo->exec("INSERT INTO meta (k,v) VALUES ('schema','5') ON CONFLICT(k) DO UPDATE SET v='5'");
+    schema_v6($pdo);
+}
+
+/** v6: Ansprechpartner, Einsaetze, Abschlussprojekt, Urlaub, Angaben fuer Ausdrucke. */
+function schema_v6(PDO $pdo): void {
+    foreach (["ALTER TABLE users ADD COLUMN dok_name TEXT NOT NULL DEFAULT ''",
+              "ALTER TABLE users ADD COLUMN dok_geb TEXT NOT NULL DEFAULT ''",
+              "ALTER TABLE users ADD COLUMN dok_merken INTEGER NOT NULL DEFAULT 0",
+              "ALTER TABLE users ADD COLUMN urlaub_tage REAL NOT NULL DEFAULT 0",
+              "ALTER TABLE absences ADD COLUMN tage REAL NOT NULL DEFAULT 0",
+              "ALTER TABLE blocks ADD COLUMN quelle TEXT NOT NULL DEFAULT 'manuell'",
+              "ALTER TABLE sources ADD COLUMN region TEXT NOT NULL DEFAULT ''",
+              "ALTER TABLE shares ADD COLUMN wer TEXT NOT NULL DEFAULT ''"] as $sql) {
+        try { $pdo->exec($sql); } catch (Throwable $e) { /* schon da */ }
+    }
+    $pdo->exec("CREATE TABLE IF NOT EXISTS kontakte (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        rolle TEXT NOT NULL DEFAULT '',
+        bereich TEXT NOT NULL DEFAULT 'betrieb',   -- betrieb | schule | ihk | sonst
+        telefon TEXT NOT NULL DEFAULT '',
+        mail TEXT NOT NULL DEFAULT '',
+        raum TEXT NOT NULL DEFAULT '',
+        notiz TEXT NOT NULL DEFAULT '',
+        subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS einsaetze (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        abteilung TEXT NOT NULL,
+        von TEXT NOT NULL, bis TEXT NOT NULL DEFAULT '',
+        ansprech TEXT NOT NULL DEFAULT '',
+        schwerpunkt TEXT NOT NULL DEFAULT '',
+        notiz TEXT NOT NULL DEFAULT '')");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS projekt (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        titel TEXT NOT NULL DEFAULT '',
+        beschreibung TEXT NOT NULL DEFAULT '',
+        stunden REAL NOT NULL DEFAULT 80,
+        antrag TEXT, genehmigt TEXT, von TEXT, bis TEXT,
+        doku TEXT, praesentation TEXT,
+        status TEXT NOT NULL DEFAULT 'idee',   -- idee | antrag | genehmigt | laeuft | doku | fertig
+        notiz TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')))");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS projekt_phasen (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        projekt_id INTEGER NOT NULL REFERENCES projekt(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL, stunden REAL NOT NULL DEFAULT 0,
+        ist REAL NOT NULL DEFAULT 0, sort INTEGER NOT NULL DEFAULT 0)");
+    $pdo->exec("CREATE INDEX IF NOT EXISTS ix_ko ON kontakte(user_id, bereich)");
+    $pdo->exec("CREATE INDEX IF NOT EXISTS ix_ei ON einsaetze(user_id, von)");
+    $pdo->exec("INSERT INTO meta (k,v) VALUES ('schema','6') ON CONFLICT(k) DO UPDATE SET v='6'");
 }
 function fts_trigger_sql(): array {
     $t = [];
@@ -622,7 +710,7 @@ function pw_hash(string $pw): string {
         ? password_hash($pw, PASSWORD_ARGON2ID, ['memory_cost' => 65536, 'time_cost' => 4, 'threads' => 2])
         : password_hash($pw, PASSWORD_DEFAULT, ['cost' => 12]);
 }
-function pw_problems(string $pw, string $user = '', string $name = ''): array {
+function pw_problems(string $pw, string $user = ''): array {
     $p = [];
     if (mb_strlen($pw) < PW_MIN_LEN) $p[] = 'mindestens ' . PW_MIN_LEN . ' Zeichen';
     if (mb_strlen($pw) > 200) $p[] = 'hoechstens 200 Zeichen';
@@ -636,9 +724,6 @@ function pw_problems(string $pw, string $user = '', string $name = ''): array {
         if (str_contains($low, $b)) { $p[] = 'kein Wort wie "' . $b . '"'; break; }
     }
     if ($user && mb_stripos($pw, $user) !== false) $p[] = 'nicht der Benutzername';
-    if ($name) foreach (preg_split('/\s+/', $name) as $t) {
-        if (mb_strlen($t) >= 4 && mb_stripos($pw, $t) !== false) { $p[] = 'nicht der eigene Name'; break; }
-    }
     return $p;
 }
 function rand_code(int $bytes = 8): string {
@@ -1025,11 +1110,92 @@ function periode_shift(string $p, string $art, int $d): string {
     return periode_of((new DateTimeImmutable($von))
         ->modify(($d >= 0 ? '+' : '-') . abs($d) . ($art === 'monat' ? ' month' : ' week'))->format('Y-m-d'), $art);
 }
+/**
+ * Beginn des Schuljahres, das im Kalenderjahr $jahr anfaengt.
+ * Bevorzugt der Tag nach den Sommerferien aus dem importierten Blockplan,
+ * sonst der 15. September.
+ */
+function schuljahr_start(int $uid, int $jahr): string {
+    static $cache = [];
+    $k = $uid . ':' . $jahr;
+    if (isset($cache[$k])) return $cache[$k];
+    $b = one("SELECT bis FROM blocks WHERE user_id = ? AND art = 'ferien'
+              AND label LIKE '%Sommerferien%' AND bis BETWEEN ? AND ?
+              ORDER BY bis DESC LIMIT 1", [$uid, $jahr . '-07-01', $jahr . '-10-15']);
+    $d = $b ? date('Y-m-d', strtotime($b['bis'] . ' +1 day')) : $jahr . '-09-15';
+    return $cache[$k] = $d;
+}
+/**
+ * Ausbildungsstand zum Stichtag.
+ *  jahr   – Ausbildungsjahr nach dem Vertragsbeginn (zaehlt am Jahrestag hoch)
+ *  stufe  – Klassenstufe, die mit dem Schuljahr hochgeht
+ *  wechsel/stufe_neu – wann die Klasse das naechste Mal wechselt
+ * @return array{jahr:int,stufe:int,wechsel:?string,stufe_neu:?int,jahrestag:?string,ende:?string}
+ */
+function ausbildungsstand(array $u, string $datum = ''): array {
+    $datum = $datum ?: today();
+    $uid = (int)($u['id'] ?? 0);
+    $leer = ['jahr' => 1, 'stufe' => 1, 'wechsel' => null, 'stufe_neu' => null,
+             'jahrestag' => null, 'ende' => null];
+    if (empty($u['start']) || !isodate(substr((string)$u['start'], 0, 10))) return $leer;
+    $start = substr((string)$u['start'], 0, 10);
+    // Regeldauer drei Jahre, bei eingetragenem Ende die tatsaechliche Dauer
+    $max = 3;
+    if (!empty($u['ende']) && isodate(substr((string)$u['ende'], 0, 10))) {
+        $max = (int)max(1, min(4, ceil((strtotime((string)$u['ende']) - strtotime($start)) / 86400 / 365.25)));
+    }
+
+    // Ausbildungsjahr: Jahrestag des Vertragsbeginns
+    $jahr = 1; $jahrestag = null;
+    for ($k = 1; $k <= 5; $k++) {
+        $tag = date('Y-m-d', strtotime($start . ' +' . $k . ' year'));
+        if ($tag <= $datum) $jahr = $k + 1;
+        elseif ($jahrestag === null && $k + 1 <= $max) $jahrestag = $tag;
+    }
+    $jahr = max(1, min($max, $jahr));
+
+    // Klassenstufe: jeder Schuljahresbeginn nach dem ersten hebt die Stufe.
+    // Der erste Beginn kurz nach Vertragsstart ist der Eintritt, kein Aufstieg.
+    $stufe = 1; $wechsel = null; $neu = null; $erste = true;
+    for ($y = (int)substr($start, 0, 4); $y <= (int)substr($datum, 0, 4) + 1; $y++) {
+        $grenze = schuljahr_start($uid, $y);
+        if ($grenze <= $start) continue;
+        if ($erste) {
+            $erste = false;
+            if ((strtotime($grenze) - strtotime($start)) / 86400 <= 100) continue;
+        }
+        if ($grenze <= $datum) $stufe++;
+        elseif ($wechsel === null && $stufe + 1 <= $max) { $wechsel = $grenze; $neu = $stufe + 1; }
+    }
+    $stufe = max(1, min($max, $stufe));
+    return ['jahr' => $jahr, 'stufe' => $stufe, 'wechsel' => $wechsel, 'stufe_neu' => $neu,
+            'jahrestag' => $jahrestag, 'ende' => $u['ende'] ?: null];
+}
 function lehrjahr(array $u, string $datum): int {
-    if (empty($u['start'])) return 1;
-    try { $s = new DateTimeImmutable($u['start']); $d = new DateTimeImmutable($datum); }
-    catch (Throwable $e) { return 1; }
-    return $d < $s ? 1 : min(4, (int)floor($s->diff($d)->days / 365) + 1);
+    return ausbildungsstand($u, $datum)['jahr'];
+}
+/** Eine Zeile, die den Stand zeigt, ohne dass jemand nachrechnen muss. */
+function stand_text(array $u, string $datum = ''): string {
+    $st = ausbildungsstand($u, $datum);
+    $jetzt = klasse_name($u, $datum);
+    $t = [];
+    if ($jetzt !== '') $t[] = '<b>' . h($jetzt) . '</b>';
+    $t[] = $st['jahr'] . '. Ausbildungsjahr';
+    if ($st['wechsel'] !== null) {
+        $spaeter = ($u['kl_kuerzel'] ?? '') !== ''
+            ? klasse_name($u, $st['wechsel'])
+            : (int)$st['stufe_neu'] . '. Klasse';
+        $t[] = '<span class="mu2">ab ' . h(dt($st['wechsel'])) . ' ' . h($spaeter) . '</span>';
+    } elseif ($st['jahrestag'] !== null) {
+        $t[] = '<span class="mu2">ab ' . h(dt($st['jahrestag'])) . ' im ' . ($st['jahr'] + 1) . '. Jahr</span>';
+    }
+    return implode(' · ', $t);
+}
+/** Klassenbezeichnung aus Bestandteilen und abgeleiteter Klassenstufe. */
+function klasse_name(array $u, string $datum = ''): string {
+    if (($u['kl_kuerzel'] ?? '') === '') return (string)($u['klasse'] ?? '');
+    $st = ausbildungsstand($u, $datum);
+    return $st['stufe'] . $u['kl_kuerzel'] . $u['kl_nr'] . (int)$u['zeitgruppe'];
 }
 
 // --- Berichtsheft ----------------------------------------------------------
@@ -1059,13 +1225,19 @@ function report_get(int $uid, string $art, string $periode): array {
         'nr' => report_nr($uid, $von), 'jahr' => lehrjahr($u, $von), 'abteilung' => $u['abteilung'] ?? '',
         'schule_text' => '', 'sonstiges' => '', 'status' => 'offen', 'fertig_am' => null];
 }
+/** Abteilung aus dem Einsatzplan zum Stichtag. */
+function einsatz_am(int $uid, string $datum): string {
+    $r = one("SELECT abteilung FROM einsaetze WHERE user_id = ? AND von <= ?
+              AND (bis = '' OR bis >= ?) ORDER BY von DESC LIMIT 1", [$uid, $datum, $datum]);
+    return $r ? (string)$r['abteilung'] : '';
+}
 function report_ensure(int $uid, string $art, string $periode): array {
     $r = one("SELECT * FROM reports WHERE user_id = ? AND art = ? AND periode = ?", [$uid, $art, $periode]);
     if ($r) return $r;
     [$von, $bis] = periode_range($periode, $art);
     $u = one("SELECT * FROM users WHERE id = ?", [$uid]) ?? [];
     $id = ins('reports', ['user_id' => $uid, 'art' => $art, 'periode' => $periode, 'von' => $von,
-        'bis' => $bis, 'jahr' => lehrjahr($u, $von), 'abteilung' => $u['abteilung'] ?? '']);
+        'bis' => $bis, 'jahr' => lehrjahr($u, $von), 'abteilung' => einsatz_am($uid, $von) ?: ($u['abteilung'] ?? '')]);
     return one("SELECT * FROM reports WHERE id = ?", [$id]);
 }
 /** Zieht Routinen, Notizen, Blockplan und Abwesenheiten in den Zeitraum. */
@@ -1520,22 +1692,77 @@ function untis_klassen(array $src): array {
     return ['fehler' => '', 'klassen' => $out];
 }
 
-/** Aus einer Klassenbezeichnung wie 2FS152 Jahr und Zeitgruppe ableiten. */
-function klasse_zerlegen(string $k): array {
-    $k = trim($k);
-    $jahr = null; $zg = null;
-    if (preg_match('/^(\d)\s*[A-Za-z]{1,4}\s*\d*?(\d)$/', $k, $m)) { $jahr = (int)$m[1]; $zg = (int)$m[2]; }
-    elseif (preg_match('/^(\d)/', $k, $m)) $jahr = (int)$m[1];
-    if (preg_match('/(\d)\s*$/', $k, $m) && $zg === null) $zg = (int)$m[1];
-    return ['jahr' => $jahr, 'zeitgruppe' => $zg];
+/**
+ * Zerlegt eine Klassenbezeichnung wie 2FS152 in ihre Bestandteile.
+ * Die fuehrende Ziffer ist das Ausbildungsjahr und wird nicht gespeichert -
+ * sie ergibt sich aus dem Ausbildungsbeginn.
+ */
+/**
+ * Zerlegt eine Klassenbezeichnung wie 2FS152: Stufe 2, Kuerzel FS,
+ * laufende Nummer 15, Zeitgruppe 2. Die Stufe selbst wird spaeter berechnet.
+ */
+function klasse_teile(string $k): array {
+    $k = strtoupper(trim($k));
+    if (preg_match('/^(\d)\s*([A-Z]{1,4})\s*(\d*?)(\d)$/', $k, $m)) {
+        return ['kuerzel' => $m[2], 'nr' => $m[3], 'zeitgruppe' => (int)$m[4],
+                'verkuerzt' => 0, 'stufe' => (int)$m[1]];
+    }
+    $zg = preg_match('/(\d)\s*$/', $k, $m2) ? (int)$m2[1] : 0;
+    return ['kuerzel' => '', 'nr' => '', 'zeitgruppe' => $zg, 'verkuerzt' => 0, 'stufe' => null];
 }
 
 /** Holt eine Quelle und schreibt die Termine ins Konto. */
+/** Bundeslaender fuer Ferien und Feiertage. */
+function laender(): array {
+    return ['DE-BY'=>'Bayern','DE-BW'=>'Baden-Wuerttemberg','DE-BE'=>'Berlin','DE-BB'=>'Brandenburg',
+        'DE-HB'=>'Bremen','DE-HH'=>'Hamburg','DE-HE'=>'Hessen','DE-MV'=>'Mecklenburg-Vorpommern',
+        'DE-NI'=>'Niedersachsen','DE-NW'=>'Nordrhein-Westfalen','DE-RP'=>'Rheinland-Pfalz',
+        'DE-SL'=>'Saarland','DE-SN'=>'Sachsen','DE-ST'=>'Sachsen-Anhalt','DE-SH'=>'Schleswig-Holstein',
+        'DE-TH'=>'Thueringen'];
+}
+/**
+ * Ferien und gesetzliche Feiertage aus dem offenen Verzeichnis openholidaysapi.org.
+ * Schreibt in die Blocktabelle, damit Berichtsheft und Kalender sie kennen.
+ */
+function feiertage_sync(array $src, array $u): array {
+    $uid = (int)$u['id']; $sid = (int)$src['id'];
+    $land = isset(laender()[$src['region']]) ? $src['region'] : 'DE-BY';
+    $von = date('Y-m-d', strtotime('-6 months'));
+    $bis = date('Y-m-d', strtotime('+18 months'));
+    $n = 0; $neu = [];
+    foreach ([['SchoolHolidays', 'ferien'], ['PublicHolidays', 'feiertag']] as [$pfad, $art]) {
+        $url = 'https://openholidaysapi.org/' . $pfad . '?countryIsoCode=DE&subdivisionCode=' . $land
+             . '&languageIsoCode=DE&validFrom=' . $von . '&validTo=' . $bis;
+        $r = http_ruf($url, ['timeout' => 20]);
+        if (!$r['ok']) { quelle_status($sid, 'fehler', $r['fehler'] ?: 'Abruf fehlgeschlagen'); return ['fehler' => $r['fehler'] ?: 'Abruf fehlgeschlagen', 'n' => 0]; }
+        $j = json_decode($r['body'], true);
+        if (!is_array($j)) { quelle_status($sid, 'fehler', 'Unerwartete Antwort.'); return ['fehler' => 'Unerwartete Antwort', 'n' => 0]; }
+        foreach ($j as $e) {
+            $a = (string)($e['startDate'] ?? ''); $b = (string)($e['endDate'] ?? $a);
+            if (!isodate($a)) continue;
+            $name = '';
+            foreach ((array)($e['name'] ?? []) as $t) if (($t['language'] ?? '') === 'DE') $name = (string)($t['text'] ?? '');
+            if ($name === '') $name = (string)(($e['name'][0]['text'] ?? '') ?: 'Frei');
+            $neu[] = ['von' => $a, 'bis' => isodate($b) ? $b : $a, 'art' => $art,
+                'label' => mb_substr($name, 0, 80), 'quelle' => 'q' . $sid];
+            $n++;
+        }
+    }
+    del('blocks', "user_id = ? AND quelle = ?", [$uid, 'q' . $sid]);
+    foreach ($neu as $b) {
+        if (one("SELECT id FROM blocks WHERE user_id = ? AND von = ? AND bis = ? AND art = ?",
+                [$uid, $b['von'], $b['bis'], $b['art']])) continue;
+        ins('blocks', $b + ['user_id' => $uid]);
+    }
+    quelle_status($sid, 'ok', $n . ' Ferien und Feiertage (' . laender()[$land] . ')', $n);
+    return ['fehler' => '', 'n' => $n];
+}
 function quelle_sync(array $src, array $u): array {
     $uid = (int)$u['id']; $sid = (int)$src['id'];
     $von = date('Y-m-d', strtotime('-14 days'));
     $bis = date('Y-m-d', strtotime('+120 days'));
     q("UPDATE sources SET letzter_sync = ? WHERE id = ?", [time(), $sid]);   // Sperre gegen Doppellauf
+    if ($src['typ'] === 'feiertage') return feiertage_sync($src, $u);
     if ($src['typ'] === 'webuntis') {
         $r = untis_hole($src, $von, $bis);
         if ($r['fehler'] !== '') { quelle_status($sid, 'fehler', $r['fehler']); return ['fehler' => $r['fehler'], 'n' => 0]; }
@@ -1777,6 +2004,22 @@ function suche(int $uid, string $q, int $limit = 40): array {
             }
         }
     }
+    // Ansprechpartner und Einsaetze liegen nicht im Volltextindex
+    if ($worte && !$f['lf'] && !$f['fach']) {
+        $l = '%' . implode('%', $worte) . '%';
+        foreach (all("SELECT id, name, rolle, bereich, mail, telefon FROM kontakte
+                      WHERE user_id = ? AND (name LIKE ? OR rolle LIKE ? OR notiz LIKE ? OR mail LIKE ?)
+                      LIMIT 8", [$uid, $l, $l, $l, $l]) as $r) {
+            $treffer[] = ['art' => 'kontakt', 'ref' => (int)$r['id'], 'datum' => '',
+                'titel' => $r['name'], 'aus' => trim($r['rolle'] . ' · ' . $r['bereich'] . ' · ' . $r['mail'], ' ·')];
+        }
+        foreach (all("SELECT id, abteilung, von, bis, schwerpunkt FROM einsaetze
+                      WHERE user_id = ? AND (abteilung LIKE ? OR schwerpunkt LIKE ? OR notiz LIKE ?)
+                      LIMIT 8", [$uid, $l, $l, $l]) as $r) {
+            $treffer[] = ['art' => 'einsatz', 'ref' => (int)$r['id'], 'datum' => $r['von'],
+                'titel' => $r['abteilung'], 'aus' => (string)$r['schwerpunkt']];
+        }
+    }
     // Filter nachziehen
     if ($f['typ']) $treffer = array_values(array_filter($treffer, fn($t) => $t['art'] === $f['typ']));
     if ($f['lf'] !== null) {
@@ -1809,27 +2052,33 @@ function such_ziel(string $art, int $ref, string $datum, array $u): string {
         'termin'  => url('termine', ['id' => $ref]),
         'aufgabe' => url('aufgaben', ['id' => $ref]),
         'bericht' => url('berichtsheft', ['periode' => periode_of($datum ?: today(), $u['bh_art']), 'art' => $u['bh_art']]),
+        'kontakt' => url('kontakte', ['id' => $ref]),
+        'einsatz' => url('einsaetze', ['id' => $ref]),
         default   => url('routinen', ['id' => $ref]),
     };
 }
 function art_label(string $a): string {
-    return ['notiz'=>'Notiz','termin'=>'Termin','aufgabe'=>'Aufgabe','bericht'=>'Bericht','routine'=>'Routine'][$a] ?? $a;
+    return ['notiz'=>'Notiz','termin'=>'Termin','aufgabe'=>'Aufgabe','bericht'=>'Bericht','routine'=>'Routine',
+            'kontakt'=>'Ansprechpartner','einsatz'=>'Einsatz'][$a] ?? $a;
 }
 
 // ===========================================================================
 //  Oberflaeche
 // ===========================================================================
 
-function nav(): array {
+/** Seitenleiste in drei Bloecken: alles liegt dort, wo man es sucht. */
+function nav_gruppen(): array {
     return [
-        ['start',       'Uebersicht'],
-        ['faecher',     'Faecher'],
-        ['notizen',     'Notizen'],
-        ['noten',       'Noten'],
-        ['plan',        'Plan'],
-        ['berichtsheft','Berichtsheft'],
-        ['pruefung',    'Pruefung'],
+        ['',         [['start', 'Heute']]],
+        ['Schule',   [['faecher', 'Faecher'], ['notizen', 'Notizen'], ['noten', 'Noten'], ['plan', 'Plan']]],
+        ['Betrieb',  [['berichtsheft', 'Berichtsheft'], ['einsaetze', 'Einsaetze'], ['kontakte', 'Kontakte']]],
+        ['Abschluss',[['pruefung', 'Pruefung']]],
     ];
+}
+function nav(): array {
+    $o = [];
+    foreach (nav_gruppen() as [, $items]) foreach ($items as $it) $o[] = $it;
+    return $o;
 }
 function nav_zahl(string $key): string {
     $u = me(); if (!$u) return '';
@@ -1927,6 +2176,8 @@ hr{border:0;border-top:1px solid var(--li);margin:14px 0}
 .nv .b{margin-left:auto;background:var(--fg3);color:var(--pa);border-radius:9px;font-size:11px;
 font-weight:600;padding:0 5px;min-width:17px;text-align:center}
 .nv a.on .b{background:rgba(255,255,255,.28);color:#fff}
+.nv .gr{padding:12px 9px 3px;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;
+color:var(--fg3);font-weight:600}
 .sf{margin-top:auto;padding:12px 16px;font-size:12.5px;color:var(--fg3)}
 .sf b{display:block;color:var(--fg);font-weight:590;font-size:13px}
 .sf .lk{display:flex;gap:10px;margin-top:6px}
@@ -1935,8 +2186,22 @@ font-weight:600;padding:0 5px;min-width:17px;text-align:center}
 backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);
 border-bottom:1px solid var(--li);display:flex;align-items:center;gap:10px;padding:0 18px;height:52px}
 .tb .sp{flex:1}
-.tb input[type=search]{width:200px;height:28px;font-size:13px;border-radius:99px;background:var(--pa2);border-color:transparent}
+.tb input[type=search]{width:250px;height:28px;font-size:13px;border-radius:99px;background:var(--pa2);border-color:transparent}
+.tb [data-palette]{font:11px var(--mo);color:var(--fg3);height:24px;padding:0 7px}
 .ct{padding:18px;max-width:1220px;width:100%}
+.ph{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:2px 0 16px}
+.ph .pt{min-width:0}
+.ph .pt{max-width:100%}
+.ph h1{font-size:24px;font-weight:640;letter-spacing:-.025em;line-height:1.15}
+.ph h1.lang{font-size:19px;letter-spacing:-.02em}
+.ph .ps{font-size:12.5px;color:var(--fg2);margin-top:2px}
+.ph .sp{flex:1}
+.lb{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--fg3);font-weight:600;margin-bottom:6px}
+.ck{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--fg2);font-weight:400;margin:0}
+.ck input{margin:0}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:13px}
+.kv dt{color:var(--fg3);font-size:12px}
+.kv dd{margin:0}
 @media(max-width:880px){
  .app{grid-template-columns:1fr}
  .sb{position:fixed;left:0;top:0;bottom:0;width:236px;z-index:60;transform:translateX(-101%);transition:transform .22s cubic-bezier(.32,.72,0,1)}
@@ -1946,7 +2211,8 @@ border-bottom:1px solid var(--li);display:flex;align-items:center;gap:10px;paddi
  .seg a{padding:3px 8px}
 }
 .sc{display:none}
-@media(min-width:881px){.tb .bg{display:none}}
+@media(min-width:881px){.tb .bg{display:none}.tb .mt{display:none}}
+@media(max-width:880px){.ph h1{font-size:20px}}
 /* Bausteine */
 .c{background:var(--pa);border-radius:var(--r);box-shadow:var(--sh);margin-bottom:14px;min-width:0;max-width:100%}
 .c>.hd{display:flex;align-items:center;gap:8px;padding:11px 14px 9px;flex-wrap:wrap}
@@ -2072,22 +2338,26 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
 </head>
 <body>
 <?php if ($bare): ?>
-<div style="max-width:<?= !empty($o['breit']) ? '580' : '340' ?>px;margin:0 auto;padding:<?= !empty($o['breit']) ? '5' : '9' ?>vh 16px"><?= $inhalt ?></div>
+<div style="max-width:<?= !empty($o['weit']) ? '900' : (!empty($o['breit']) ? '580' : '340') ?>px;margin:0 auto;padding:<?= !empty($o['breit']) || !empty($o['weit']) ? '5' : '9' ?>vh 16px"><?= $inhalt ?></div>
 <?php else: ?>
 <div class="sc" data-nav="0"></div>
 <div class="app">
  <aside class="sb">
   <div class="bd"><i></i><?= h(APP_NAME) ?></div>
   <nav class="nv">
-   <?php foreach (nav() as $i => [$k, $lbl]): $b = nav_zahl($k); ?>
-    <a href="<?= url($k) ?>"<?= $p === $k ? ' class="on"' : '' ?>><?= h($lbl) ?>
-     <?= $b !== '' ? '<span class="b">' . h($b) . '</span>' : '<span class="k">' . ($i + 1) . '</span>' ?></a>
+   <?php $ni = 0; foreach (nav_gruppen() as [$grp, $items]): ?>
+    <?php if ($grp !== ''): ?><div class="gr"><?= h($grp) ?></div><?php endif; ?>
+    <?php foreach ($items as [$k, $lbl]): $ni++; $b = nav_zahl($k); ?>
+     <a href="<?= url($k) ?>"<?= $p === $k ? ' class="on"' : '' ?>><?= h($lbl) ?>
+      <?= $b !== '' ? '<span class="b">' . h($b) . '</span>' : '<span class="k">' . $ni . '</span>' ?></a>
+    <?php endforeach; ?>
    <?php endforeach; ?>
   </nav>
   <div class="sf">
    <?php if ($u): ?>
-    <b><?= h($u['name'] ?: $u['username']) ?></b>
-    <?= h($u['klasse'] ?: $u['betrieb']) ?>
+    <b><?= h($u['username']) ?></b>
+    <?php $sfs = ausbildungsstand($u); ?>
+    <?= h(trim((klasse_name($u) ?: $u['betrieb']) . ' · ' . $sfs['jahr'] . '. Jahr', ' ·')) ?>
     <div class="lk">
      <a href="<?= url('einstellungen') ?>">Einstellungen</a>
      <form method="post" action="<?= url('logout') ?>" style="display:inline"><?= csrf_field() ?>
@@ -2099,19 +2369,35 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
  <div class="mn">
   <header class="tb np">
    <button class="g s bg" data-nav="1" aria-label="Menue">&#9776;</button>
-   <h1><?= h($titel) ?></h1>
+   <h1 class="mt"><?= h($titel) ?></h1>
    <span class="sp"></span>
-   <?= $o['aktion'] ?? '' ?>
    <form method="get" action="<?= h(base_path()) ?>" style="display:flex">
     <input type="hidden" name="p" value="suche">
-    <input type="search" name="q" id="sq" placeholder="Suchen  /" value="<?= h(get('q')) ?>">
+    <input type="search" name="q" id="sq" placeholder="Suchen" value="<?= h(get('q')) ?>">
    </form>
+   <button class="g s np" data-palette type="button" title="Springen">&#8984;K</button>
    <form method="post" action="<?= url('theme') ?>"><?= csrf_field() ?>
     <input type="hidden" name="theme" value="<?= $theme === 'dunkel' ? 'hell' : ($theme === 'hell' ? 'auto' : 'dunkel') ?>">
     <button class="g s" type="submit" title="Design"><?= $theme === 'dunkel' ? '&#9788;' : ($theme === 'hell' ? '&#9789;' : '&#9681;') ?></button>
    </form>
   </header>
   <div class="ct">
+   <div class="ph np">
+    <div class="pt">
+     <?php $pt = (string)($o['titel'] ?? $titel); ?>
+     <h1<?= mb_strlen($pt) > 30 ? ' class="lang"' : '' ?>><?= h($pt) ?></h1>
+     <?php if (!empty($o['unter'])): ?><div class="ps"><?= $o['unter'] ?></div><?php endif; ?>
+    </div>
+    <?php if (!empty($o['tabs'])): ?>
+     <div class="seg">
+      <?php foreach ($o['tabs'] as $tk => [$tl, $tu]): ?>
+       <a class="<?= ($o['aktiv'] ?? '') === $tk ? 'on' : '' ?>" href="<?= h($tu) ?>"><?= h($tl) ?></a>
+      <?php endforeach; ?>
+     </div>
+    <?php endif; ?>
+    <span class="sp"></span>
+    <?= $o['aktion'] ?? '' ?>
+   </div>
    <?php foreach ($flash as [$t, $m]): ?><div class="ms <?= h($t) ?>"><?= h($m) ?></div><?php endforeach; ?>
    <?= $inhalt ?>
   </div>
@@ -2129,9 +2415,14 @@ var Z=<?= json_encode(array_merge(
    ['t'=>'Stundenplan','u'=>url('plan',['t'=>'stundenplan'])],
    ['t'=>'Blockplan','u'=>url('plan',['t'=>'block'])],
    ['t'=>'Routinen','u'=>url('berichtsheft',['t'=>'routinen'])],
-   ['t'=>'Abwesenheiten','u'=>url('berichtsheft',['t'=>'abwesend'])],
+   ['t'=>'Ausbildungsplan','u'=>url('berichtsheft',['t'=>'plan'])],
    ['t'=>'Alle Nachweise','u'=>url('berichtsheft',['t'=>'alle'])],
+   ['t'=>'Fehlzeiten und Urlaub','u'=>url('einsaetze',['t'=>'zeiten'])],
+   ['t'=>'Abteilungen','u'=>url('einsaetze')],
+   ['t'=>'Ansprechpartner','u'=>url('kontakte')],
+   ['t'=>'Abschlussprojekt','u'=>url('pruefung',['t'=>'projekt'])],
    ['t'=>'Lernfelder','u'=>url('pruefung',['t'=>'lf'])],
+   ['t'=>'Geteilte Links','u'=>url('geteilt')],
    ['t'=>'Einstellungen','u'=>url('einstellungen')],
    ['t'=>'Quellen und Import','u'=>url('einstellungen',['t'=>'quellen'])],
    ['t'=>'Zwei-Faktor','u'=>url('einstellungen',['t'=>'sicherheit'])],
@@ -2144,8 +2435,14 @@ document.addEventListener('click',function(e){
  if(c){var el=document.getElementById(c.dataset.copy);
   if(el&&navigator.clipboard)navigator.clipboard.writeText(el.innerText).then(function(){
    var o=c.textContent;c.textContent='kopiert';setTimeout(function(){c.textContent=o;},1100);});}
+ var v=e.target.closest('[data-copy-val]');
+ if(v&&navigator.clipboard){navigator.clipboard.writeText(v.dataset.copyVal).then(function(){
+   var o=v.textContent;v.textContent='kopiert';setTimeout(function(){v.textContent=o;},1100);});}
 });
 document.addEventListener('submit',function(e){var m=e.target.getAttribute('data-q');if(m&&!confirm(m))e.preventDefault();});
+document.addEventListener('change',function(e){if(e.target.matches('[data-autosubmit]'))e.target.form.submit();});
+document.addEventListener('click',function(e){if(e.target.closest('[data-palette]')&&pl)open_();});
+document.addEventListener('focus',function(e){if(e.target.matches('[data-sel]'))e.target.select();},true);
 var pl=document.getElementById('pl'),pq=document.getElementById('pq'),pu=document.getElementById('pu'),sel=0,cur=[];
 var tref=[],tid=0,lauf='';
 function esc(t){return String(t).replace(/[<>&"']/g,function(c){
@@ -2192,9 +2489,41 @@ document.addEventListener('keydown',function(e){
  if(e.ctrlKey||e.metaKey||e.altKey)return;
  if(typing(e)){if(e.key==='Escape')e.target.blur();return;}
  if(e.key==='/'){e.preventDefault();var s=document.getElementById('sq');if(s)s.focus();return;}
- if(e.key>='1'&&e.key<='8'){var x=N[+e.key-1];if(x){e.preventDefault();location.href=x.u;}return;}
+ if(e.key>='1'&&e.key<='9'){var x=N[+e.key-1];if(x){e.preventDefault();location.href=x.u;}return;}
  if(e.key==='n'){var a=document.querySelector('[data-new]');if(a){e.preventDefault();
   if(a.nodeName==='A')location.href=a.href;else a.focus();}}
+});
+// Klasse und Ausbildungsjahr ergeben sich aus Kuerzel und Beginn
+function schuljStart(y){return new Date(y+'-09-15');}
+function stand(startS){
+ var start=new Date(startS), heute=new Date(), jahr=1, jt=null;
+ for(var k=1;k<=5;k++){var t=new Date(start.getFullYear()+k,start.getMonth(),start.getDate());
+  if(t<=heute)jahr=k+1;else if(!jt&&k+1<=3)jt=t;}
+ jahr=Math.max(1,Math.min(3,jahr));
+ var stufe=1,wechsel=null,erst=true;
+ for(var y=start.getFullYear();y<=heute.getFullYear()+1;y++){var g=schuljStart(y);
+  if(g<=start)continue;
+  if(erst){erst=false;if((g-start)/864e5<=100)continue;}
+  if(g<=heute)stufe++;else if(!wechsel&&stufe+1<=3)wechsel=g;}
+ return {jahr:jahr,stufe:Math.max(1,Math.min(3,stufe)),wechsel:wechsel,jahrestag:jt};
+}
+function dts(d){return ('0'+d.getDate()).slice(-2)+'.'+('0'+(d.getMonth()+1)).slice(-2)+'.'+d.getFullYear();}
+document.querySelectorAll('[data-klasse]').forEach(function(inp){
+ var wrap=inp.closest('.fg')||document, hin=wrap.querySelector('[data-klassehinweis]'),
+     st=wrap.querySelector('[data-kstart]');
+ if(!hin)return;
+ function upd(){
+  var m=(inp.value||'').toUpperCase().replace(/\s+/g,'').match(/^(\d)([A-Z]{1,4})(\d*?)(\d)$/);
+  if(!m){hin.textContent=inp.value?'Zum Beispiel 2FS152.':'';return;}
+  var kern=m[2]+m[3]+m[4];
+  if(!st||!st.value){hin.textContent='Klasse '+kern+', Zeitgruppe '+m[4]+'. Beginn eintragen fuer die Stufe.';return;}
+  var s=stand(st.value);
+  var txt=s.stufe+kern+' · '+s.jahr+'. Ausbildungsjahr';
+  if(s.wechsel)txt+=' · ab '+dts(s.wechsel)+' '+(s.stufe+1)+kern;
+  else if(s.jahrestag)txt+=' · ab '+dts(s.jahrestag)+' im '+(s.jahr+1)+'. Jahr';
+  hin.textContent=txt;
+ }
+ inp.addEventListener('input',upd); if(st)st.addEventListener('change',upd); upd();
 });
 // Schulsuche im WebUntis-Verzeichnis
 document.querySelectorAll('[data-schule]').forEach(function(box){
@@ -2333,7 +2662,7 @@ function kat_opts($sel, string $leer = 'automatisch'): string {
 }
 function typ_label(string $t): string {
     return ['probe'=>'Probe','test'=>'Test','abgabe'=>'Abgabe','pruefung'=>'Pruefung',
-            'termin'=>'Termin','projekt'=>'Projekt','frei'=>'Frei'][$t] ?? $t;
+            'termin'=>'Termin','projekt'=>'Projekt','frist'=>'Frist','frei'=>'Frei'][$t] ?? $t;
 }
 function md(string $s): string {
     $out = []; $code = false; $buf = [];
@@ -2341,13 +2670,14 @@ function md(string $s): string {
     foreach (preg_split('/\R/', $s) as $line) {
         if (preg_match('/^```/', $line)) { if ($code) $flush(); $code = !$code; continue; }
         if ($code) { $buf[] = h($line); continue; }
-        $l = h($line);
+        $roh = $line; $vor = ''; $nach = '';
+        if (preg_match('/^\s*[-*]\s+(.*)$/', $line, $m))          { $roh = $m[1]; $vor = '&bull; '; }
+        elseif (preg_match('/^\s*#{1,3}\s+(.*)$/', $line, $m))    { $roh = $m[1]; $vor = '<b>'; $nach = '</b>'; }
+        $l = h($roh);
         $l = preg_replace('/`([^`]+)`/', '<code>$1</code>', $l);
         $l = preg_replace('/\*\*([^*]+)\*\*/', '<b>$1</b>', $l);
-        $l = preg_replace_callback('~https?://[^\s<]+~', fn($m) => '<a href="' . $m[0] . '" rel="noopener nofollow">' . $m[0] . '</a>', $l);
-        if (preg_match('/^\s*[-*]\s+(.*)$/', $line, $m)) $l = '&bull; ' . h($m[1]);
-        elseif (preg_match('/^\s*#{1,3}\s+(.*)$/', $line, $m)) $l = '<b>' . h($m[1]) . '</b>';
-        $out[] = $l;
+        $l = preg_replace_callback('~https?://[^\s<]+~', fn($m2) => '<a href="' . $m2[0] . '" rel="noopener nofollow">' . $m2[0] . '</a>', $l);
+        $out[] = $vor . $l . $nach;
     }
     $flush();
     return implode("<br>\n", $out);
@@ -2355,7 +2685,6 @@ function md(string $s): string {
 
 /** Schul- und Klassenfeld mit Suche im WebUntis-Verzeichnis. */
 function schul_felder(array $v = []): string {
-    $z = klasse_zerlegen((string)($v['klasse'] ?? ''));
     ob_start(); ?>
     <div class="f" data-schule>
       <label for="sch">Schule</label>
@@ -2372,13 +2701,10 @@ function schul_felder(array $v = []): string {
     </div>
     <div class="fg">
       <div class="f"><label for="kl">Klasse</label>
-        <input id="kl" name="klasse" value="<?= h($v['klasse'] ?? '') ?>" placeholder="z.B. 2FS152" data-klasse autocomplete="off"></div>
-      <div class="f"><label for="kjahr">Ausbildungsjahr</label>
-        <select id="kjahr" name="jahrgang" data-kjahr><?= optm([''=>'–','1'=>'1','2'=>'2','3'=>'3','W'=>'Verkuerzer'],
-          (string)($v['jahrgang'] ?? ($z['jahr'] ?? ''))) ?></select></div>
-      <div class="f"><label for="kzg">Zeitgruppe</label>
-        <input id="kzg" name="zeitgruppe" type="number" min="0" max="9" data-kzg
-          value="<?= h((string)($v['zeitgruppe'] ?? ($z['zeitgruppe'] ?? ''))) ?>"></div>
+        <input id="kl" name="klasse" value="<?= h($v['klasse'] ?? '') ?>" placeholder="z.B. 2FS152" data-klasse autocomplete="off">
+        <div class="sm mu2" data-klassehinweis style="margin-top:4px"></div></div>
+      <div class="f"><label for="beg">Ausbildungsbeginn</label>
+        <input id="beg" name="start" type="date" value="<?= h($v['start'] ?? '') ?>" data-kstart></div>
     </div>
     <?php return ob_get_clean();
 }
@@ -2419,7 +2745,7 @@ function p_login(): void {
         if (post('web') !== '') { usleep(400000); $err = 'Anmeldung fehlgeschlagen.'; }
         elseif (!rl('ip:' . $ip, LOGIN_MAX_IP, 900)) $err = 'Zu viele Versuche von dieser Adresse. 15 Minuten warten.';
         else {
-            $u = one("SELECT * FROM users WHERE username = ? OR (email IS NOT NULL AND email = ?)", [$ident, $ident]);
+            $u = one("SELECT * FROM users WHERE username = ?", [$ident]);
             $aid = ins('login_attempts', ['ident' => mb_substr($ident, 0, 80), 'ip' => $ip, 'ok' => 0, 'ts' => time()]);
             if ($u && (int)$u['locked_until'] > time()) {
                 $err = 'Konto gesperrt, noch ' . (int)ceil(((int)$u['locked_until'] - time()) / 60) . ' Minuten.';
@@ -2494,23 +2820,20 @@ function p_konto(): void {
             $err[] = 'Code stimmt nicht.';
         }
         $user = preg_replace('/[^A-Za-z0-9._-]/', '', post('username'));
-        $name = post('name');
-        $mail = filter_var(post('email'), FILTER_VALIDATE_EMAIL) ?: '';
         $pw   = (string)($_POST['pw'] ?? '');
         if (mb_strlen($user) < 3) $err[] = 'Benutzername: mindestens 3 Zeichen.';
         if (val("SELECT 1 FROM users WHERE username = ?", [$user])) $err[] = 'Benutzername vergeben.';
-        if ($mail && val("SELECT 1 FROM users WHERE email = ?", [$mail])) $err[] = 'E-Mail vergeben.';
         if ($pw !== (string)($_POST['pw2'] ?? '')) $err[] = 'Passwoerter stimmen nicht ueberein.';
-        foreach (pw_problems($pw, $user, $name) as $p) $err[] = 'Passwort: ' . $p;
+        foreach (pw_problems($pw, $user) as $p) $err[] = 'Passwort: ' . $p;
         if (!$err) {
-            $klasse = mb_substr(post('klasse'), 0, 20);
-            $z = klasse_zerlegen($klasse);
-            $zg = post('zeitgruppe') !== '' ? (int)post('zeitgruppe') : (int)($z['zeitgruppe'] ?? 0);
+            $teile = klasse_teile(post('klasse'));
             $server = preg_match('~^[a-z0-9.-]+\.webuntis\.com$~i', post('untis_server')) ? post('untis_server') : '';
             $uschule = preg_replace('/[^A-Za-z0-9._-]/', '', post('untis_schule'));
-            $uid = ins('users', ['username' => $user, 'email' => $mail ?: null, 'pass_hash' => pw_hash($pw),
-                'name' => $name ?: $user, 'schule' => mb_substr(post('schule'), 0, 120),
-                'klasse' => $klasse, 'zeitgruppe' => max(0, min(9, $zg)),
+            $uid = ins('users', ['username' => $user, 'pass_hash' => pw_hash($pw),
+                'name' => '', 'schule' => mb_substr(post('schule'), 0, 120),
+                'klasse' => mb_substr(post('klasse'), 0, 20),
+                'kl_kuerzel' => $teile['kuerzel'], 'kl_nr' => $teile['nr'],
+                'zeitgruppe' => $teile['zeitgruppe'], 'verkuerzt' => $teile['verkuerzt'],
                 'untis_server' => $server, 'untis_schule' => mb_substr($uschule, 0, 60),
                 'start' => post('start') ?: null, 'betrieb' => post('betrieb'),
                 'ics_token' => bin2hex(random_bytes(16)), 'pw_changed' => date('Y-m-d H:i:s')]);
@@ -2533,18 +2856,12 @@ function p_konto(): void {
           <div class="f"><label for="cd">Code</label>
             <input id="cd" name="code" required autocomplete="off" class="mo" value="<?= h(post('code')) ?>"></div>
         <?php endif; ?>
-        <div class="fg">
-          <div class="f"><label for="us">Benutzername</label><input id="us" name="username" required autocomplete="username" value="<?= h(post('username')) ?>"></div>
-          <div class="f"><label for="nm">Name</label><input id="nm" name="name" required value="<?= h(post('name')) ?>"></div>
-        </div>
+        <div class="f"><label for="us">Benutzername</label>
+          <input id="us" name="username" required autocomplete="username" value="<?= h(post('username')) ?>"></div>
         <?= schul_felder(['schule' => post('schule'), 'klasse' => post('klasse'),
             'untis_server' => post('untis_server'), 'untis_schule' => post('untis_schule'),
-            'jahrgang' => post('jahrgang'), 'zeitgruppe' => post('zeitgruppe')]) ?>
-        <div class="fg">
-          <div class="f"><label for="st">Ausbildungsbeginn</label><input id="st" name="start" type="date" value="<?= h(post('start')) ?>"></div>
-          <div class="f"><label for="bt">Betrieb</label><input id="bt" name="betrieb" value="<?= h(post('betrieb')) ?>"></div>
-        </div>
-        <div class="f"><label for="em">E-Mail</label><input id="em" name="email" type="email" value="<?= h(post('email')) ?>"></div>
+            'start' => post('start')]) ?>
+        <div class="f"><label for="bt">Betrieb</label><input id="bt" name="betrieb" value="<?= h(post('betrieb')) ?>"></div>
         <div class="fg">
           <div class="f"><label for="pw">Passwort</label><input id="pw" name="pw" type="password" required autocomplete="new-password"></div>
           <div class="f"><label for="p2">Wiederholen</label><input id="p2" name="pw2" type="password" required autocomplete="new-password"></div>
@@ -2745,11 +3062,7 @@ function p_faecher(): void {
     $z = fach_zahlen($uid);
     $neu = get('neu') !== '';
     ob_start(); ?>
-    <div class="c"><div class="hd">
-      <h2>Faecher</h2><span class="sp"></span>
-      <a class="bt s g" href="<?= url('faecher', $zeigeArchiv ? [] : ['archiv' => 1]) ?>"><?= $zeigeArchiv ? 'Archiv aus' : 'Archiv zeigen' ?></a>
-      <a class="bt p s" data-new href="<?= url('faecher', ['neu' => 1]) ?>">Neu <kbd>n</kbd></a>
-    </div><div class="bo">
+    <div class="c"><div class="bo">
       <?php if (!$faecher): ?><?= em('Noch keine Faecher.') ?><?php else: ?><?= fach_kacheln($uid, $faecher, $z) ?><?php endif; ?>
     </div></div>
     <?php if ($neu): ?>
@@ -2758,7 +3071,10 @@ function p_faecher(): void {
       </div></div>
     <?php endif; ?>
     <?php
-    page('Faecher', ob_get_clean());
+    page('Faecher', ob_get_clean(), ['unter' => count($faecher) . ' Faecher · alles zu einem Fach an einem Ort',
+        'aktion' => '<a class="bt s g" href="' . h(url('faecher', $zeigeArchiv ? [] : ['archiv' => 1])) . '">'
+            . ($zeigeArchiv ? 'Archiv aus' : 'Archiv') . '</a>'
+            . '<a class="bt p s" data-new href="' . h(url('faecher', ['neu' => 1])) . '">Neues Fach <kbd>n</kbd></a>']);
 }
 
 function fach_form(int $uid, ?array $e): string {
@@ -2805,30 +3121,26 @@ function fach_detail(array $u, array $f): void {
     $artName = ['notiz'=>'Notizen','stoff'=>'Stoff','howto'=>'How-To','snippet'=>'Snippets','link'=>'Links'];
 
     ob_start(); ?>
-    <div class="c"><div class="bo">
-      <div class="rw" style="gap:18px">
-        <span class="dot" style="width:12px;height:12px;background:<?= h($f['color']) ?>"></span>
-        <div style="flex:1;min-width:150px">
-          <div style="font-size:19px;font-weight:600;letter-spacing:-.02em"><?= h($f['name']) ?></div>
-          <div class="sm mu2">
-            <?= $f['short'] ? h($f['short']) : '' ?>
-            <?= $lf ? ' · ' . h($lf['code']) . ' · ' . (int)$lf['jahr'] . '. Jahr' : '' ?>
-            <?= $f['lehrer'] ? ' · ' . h($f['lehrer']) : '' ?>
-          </div>
-        </div>
-        <div style="text-align:right;padding-right:6px"><div class="sm mu2">Schnitt</div>
-          <div style="font-size:21px;font-weight:600;letter-spacing:-.02em;color:<?= h(nfarbe($schnitt)) ?>"><?= $schnitt !== null ? num($schnitt, 2) : '–' ?></div></div>
-        <?php if (count($werte) >= 2): ?><div style="padding-right:6px"><?= spark($werte, 110, 30) ?></div><?php endif; ?>
-        <div class="rw" style="gap:6px">
-          <a class="bt s" href="<?= url('faecher', ['id' => $id, 'e' => 1]) ?>">Bearbeiten</a>
-          <a class="bt s g" href="<?= url('faecher') ?>">Alle</a>
-        </div>
-      </div>
-    </div></div>
+    <div class="g g3" style="margin-bottom:14px">
+      <div class="c"><div class="bo"><div class="lb">Schnitt</div>
+        <div class="rw" style="justify-content:space-between">
+          <div style="font-size:26px;font-weight:640;letter-spacing:-.03em;color:<?= h(nfarbe($schnitt)) ?>"><?= $schnitt !== null ? num($schnitt, 2) : '–' ?></div>
+          <?php if (count($werte) >= 2): ?><?= spark($werte, 110, 30) ?><?php endif; ?>
+        </div></div></div>
+      <div class="c"><div class="bo"><div class="lb">Festgehalten</div>
+        <div style="font-size:26px;font-weight:640;letter-spacing:-.03em"><?= count($notizen) ?>
+          <span class="sm mu2" style="font-weight:400">Notizen</span></div></div></div>
+      <div class="c"><div class="bo"><div class="lb">Anstehend</div>
+        <div style="font-size:26px;font-weight:640;letter-spacing:-.03em">
+          <?= count(array_filter($termine, fn($e) => $e['datum'] >= today())) ?>
+          <span class="sm mu2" style="font-weight:400">Termine</span></div></div></div>
+    </div>
 
     <?php if ($bearbeiten): ?>
       <div class="c" style="max-width:520px"><div class="hd"><h2>Fach bearbeiten</h2></div><div class="bo">
         <?= fach_form($uid, $f) ?>
+        <hr><div class="lb">Teilen</div>
+        <?= share_box($uid, 'fach', $id, (string)$f['name'], url('faecher', ['id' => $id, 'e' => 1])) ?>
         <hr>
         <form method="post" data-q="Fach loeschen? Notizen und Noten bleiben, verlieren aber die Zuordnung.">
           <?= csrf_field() ?><input type="hidden" name="a" value="fachdel"><input type="hidden" name="id" value="<?= $id ?>">
@@ -2945,7 +3257,12 @@ function fach_detail(array $u, array $f): void {
       </div>
     </div>
     <?php
-    page($f['short'] ?: $f['name'], ob_get_clean());
+    $unter = '<span class="dot" style="width:9px;height:9px;background:' . h($f['color']) . '"></span> ';
+    $unter .= $lf ? h($lf['code']) . ' · ' . (int)$lf['jahr'] . '. Jahr' : 'ohne Lernfeld';
+    if ($f['lehrer']) $unter .= ' · ' . h($f['lehrer']);
+    page($f['name'], ob_get_clean(), ['unter' => $unter,
+        'aktion' => '<a class="bt s" href="' . h(url('faecher', ['id' => $id, 'e' => 1])) . '">Bearbeiten</a>'
+            . '<a class="bt s g" href="' . h(url('faecher')) . '">Alle Faecher</a>']);
 }
 
 // --- Uebersicht -------------------------------------------------------------
@@ -2959,7 +3276,7 @@ function p_start(): void {
     $faecher = all("SELECT * FROM subjects WHERE user_id = ? AND archiv = 0 ORDER BY sort, name", [$uid]);
     $z = fach_zahlen($uid);
     $ev = all("SELECT e.*, s.short FROM events e LEFT JOIN subjects s ON s.id = e.subject_id
-               WHERE e.user_id = ? AND e.typ IN ('probe','test','abgabe','pruefung','projekt')
+               WHERE e.user_id = ? AND e.typ IN ('probe','test','abgabe','pruefung','projekt','frist')
                AND e.datum >= date('now','localtime')
                ORDER BY e.datum, e.zeit_von LIMIT 10", [$uid]);
     $tk = all("SELECT t.*, s.short FROM tasks t LEFT JOIN subjects s ON s.id = t.subject_id
@@ -3024,7 +3341,7 @@ function p_start(): void {
       }); ?>
     <div class="c"><div class="hd"><h2>Faecher</h2><span class="sp"></span>
       <a class="bt s g" href="<?= url('faecher') ?>">alle</a></div><div class="bo">
-      <?= fach_kacheln($uid, array_slice($faecher, 0, 12), $z) ?>
+      <?= fach_kacheln($uid, array_slice($faecher, 0, 8), $z) ?>
     </div></div>
     <?php endif; ?>
 
@@ -3086,19 +3403,19 @@ function p_start(): void {
       </div>
     </div>
     <?php
-    page('Uebersicht', ob_get_clean());
+    $unter = h(de_names(date('l, j. F Y'))) . ' · ' . stand_text($u);
+    if ($block) $unter .= ' · ' . h($block['art'] === 'schule' ? 'Blockwoche' : ucfirst((string)$block['art']));
+    page('Heute', ob_get_clean(), ['unter' => $unter]);
 }
 
 // --- Termine ---------------------------------------------------------------
 // --- Plan: Termine, Aufgaben, Stundenplan, Blockplan ------------------------
-function plan_kopf(string $aktiv): string {
-    $tabs = ['termine' => 'Termine', 'aufgaben' => 'Aufgaben', 'stundenplan' => 'Stundenplan', 'block' => 'Blockplan'];
-    $o = '<div class="rw np" style="margin-bottom:14px"><div class="seg">';
-    foreach ($tabs as $k => $l) {
-        $o .= '<a class="' . ($aktiv === $k ? 'on' : '') . '" href="'
-            . h(url('plan', $k === 'termine' ? [] : ['t' => $k])) . '">' . h($l) . '</a>';
+function plan_tabs(): array {
+    $t = [];
+    foreach (['termine' => 'Termine', 'aufgaben' => 'Aufgaben', 'stundenplan' => 'Stundenplan', 'block' => 'Blockplan'] as $k => $l) {
+        $t[$k] = [$l, url('plan', $k === 'termine' ? [] : ['t' => $k])];
     }
-    return $o . '</div></div>';
+    return $t;
 }
 function p_plan(): void {
     $u = need_login();
@@ -3129,7 +3446,6 @@ function plan_stundenplan(array $u): void {
                    WHERE e.user_id = ? AND e.typ = 'unterricht' AND e.datum BETWEEN date('now','localtime')
                    AND date('now','localtime','+6 day') ORDER BY e.datum, e.zeit_von", [$uid]);
     ob_start(); ?>
-    <?= plan_kopf('stundenplan') ?>
     <?php if ($import): ?>
       <div class="c"><div class="hd"><h2>Aus WebUntis diese Woche</h2><span class="sp"></span>
         <a class="bt s g" href="<?= url('einstellungen', ['t' => 'quellen']) ?>">Quellen</a></div>
@@ -3159,7 +3475,7 @@ function plan_stundenplan(array $u): void {
       </form>
     </div></div>
     <?php
-    page('Plan', ob_get_clean());
+    page('Stundenplan', ob_get_clean(), ['tabs' => plan_tabs(), 'aktiv' => 'stundenplan']);
 }
 
 function plan_block(array $u): void {
@@ -3192,7 +3508,6 @@ function plan_block(array $u): void {
     $archive = get('laden') !== '' ? blockplan_archive() : [];
     $jahr = lehrjahr($u, today());
     ob_start(); ?>
-    <?= plan_kopf('block') ?>
     <div class="sp2">
       <div class="c"><div class="hd"><h2>Blockwochen</h2><span class="sp"></span>
         <span class="sm mu2"><?= count($bl) ?></span></div>
@@ -3250,7 +3565,7 @@ function plan_block(array $u): void {
       </div>
     </div>
     <?php
-    page('Plan', ob_get_clean());
+    page('Blockplan', ob_get_clean(), ['tabs' => plan_tabs(), 'aktiv' => 'block']);
 }
 
 function plan_termine(array $u): void {
@@ -3260,7 +3575,7 @@ function plan_termine(array $u): void {
         $a = post('a'); $id = (int)post('id', '0');
         if ($a === 'save') {
             $d = ['subject_id' => inull(postn('subject_id')),
-                'typ' => in_array(post('typ'), ['probe','test','abgabe','pruefung','termin','projekt','frei'], true) ? post('typ') : 'termin',
+                'typ' => in_array(post('typ'), ['probe','test','abgabe','pruefung','termin','projekt','frist','frei'], true) ? post('typ') : 'termin',
                 'titel' => mb_substr(post('titel'), 0, 200), 'beschreibung' => post('beschreibung'),
                 'datum' => isodate(post('datum')) ? post('datum') : today(),
                 'zeit_von' => post('zeit_von'), 'zeit_bis' => post('zeit_bis'),
@@ -3294,7 +3609,6 @@ function plan_termine(array $u): void {
                  [$uid, $start->format('Y-m-d'), $start->modify('+41 days')->format('Y-m-d')]) as $e) $cal[$e['datum']][] = $e;
 
     ob_start(); ?>
-    <?= plan_kopf('termine') ?>
     <div class="sp2">
       <div>
         <div class="c">
@@ -3304,7 +3618,8 @@ function plan_termine(array $u): void {
               <input type="date" name="von" value="<?= h($von) ?>" style="width:135px">
               <input type="date" name="bis" value="<?= h($bis) ?>" style="width:135px">
               <select name="typ" style="width:110px"><?= optm(['' => 'Alle', 'probe' => 'Probe', 'test' => 'Test',
-                'abgabe' => 'Abgabe', 'pruefung' => 'Pruefung', 'termin' => 'Termin', 'projekt' => 'Projekt'], $typ) ?></select>
+                'abgabe' => 'Abgabe', 'pruefung' => 'Pruefung', 'termin' => 'Termin', 'projekt' => 'Projekt',
+                'frist' => 'Frist'], $typ) ?></select>
               <button class="s" type="submit">Filter</button>
             </form>
             <a class="bt p s" data-new href="<?= url('plan', ['neu' => 1]) ?>">Neu <kbd>n</kbd></a>
@@ -3356,7 +3671,7 @@ function plan_termine(array $u): void {
             <div class="fg">
               <div class="f"><label for="ty">Art</label><select id="ty" name="typ"><?= optm(
                 ['probe'=>'Probe','test'=>'Test','abgabe'=>'Abgabe','pruefung'=>'Pruefung','termin'=>'Termin',
-                 'projekt'=>'Projekt','frei'=>'Frei'], $edit['typ'] ?? 'probe') ?></select></div>
+                 'projekt'=>'Projekt','frist'=>'Frist','frei'=>'Frei'], $edit['typ'] ?? 'probe') ?></select></div>
               <div class="f"><label for="da">Datum</label><input id="da" name="datum" type="date" required value="<?= h($edit['datum'] ?? today()) ?>"></div>
             </div>
             <div class="fg">
@@ -3393,7 +3708,7 @@ function plan_termine(array $u): void {
       </div>
     </div>
     <?php
-    page('Plan', ob_get_clean());
+    page('Termine', ob_get_clean(), ['tabs' => plan_tabs(), 'aktiv' => 'termine']);
 }
 
 // --- Aufgaben --------------------------------------------------------------
@@ -3429,7 +3744,6 @@ function plan_aufgaben(array $u): void {
     $rows = all($sql, $ar);
     $edit = get('id') !== '' ? one("SELECT * FROM tasks WHERE id = ? AND user_id = ?", [(int)get('id'), $uid]) : null;
     ob_start(); ?>
-    <?= plan_kopf('aufgaben') ?>
     <div class="sp2">
       <div class="c">
         <div class="hd">
@@ -3487,7 +3801,7 @@ function plan_aufgaben(array $u): void {
       </div></div>
     </div>
     <?php
-    page('Plan', ob_get_clean());
+    page('Aufgaben', ob_get_clean(), ['tabs' => plan_tabs(), 'aktiv' => 'aufgaben']);
 }
 
 // --- Notizen ---------------------------------------------------------------
@@ -3545,7 +3859,6 @@ function p_notizen(): void {
             <select name="lf" style="width:100px"><?= opts(all("SELECT nr AS id, code AS name FROM lernfelder ORDER BY nr"), $lf, 'Alle LF') ?></select>
             <button class="s" type="submit">Filter</button>
           </form>
-          <a class="bt p s" data-new href="<?= url('notizen', ['neu' => 1]) ?>">Neu <kbd>n</kbd></a>
         </div>
         <?php if (!$rows): ?><?= em('Nichts gefunden.') ?><?php else: ?>
         <div class="tw"><table><tbody>
@@ -3607,6 +3920,8 @@ function p_notizen(): void {
               <?php endforeach; ?></ul>
           <?php endif; ?>
           <?php if (!$neu): ?>
+            <hr><div class="lb">Teilen</div>
+            <?= share_box($uid, 'notiz', (int)$edit['id'], (string)($edit['titel'] ?: 'Notiz'), url('notizen', ['id' => (int)$edit['id']])) ?>
             <hr><form method="post" data-q="Notiz loeschen?"><?= csrf_field() ?>
               <input type="hidden" name="a" value="del"><input type="hidden" name="id" value="<?= (int)$edit['id'] ?>">
               <button class="d s" type="submit">Loeschen</button></form>
@@ -3624,7 +3939,8 @@ function p_notizen(): void {
       </div>
     </div>
     <?php
-    page('Notizen', ob_get_clean());
+    page('Notizen', ob_get_clean(), ['unter' => count($rows) . ' Eintraege',
+        'aktion' => '<a class="bt p s" data-new href="' . h(url('notizen', ['neu' => 1])) . '">Neue Notiz <kbd>n</kbd></a>']);
 }
 
 // --- Noten -----------------------------------------------------------------
@@ -3740,18 +4056,17 @@ function p_noten(): void {
       </div></div>
     </div>
     <?php
-    page('Noten', ob_get_clean());
+    page('Noten', ob_get_clean(), ['unter' => count($g['rows']) . ' Noten'
+        . ($g['schnitt'] !== null ? ' · Schnitt ' . num((float)$g['schnitt'], 2) : '')]);
 }
 
 // --- Berichtsheft ----------------------------------------------------------
-function bh_kopf(string $aktiv): string {
-    $tabs = ['woche' => 'Nachweis', 'alle' => 'Alle', 'routinen' => 'Routinen', 'abwesend' => 'Abwesenheiten'];
-    $o = '<div class="rw np" style="margin-bottom:14px"><div class="seg">';
-    foreach ($tabs as $k => $l) {
-        $o .= '<a class="' . ($aktiv === $k ? 'on' : '') . '" href="'
-            . h(url('berichtsheft', $k === 'woche' ? [] : ['t' => $k])) . '">' . h($l) . '</a>';
+function bh_tabs(): array {
+    $t = [];
+    foreach (['woche' => 'Nachweis', 'alle' => 'Alle', 'plan' => 'Ausbildungsplan', 'routinen' => 'Routinen'] as $k => $l) {
+        $t[$k] = [$l, url('berichtsheft', $k === 'woche' ? [] : ['t' => $k])];
     }
-    return $o . '</div></div>';
+    return $t;
 }
 
 function p_berichtsheft(): void {
@@ -3765,23 +4080,13 @@ function p_berichtsheft(): void {
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($tab === 'routinen' || in_array(post('a'), ['log','unlog'], true))) {
         bh_routinen($u); return;
     }
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && post('a') === 'dok') {
+        $rep = report_get($uid, $art, $per);
+        bh_druck($u, $rep, report_sum((int)$rep['id'])); return;
+    }
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         csrf_check();
         $a = post('a');
-        if ($a === 'abw') {
-            $von = isodate(post('von')) ? post('von') : today();
-            $bis = isodate(post('bis')) && post('bis') >= $von ? post('bis') : $von;
-            ins('absences', ['user_id' => $uid, 'von' => $von, 'bis' => $bis,
-                'art' => in_array(post('art'), ['krank','urlaub','frei','dienstreise'], true) ? post('art') : 'krank',
-                'grund' => mb_substr(post('grund'), 0, 200), 'schule' => post('schule') ? 1 : 0,
-                'entschuldigt' => post('entschuldigt') ? 1 : 0]);
-            flash('Erfasst.');
-            redirect(url('berichtsheft', ['t' => 'abwesend']));
-        }
-        if ($a === 'abwdel') {
-            del('absences', 'id = ? AND user_id = ?', [(int)post('id', '0'), $uid]);
-            redirect(url('berichtsheft', ['t' => 'abwesend']));
-        }
         $pp = post('periode') ?: $per;
         if (!periode_ok($pp, $art)) $pp = $per;
         $rep = report_ensure($uid, $art, $pp);
@@ -3824,7 +4129,7 @@ function p_berichtsheft(): void {
     }
 
     if ($tab === 'alle')     { bh_liste($u); return; }
-    if ($tab === 'abwesend') { bh_abwesend($u); return; }
+    if ($tab === 'plan')     { bh_ausbildungsplan($u); return; }
     if ($tab === 'routinen') { bh_routinen($u); return; }
 
     $rep = report_get($uid, $art, $per);
@@ -3836,23 +4141,19 @@ function p_berichtsheft(): void {
     while ($d <= $e) { $tage[$d->format('Y-m-d')] = $d; $d = $d->modify('+1 day'); }
 
     ob_start(); ?>
-    <?= bh_kopf('woche') ?>
     <div class="c np"><div class="bo" style="padding:7px 10px">
       <div class="rw" style="justify-content:space-between">
         <div class="rw">
-          <a class="bt s g" href="<?= url('berichtsheft', ['periode' => periode_shift($per, $art, -1), 'art' => $art]) ?>">&larr;</a>
-          <b style="min-width:190px;text-align:center"><?= h(periode_label($per, $art)) ?></b>
-          <a class="bt s g" href="<?= url('berichtsheft', ['periode' => periode_shift($per, $art, 1), 'art' => $art]) ?>">&rarr;</a>
+          <a class="bt s g" href="<?= url('berichtsheft', ['periode' => periode_shift($per, $art, -1), 'art' => $art]) ?>" title="zurueck">&larr;</a>
+          <b style="min-width:180px;text-align:center"><?= h(periode_label($per, $art)) ?></b>
+          <a class="bt s g" href="<?= url('berichtsheft', ['periode' => periode_shift($per, $art, 1), 'art' => $art]) ?>" title="weiter">&rarr;</a>
           <a class="bt s g" href="<?= url('berichtsheft', ['art' => $art]) ?>">heute</a>
           <span class="tg <?= $zu ? 'o' : 'w' ?>"><?= $zu ? 'fertig' : 'offen' ?></span>
-          <span class="sm mu mo"><?= num($s['std'], 1) ?> h · Nr. <?= (int)$rep['nr'] ?></span>
+          <span class="sm mu mo">Nr. <?= (int)$rep['nr'] ?></span>
         </div>
-        <div class="rw">
-          <a class="bt s <?= $art === 'woche' ? 'p' : 'g' ?>" href="<?= url('berichtsheft', ['art' => 'woche']) ?>">Woche</a>
-          <a class="bt s <?= $art === 'monat' ? 'p' : 'g' ?>" href="<?= url('berichtsheft', ['art' => 'monat']) ?>">Monat</a>
-          <a class="bt s g" href="<?= url('berichtsheft', ['periode' => $per, 'art' => $art, 'druck' => 1]) ?>">Drucken</a>
-          <a class="bt s g" href="<?= url('berichtsheft', ['t' => 'alle']) ?>">Alle</a>
-          <a class="bt s g" href="<?= url('berichtsheft', ['t' => 'abwesend']) ?>">Abwesend</a>
+        <div class="seg">
+          <a class="<?= $art === 'woche' ? 'on' : '' ?>" href="<?= url('berichtsheft', ['art' => 'woche']) ?>">Woche</a>
+          <a class="<?= $art === 'monat' ? 'on' : '' ?>" href="<?= url('berichtsheft', ['art' => 'monat']) ?>">Monat</a>
         </div>
       </div>
     </div></div>
@@ -3887,7 +4188,7 @@ function p_berichtsheft(): void {
                     <form method="post"><?= csrf_field() ?><input type="hidden" name="a" value="kat">
                       <input type="hidden" name="periode" value="<?= h($per) ?>">
                       <input type="hidden" name="eid" value="<?= (int)$r['id'] ?>">
-                      <select name="cat" onchange="this.form.submit()" style="height:24px;font-size:12px"><?= kat_opts($r['category_id'], 'ohne') ?></select>
+                      <select name="cat" data-autosubmit style="height:24px;font-size:12px"><?= kat_opts($r['category_id'], 'ohne') ?></select>
                       <noscript><button class="s" type="submit">ok</button></noscript></form>
                     <?php endif; ?>
                   </td>
@@ -3945,6 +4246,11 @@ function p_berichtsheft(): void {
           <pre id="bt" style="white-space:pre-wrap;max-height:220px;overflow:auto;font-size:11.5px"><?= h(report_text((int)$rep['id'])) ?></pre>
         </div></div>
         <?php endif; ?>
+        <div class="c"><div class="hd"><h2>Teilen</h2></div><div class="bo">
+          <?= share_box($uid, 'bericht', (int)$rep['id'],
+              'Nachweis ' . periode_label($rep['periode'], $rep['art']),
+              url('berichtsheft', ['periode' => $per, 'art' => $art])) ?>
+        </div></div>
         <div class="c"><div class="bo">
           <?php if (!$zu): ?>
             <form method="post"><?= csrf_field() ?><input type="hidden" name="a" value="fertig">
@@ -3962,7 +4268,10 @@ function p_berichtsheft(): void {
       </div>
     </div>
     <?php
-    page('Berichtsheft', ob_get_clean());
+    page('Berichtsheft', ob_get_clean(), ['tabs' => bh_tabs(), 'aktiv' => 'woche',
+        'unter' => h(periode_label($per, $art)) . ' · ' . num((float)$s['std'], 1) . ' h'
+            . ($rep['abteilung'] !== '' ? ' · ' . h($rep['abteilung']) : ''),
+        'aktion' => '<a class="bt s g" href="' . h(url('berichtsheft', ['periode' => $per, 'art' => $art, 'druck' => 1])) . '">Drucken</a>']);
 }
 
 function bh_liste(array $u): void {
@@ -3973,7 +4282,6 @@ function bh_liste(array $u): void {
                  AND (r.status <> 'offen' OR EXISTS (SELECT 1 FROM report_entries e WHERE e.report_id = r.id)
                       OR r.schule_text <> '') ORDER BY r.von DESC", [$uid]);
     ob_start(); ?>
-    <?= bh_kopf('alle') ?>
     <div class="c">
       <div class="hd"><h2>Alle Nachweise</h2><span class="sp"></span>
         <a class="bt s g" href="<?= url('berichtsheft') ?>">Aktuelle Woche</a>
@@ -3993,79 +4301,69 @@ function bh_liste(array $u): void {
       <?php endif; ?>
     </div>
     <?php
-    page('Nachweise', ob_get_clean());
+    page('Alle Nachweise', ob_get_clean(), ['tabs' => bh_tabs(), 'aktiv' => 'alle']);
 }
 
-function bh_abwesend(array $u): void {
+/**
+ * Vollstaendiger Name steht nicht im Konto. Vor einem Ausdruck, der ihn braucht,
+ * wird er einmal abgefragt - auf Wunsch gespeichert, sonst nur fuer diese Sitzung.
+ */
+function dok_daten(array $u, string $zurueck): ?array {
     $uid = (int)$u['id'];
-    $rows = all("SELECT * FROM absences WHERE user_id = ? ORDER BY von DESC", [$uid]);
-    $at = function (array $r): int {
-        $d = new DateTimeImmutable($r['von']); $e = new DateTimeImmutable($r['bis']); $n = 0;
-        while ($d <= $e) { if ((int)$d->format('N') <= 5) $n++; $d = $d->modify('+1 day'); }
-        return $n;
-    };
-    $jahr = date('Y');
-    $imJ = array_filter($rows, fn($r) => substr($r['von'], 0, 4) === $jahr);
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && post('a') === 'dok') {
+        csrf_check();
+        $d = ['name' => mb_substr(post('dok_name'), 0, 80), 'geb' => isodate(post('dok_geb')) ? post('dok_geb') : ''];
+        $_SESSION['dok'] = $d;
+        if (post('merken') !== '') {
+            upd('users', ['dok_name' => $d['name'], 'dok_geb' => $d['geb'], 'dok_merken' => 1], 'id = :id', ['id' => $uid]);
+        } elseif ((int)$u['dok_merken'] === 1) {
+            upd('users', ['dok_name' => '', 'dok_geb' => '', 'dok_merken' => 0], 'id = :id', ['id' => $uid]);
+        }
+        return $d;
+    }
+    if (!empty($_SESSION['dok']['name'])) return $_SESSION['dok'];
+    if ((int)$u['dok_merken'] === 1 && $u['dok_name'] !== '') return ['name' => $u['dok_name'], 'geb' => (string)$u['dok_geb']];
+    $vor = $_SESSION['dok']['name'] ?? $u['dok_name'];
     ob_start(); ?>
-    <?= bh_kopf('abwesend') ?>
-    <div class="sp2">
-      <div class="c">
-        <div class="hd"><h2>Abwesenheiten</h2><span class="sp"></span>
-          <span class="sm mu"><?= $jahr ?>: <?= array_sum(array_map($at, array_filter($imJ, fn($r) => $r['art'] === 'krank'))) ?> krank,
-            <?= array_sum(array_map($at, array_filter($imJ, fn($r) => $r['art'] === 'urlaub'))) ?> Urlaub</span>
-          <a class="bt s g" href="<?= url('berichtsheft') ?>">Berichtsheft</a></div>
-        <?php if (!$rows): ?><?= em('Nichts erfasst.') ?><?php else: ?>
-        <div class="tw"><table><thead><tr><th>Zeitraum</th><th class="n">Tage</th><th>Art</th><th>Grund</th><th>Schule</th><th></th></tr></thead><tbody>
-          <?php foreach ($rows as $r): ?>
-            <tr><td class="mo sm" style="white-space:nowrap"><?= h(dt($r['von'], 'd.m.y')) ?><?= $r['bis'] !== $r['von'] ? '–' . h(dt($r['bis'], 'd.m.y')) : '' ?></td>
-              <td class="n"><?= $at($r) ?></td>
-              <td><span class="tg <?= $r['art'] === 'krank' ? 'e' : ($r['art'] === 'urlaub' ? 'o' : '') ?>"><?= h($r['art']) ?></span></td>
-              <td class="sm"><?= h($r['grund']) ?></td>
-              <td class="sm"><?= (int)$r['schule'] ? ((int)$r['entschuldigt'] ? '<span class="tg o">entsch.</span>' : '<span class="tg e">offen</span>') : '' ?></td>
-              <td style="width:30px"><form method="post" action="<?= url('berichtsheft') ?>" data-q="Loeschen?">
-                <?= csrf_field() ?><input type="hidden" name="a" value="abwdel">
-                <input type="hidden" name="id" value="<?= (int)$r['id'] ?>">
-                <button class="g s d" type="submit">&times;</button></form></td></tr>
-          <?php endforeach; ?>
-        </tbody></table></div>
-        <?php endif; ?>
-      </div>
-      <div class="c"><div class="hd"><h2>Neu</h2></div><div class="bo">
-        <form method="post" action="<?= url('berichtsheft') ?>">
-          <?= csrf_field() ?><input type="hidden" name="a" value="abw">
-          <div class="fg">
-            <div class="f"><label for="v">Von</label><input id="v" name="von" type="date" required value="<?= h(today()) ?>" data-new></div>
-            <div class="f"><label for="b">Bis</label><input id="b" name="bis" type="date" value="<?= h(today()) ?>"></div>
-          </div>
-          <div class="f"><label for="ar">Art</label><select id="ar" name="art"><?= optm(
-            ['krank'=>'Krank','urlaub'=>'Urlaub','frei'=>'Frei','dienstreise'=>'Dienstreise'], 'krank') ?></select></div>
-          <div class="f"><label for="gr">Grund</label><input id="gr" name="grund"></div>
-          <div class="rw" style="margin-bottom:8px">
-            <label style="display:flex;gap:5px;align-items:center;font-weight:400"><input type="checkbox" name="schule" value="1"> Berufsschule</label>
-            <label style="display:flex;gap:5px;align-items:center;font-weight:400"><input type="checkbox" name="entschuldigt" value="1"> entschuldigt</label>
-          </div>
-          <button class="p" type="submit">Speichern</button>
-        </form>
-      </div></div>
-    </div>
+    <div class="c" style="max-width:440px"><div class="bo">
+      <h2>Angaben fuer den Ausdruck</h2>
+      <p class="mu sm">Stehen nicht im Konto und werden nur fuer dieses Dokument gebraucht.</p>
+      <form method="post">
+        <?= csrf_field() ?><input type="hidden" name="a" value="dok">
+        <div class="f"><label for="dkn">Vor- und Nachname</label>
+          <input id="dkn" name="dok_name" required autofocus value="<?= h($vor) ?>"></div>
+        <div class="f"><label for="dkg">Geburtsdatum <span class="mu sm">optional</span></label>
+          <input id="dkg" name="dok_geb" type="date" value="<?= h($_SESSION['dok']['geb'] ?? $u['dok_geb']) ?>"></div>
+        <label class="ck"><input type="checkbox" name="merken" value="1"<?= (int)$u['dok_merken'] ? ' checked' : '' ?>>
+          im Konto merken</label>
+        <div class="rw" style="margin-top:12px">
+          <button class="p" type="submit">Weiter</button>
+          <a class="bt g" href="<?= h($zurueck) ?>">Abbrechen</a>
+        </div>
+      </form>
+    </div></div>
     <?php
-    page('Abwesenheiten', ob_get_clean());
+    page('Angaben', ob_get_clean());
+    return null;
 }
 
 function bh_druck(array $u, array $rep, array $s): void {
+    $zurueck = url('berichtsheft', ['periode' => $rep['periode'], 'art' => $rep['art']]);
+    $dok = dok_daten($u, $zurueck);
+    if ($dok === null) return;
     $betrieb = array_filter($s['rows'], fn($r) => $r['ort'] !== 'schule');
     $schule  = array_filter($s['rows'], fn($r) => $r['ort'] === 'schule');
     $sb = array_sum(array_map(fn($r) => (float)$r['stunden'], $betrieb));
     $ss = array_sum(array_map(fn($r) => (float)$r['stunden'], $schule));
     ob_start(); ?>
     <div class="rw np" style="justify-content:flex-end;margin-bottom:10px">
-      <a class="bt s g" href="<?= url('berichtsheft', ['periode' => $rep['periode'], 'art' => $rep['art']]) ?>">&larr; zurueck</a></div>
+      <a class="bt s g" href="<?= h($zurueck) ?>">&larr; zurueck</a></div>
     <div class="c"><div class="bo">
       <h1 style="font-size:19px;margin-bottom:2px">Ausbildungsnachweis Nr. <?= (int)$rep['nr'] ?></h1>
       <p class="mu sm"><?= $rep['art'] === 'monat' ? 'Monatsnachweis' : 'Wochennachweis' ?> ·
         <?= h(periode_label($rep['periode'], $rep['art'])) ?></p>
       <div class="tw"><table style="margin-bottom:12px">
-        <tr><th style="width:20%">Auszubildende/-r</th><td><?= h($u['name'] ?: $u['username']) ?></td>
+        <tr><th style="width:20%">Auszubildende/-r</th><td><?= h($dok['name']) ?><?= $dok['geb'] ? ' <span class="sm mu">* ' . h(dt($dok['geb'])) . '</span>' : '' ?></td>
             <th style="width:16%">Ausbildungsjahr</th><td><?= (int)$rep['jahr'] ?></td></tr>
         <tr><th>Beruf</th><td><?= h($u['beruf']) ?></td>
             <th>Zeitraum</th><td><?= h(dt($rep['von'])) ?> – <?= h(dt($rep['bis'])) ?></td></tr>
@@ -4135,7 +4433,6 @@ function bh_routinen(array $u): void {
                  WHERE l.user_id = ? ORDER BY l.datum DESC, l.id DESC LIMIT 120", [$uid]);
     $edit = get('id') !== '' ? one("SELECT * FROM routines WHERE id = ? AND user_id = ?", [(int)get('id'), $uid]) : (get('neu') !== '' ? ['id' => 0] : null);
     ob_start(); ?>
-    <?= bh_kopf('routinen') ?>
     <?= quick($u, 'routine') ?>
     <div class="sp2">
       <div>
@@ -4230,10 +4527,492 @@ function bh_routinen(array $u): void {
       </div>
     </div>
     <?php
-    page('Berichtsheft', ob_get_clean());
+    page('Routinen', ob_get_clean(), ['tabs' => bh_tabs(), 'aktiv' => 'routinen']);
+}
+
+/**
+ * Ausbildungsplan: welche Berufsbildposition der FIAusbV schon durch Nachweise
+ * belegt ist - und welche noch offen steht.
+ */
+function bh_ausbildungsplan(array $u): void {
+    $uid = (int)$u['id'];
+    $cats = all("SELECT * FROM categories ORDER BY abschnitt, sort, id");
+    $zahlen = [];
+    foreach (all("SELECT category_id, COUNT(*) AS n, SUM(stunden) AS std, MAX(datum) AS letzt
+                  FROM report_entries WHERE user_id = ? AND category_id IS NOT NULL
+                  GROUP BY category_id", [$uid]) as $r) {
+        $zahlen[(int)$r['category_id']] = $r;
+    }
+    $ohne = (int)val("SELECT COUNT(*) FROM report_entries WHERE user_id = ? AND category_id IS NULL", [$uid], 0);
+    $abschnitt = ['A' => 'Abschnitt A – berufsprofilgebende Fertigkeiten',
+                  'C' => 'Abschnitt C – Fachrichtung Systemintegration',
+                  'B' => 'Abschnitt B – integrative Inhalte',
+                  'X' => 'Sonstiges'];
+    $grp = [];
+    foreach ($cats as $c) $grp[$c['abschnitt']][] = $c;
+    // X-Positionen sind Organisatorisches und zaehlen nicht zum Ausbildungsplan
+    $plan = array_values(array_filter($cats, fn($c) => $c['abschnitt'] !== 'X'));
+    $belegt = count(array_filter($plan, fn($c) => isset($zahlen[(int)$c['id']])));
+    $maxStd = max(1.0, max(array_map(fn($r) => (float)$r['std'], $zahlen ?: [['std' => 1]])));
+
+    $lf = all("SELECT l.nr, l.code, l.titel, l.jahr,
+                 (SELECT COUNT(*) FROM notes n WHERE n.user_id = ? AND n.lf_no = l.nr) AS notizen,
+                 (SELECT COUNT(*) FROM report_entries e WHERE e.user_id = ? AND e.lf_no = l.nr) AS eintraege
+               FROM lernfelder l ORDER BY l.nr", [$uid, $uid]);
+    ob_start(); ?>
+    <div class="g g3" style="margin-bottom:14px">
+      <div class="c"><div class="bo"><div class="lb">Positionen belegt</div>
+        <div style="font-size:26px;font-weight:640;letter-spacing:-.03em"><?= $belegt ?>
+          <span class="sm mu2" style="font-weight:400">von <?= count($plan) ?></span></div>
+        <div class="br" style="margin-top:8px"><i style="width:<?= round($belegt / max(1, count($plan)) * 100) ?>%"></i></div>
+      </div></div>
+      <div class="c"><div class="bo"><div class="lb">Ohne Zuordnung</div>
+        <div style="font-size:26px;font-weight:640;letter-spacing:-.03em"><?= $ohne ?>
+          <span class="sm mu2" style="font-weight:400">Eintraege</span></div></div></div>
+      <div class="c"><div class="bo"><div class="lb">Lernfelder mit Material</div>
+        <div style="font-size:26px;font-weight:640;letter-spacing:-.03em">
+          <?= count(array_filter($lf, fn($l) => (int)$l['notizen'] + (int)$l['eintraege'] > 0)) ?>
+          <span class="sm mu2" style="font-weight:400">von <?= count($lf) ?></span></div></div></div>
+    </div>
+
+    <?php foreach ($abschnitt as $ab => $lbl): if (empty($grp[$ab])) continue; ?>
+      <div class="c"><div class="hd"><h2><?= h($lbl) ?></h2></div>
+        <div class="tw"><table><thead><tr><th style="width:56px">Pos.</th><th>Inhalt</th>
+          <th class="n" style="width:64px">Eintr.</th><th class="n" style="width:64px">Std</th>
+          <th style="width:96px">zuletzt</th><th style="width:120px"></th></tr></thead><tbody>
+          <?php foreach ($grp[$ab] as $c): $z = $zahlen[(int)$c['id']] ?? null; ?>
+            <tr<?= $z ? '' : ' style="opacity:.55"' ?>>
+              <td class="mo sm"><?= h($c['pos_no']) ?></td>
+              <td><?= h($c['name']) ?></td>
+              <td class="n"><?= $z ? (int)$z['n'] : '–' ?></td>
+              <td class="n"><?= $z && (float)$z['std'] > 0 ? num((float)$z['std'], 1) : '' ?></td>
+              <td class="mo sm mu2"><?= $z ? h(dt($z['letzt'], 'd.m.y')) : '' ?></td>
+              <td><div class="br"><i style="width:<?= $z ? max(4, round((float)$z['std'] / $maxStd * 100)) : 0 ?>%;background:<?= h($c['farbe']) ?>"></i></div></td>
+            </tr>
+          <?php endforeach; ?>
+        </tbody></table></div>
+      </div>
+    <?php endforeach; ?>
+
+    <div class="c"><div class="hd"><h2>Lernfelder</h2><span class="sp"></span>
+      <span class="sm mu2">Notizen und Nachweise je Lernfeld</span></div>
+      <div class="tw"><table><thead><tr><th style="width:78px">LF</th><th>Titel</th>
+        <th style="width:56px">Jahr</th><th class="n" style="width:74px">Notizen</th>
+        <th class="n" style="width:74px">Nachweis</th></tr></thead><tbody>
+        <?php foreach ($lf as $l): $leer = (int)$l['notizen'] + (int)$l['eintraege'] === 0; ?>
+          <tr<?= $leer ? ' style="opacity:.55"' : '' ?>>
+            <td class="mo sm" style="white-space:nowrap"><a href="<?= url('notizen', ['lf' => $l['nr']]) ?>"><?= h($l['code']) ?></a></td>
+            <td><?= h($l['titel']) ?></td>
+            <td class="sm mu2"><?= (int)$l['jahr'] ?>.</td>
+            <td class="n"><?= (int)$l['notizen'] ?: '–' ?></td>
+            <td class="n"><?= (int)$l['eintraege'] ?: '–' ?></td>
+          </tr>
+        <?php endforeach; ?>
+      </tbody></table></div>
+    </div>
+    <?php
+    page('Ausbildungsplan', ob_get_clean(), ['tabs' => bh_tabs(), 'aktiv' => 'plan',
+        'unter' => 'Berufsbildpositionen der FIAusbV, belegt aus dem Berichtsheft']);
+}
+
+// --- Einsaetze, Fehlzeiten, Urlaub -----------------------------------------
+function einsatz_tabs(): array {
+    return ['abteilungen' => ['Abteilungen', url('einsaetze')],
+            'zeiten'      => ['Fehlzeiten & Urlaub', url('einsaetze', ['t' => 'zeiten'])]];
+}
+/** Arbeitstage eines Zeitraums (Mo-Fr). */
+function werktage(string $von, string $bis): int {
+    $d = new DateTimeImmutable($von); $e = new DateTimeImmutable($bis); $n = 0;
+    while ($d <= $e) { if ((int)$d->format('N') <= 5) $n++; $d = $d->modify('+1 day'); }
+    return $n;
+}
+function p_einsaetze(): void {
+    $u = need_login(); $uid = (int)$u['id'];
+    $t = get('t') === 'zeiten' ? 'zeiten' : 'abteilungen';
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        csrf_check();
+        $a = post('a'); $id = (int)post('id', '0');
+        if ($a === 'save') {
+            $von = isodate(post('von')) ? post('von') : today();
+            $bis = isodate(post('bis')) && post('bis') >= $von ? post('bis') : '';
+            $d = ['abteilung' => mb_substr(post('abteilung'), 0, 80), 'von' => $von, 'bis' => $bis,
+                'ansprech' => mb_substr(post('ansprech'), 0, 80),
+                'schwerpunkt' => mb_substr(post('schwerpunkt'), 0, 200),
+                'notiz' => mb_substr(post('notiz'), 0, 500)];
+            if ($d['abteilung'] === '') flash('Abteilung fehlt.', 'err');
+            elseif ($id) { upd('einsaetze', $d, 'id = :id AND user_id = :u', ['id' => $id, 'u' => $uid]); flash('Gespeichert.'); }
+            else { $d['user_id'] = $uid; ins('einsaetze', $d); flash('Einsatz angelegt.'); }
+        } elseif ($a === 'del') {
+            del('einsaetze', 'id = ? AND user_id = ?', [$id, $uid]);
+        } elseif ($a === 'jetzt') {
+            $e = one("SELECT * FROM einsaetze WHERE id = ? AND user_id = ?", [$id, $uid]);
+            if ($e) { upd('users', ['abteilung' => $e['abteilung']], 'id = :id', ['id' => $uid]); flash('Als aktuelle Abteilung gesetzt.'); }
+        } elseif ($a === 'abw') {
+            $von = isodate(post('von')) ? post('von') : today();
+            $bis = isodate(post('bis')) && post('bis') >= $von ? post('bis') : $von;
+            ins('absences', ['user_id' => $uid, 'von' => $von, 'bis' => $bis,
+                'art' => in_array(post('art'), ['krank','urlaub','frei','dienstreise','schulung'], true) ? post('art') : 'krank',
+                'grund' => mb_substr(post('grund'), 0, 200), 'schule' => post('schule') ? 1 : 0,
+                'entschuldigt' => post('entschuldigt') ? 1 : 0, 'tage' => werktage($von, $bis)]);
+            flash('Erfasst.');
+        } elseif ($a === 'abwdel') {
+            del('absences', 'id = ? AND user_id = ?', [$id, $uid]);
+        } elseif ($a === 'urlaub') {
+            upd('users', ['urlaub_tage' => max(0, min(60, (float)str_replace(',', '.', post('urlaub_tage', '0'))))],
+                'id = :id', ['id' => $uid]);
+            flash('Gespeichert.');
+        }
+        redirect(url('einsaetze', $t === 'zeiten' ? ['t' => 'zeiten'] : []));
+    }
+
+    if ($t === 'zeiten') {
+        $rows = all("SELECT * FROM absences WHERE user_id = ? ORDER BY von DESC LIMIT 300", [$uid]);
+        $jahr = date('Y');
+        $tage = function (string $art) use ($rows, $jahr) {
+            $n = 0;
+            foreach ($rows as $r) if ($r['art'] === $art && substr($r['von'], 0, 4) === $jahr) $n += werktage($r['von'], $r['bis']);
+            return $n;
+        };
+        $genommen = $tage('urlaub');
+        $rest = max(0, (float)$u['urlaub_tage'] - $genommen);
+        ob_start(); ?>
+        <div class="g g3" style="margin-bottom:14px">
+          <div class="c"><div class="bo"><div class="lb">Urlaub <?= h($jahr) ?></div>
+            <div style="font-size:26px;font-weight:640;letter-spacing:-.03em"><?= num($rest, 0) ?>
+              <span class="sm mu2" style="font-weight:400">von <?= num((float)$u['urlaub_tage'], 0) ?> offen</span></div>
+            <div class="br" style="margin-top:8px"><i style="width:<?= (float)$u['urlaub_tage'] > 0 ? round($rest / (float)$u['urlaub_tage'] * 100) : 0 ?>%;background:var(--ok)"></i></div>
+            <div class="sm mu2" style="margin-top:4px"><?= num($genommen, 0) ?> Tage genommen</div>
+          </div></div>
+          <div class="c"><div class="bo"><div class="lb">Krank <?= h($jahr) ?></div>
+            <div style="font-size:26px;font-weight:640;letter-spacing:-.03em"><?= $tage('krank') ?>
+              <span class="sm mu2" style="font-weight:400">Tage</span></div></div></div>
+          <div class="c"><div class="bo"><div class="lb">Unentschuldigt Schule</div>
+            <div style="font-size:26px;font-weight:640;letter-spacing:-.03em">
+              <?= count(array_filter($rows, fn($r) => (int)$r['schule'] === 1 && (int)$r['entschuldigt'] === 0)) ?>
+              <span class="sm mu2" style="font-weight:400">offen</span></div></div></div>
+        </div>
+        <div class="sp2">
+          <div class="c">
+            <div class="hd"><h2>Fehlzeiten</h2><span class="sp"></span><span class="sm mu2"><?= count($rows) ?></span></div>
+            <?php if (!$rows): ?><?= em('Nichts erfasst.') ?><?php else: ?>
+            <div class="tw"><table><thead><tr><th>Zeitraum</th><th class="n">Tage</th><th>Art</th><th>Grund</th><th>Schule</th><th></th></tr></thead><tbody>
+              <?php foreach ($rows as $r): ?>
+                <tr><td class="mo sm" style="white-space:nowrap"><?= h(dt($r['von'], 'd.m.y')) ?><?= $r['bis'] !== $r['von'] ? '–' . h(dt($r['bis'], 'd.m.y')) : '' ?></td>
+                  <td class="n"><?= werktage($r['von'], $r['bis']) ?></td>
+                  <td><span class="tg <?= $r['art'] === 'krank' ? 'e' : ($r['art'] === 'urlaub' ? 'o' : '') ?>"><?= h($r['art']) ?></span></td>
+                  <td class="sm"><?= h($r['grund']) ?></td>
+                  <td class="sm"><?= (int)$r['schule'] ? ((int)$r['entschuldigt'] ? '<span class="tg o">entsch.</span>' : '<span class="tg e">offen</span>') : '' ?></td>
+                  <td style="width:30px"><form method="post" data-q="Loeschen?">
+                    <?= csrf_field() ?><input type="hidden" name="a" value="abwdel">
+                    <input type="hidden" name="id" value="<?= (int)$r['id'] ?>">
+                    <button class="g s d" type="submit">&times;</button></form></td></tr>
+              <?php endforeach; ?>
+            </tbody></table></div>
+            <?php endif; ?>
+          </div>
+          <div>
+            <div class="c"><div class="hd"><h2>Eintragen</h2></div><div class="bo">
+              <form method="post">
+                <?= csrf_field() ?><input type="hidden" name="a" value="abw">
+                <div class="fg">
+                  <div class="f"><label for="v">Von</label><input id="v" name="von" type="date" required value="<?= h(today()) ?>" data-new></div>
+                  <div class="f"><label for="b">Bis</label><input id="b" name="bis" type="date" value="<?= h(today()) ?>"></div>
+                </div>
+                <div class="f"><label for="ar">Art</label><select id="ar" name="art"><?= optm(
+                  ['krank'=>'Krank','urlaub'=>'Urlaub','frei'=>'Frei','dienstreise'=>'Dienstreise','schulung'=>'Schulung'], 'krank') ?></select></div>
+                <div class="f"><label for="gr">Grund</label><input id="gr" name="grund"></div>
+                <div class="rw" style="margin-bottom:10px">
+                  <label class="ck"><input type="checkbox" name="schule" value="1"> Berufsschule</label>
+                  <label class="ck"><input type="checkbox" name="entschuldigt" value="1"> entschuldigt</label>
+                </div>
+                <button class="p" type="submit">Speichern</button>
+              </form>
+            </div></div>
+            <div class="c"><div class="hd"><h2>Urlaubsanspruch</h2></div><div class="bo">
+              <form method="post" class="rw">
+                <?= csrf_field() ?><input type="hidden" name="a" value="urlaub">
+                <input name="urlaub_tage" inputmode="decimal" style="width:80px;flex:none"
+                       value="<?= h(num((float)$u['urlaub_tage'], 0)) ?>">
+                <span class="sm mu">Tage im Jahr</span>
+                <button class="s" type="submit">Sichern</button>
+              </form>
+            </div></div>
+          </div>
+        </div>
+        <?php
+        page('Fehlzeiten & Urlaub', ob_get_clean(), ['tabs' => einsatz_tabs(), 'aktiv' => 'zeiten']);
+        return;
+    }
+
+    $edit = get('id') !== '' ? one("SELECT * FROM einsaetze WHERE id = ? AND user_id = ?", [(int)get('id'), $uid]) : null;
+    if (get('neu') !== '') $edit = ['id' => 0, 'von' => today()];
+    $rows = all("SELECT * FROM einsaetze WHERE user_id = ? ORDER BY von DESC", [$uid]);
+    ob_start(); ?>
+    <div class="sp2">
+      <div class="c">
+        <div class="hd"><h2>Abteilungsdurchlauf</h2><span class="sp"></span>
+          <a class="bt p s" data-new href="<?= url('einsaetze', ['neu' => 1]) ?>">Neu <kbd>n</kbd></a></div>
+        <?php if (!$rows): ?><?= em('Noch kein Einsatz erfasst. Der Nachweis uebernimmt die Abteilung dann automatisch.') ?>
+        <?php else: ?>
+        <div class="tw"><table><thead><tr><th style="width:150px">Zeitraum</th><th>Abteilung</th>
+          <th>Schwerpunkt</th><th style="width:130px">Ansprechpartner</th><th style="width:34px"></th></tr></thead><tbody>
+          <?php foreach ($rows as $r): $laeuft = $r['von'] <= today() && ($r['bis'] === '' || $r['bis'] >= today()); ?>
+            <tr>
+              <td class="mo sm" style="white-space:nowrap"><?= h(dt($r['von'], 'd.m.y')) ?> –
+                <?= $r['bis'] ? h(dt($r['bis'], 'd.m.y')) : 'offen' ?></td>
+              <td><a href="<?= url('einsaetze', ['id' => $r['id']]) ?>"><?= h($r['abteilung']) ?></a>
+                <?= $laeuft ? ' <span class="tg a">aktuell</span>' : '' ?></td>
+              <td class="sm mu"><?= h($r['schwerpunkt']) ?></td>
+              <td class="sm"><?= h($r['ansprech']) ?></td>
+              <td><form method="post" data-q="Einsatz loeschen?"><?= csrf_field() ?>
+                <input type="hidden" name="a" value="del"><input type="hidden" name="id" value="<?= (int)$r['id'] ?>">
+                <button class="g s d" type="submit">&times;</button></form></td>
+            </tr>
+          <?php endforeach; ?>
+        </tbody></table></div>
+        <?php endif; ?>
+      </div>
+      <div>
+        <?php if ($edit !== null): $neu = empty($edit['id']); ?>
+        <div class="c"><div class="hd"><h2><?= $neu ? 'Neuer Einsatz' : 'Einsatz' ?></h2></div><div class="bo">
+          <form method="post">
+            <?= csrf_field() ?><input type="hidden" name="a" value="save">
+            <input type="hidden" name="id" value="<?= (int)($edit['id'] ?? 0) ?>">
+            <div class="f"><label for="ea">Abteilung</label>
+              <input id="ea" name="abteilung" required value="<?= h($edit['abteilung'] ?? '') ?>"<?= $neu ? ' autofocus' : '' ?>></div>
+            <div class="fg">
+              <div class="f"><label for="ev">Von</label><input id="ev" name="von" type="date" required value="<?= h($edit['von'] ?? today()) ?>"></div>
+              <div class="f"><label for="eb">Bis</label><input id="eb" name="bis" type="date" value="<?= h($edit['bis'] ?? '') ?>"></div>
+            </div>
+            <div class="f"><label for="es">Schwerpunkt</label><input id="es" name="schwerpunkt" value="<?= h($edit['schwerpunkt'] ?? '') ?>"></div>
+            <div class="f"><label for="ep">Ansprechpartner</label><input id="ep" name="ansprech" value="<?= h($edit['ansprech'] ?? '') ?>"></div>
+            <div class="f"><label for="en">Notiz</label><textarea id="en" name="notiz" style="min-height:60px"><?= h($edit['notiz'] ?? '') ?></textarea></div>
+            <div class="rw"><button class="p" type="submit">Speichern</button>
+              <a class="bt g" href="<?= url('einsaetze') ?>">Schliessen</a></div>
+          </form>
+          <?php if (!$neu): ?>
+            <hr><form method="post"><?= csrf_field() ?>
+              <input type="hidden" name="a" value="jetzt"><input type="hidden" name="id" value="<?= (int)$edit['id'] ?>">
+              <button class="s" type="submit">Als aktuelle Abteilung setzen</button></form>
+          <?php endif; ?>
+        </div></div>
+        <?php else: ?>
+        <div class="c"><div class="hd"><h2>Aktuell</h2></div><div class="bo">
+          <dl class="kv">
+            <dt>Abteilung</dt><dd><?= h(einsatz_am($uid, today()) ?: ($u['abteilung'] ?: '–')) ?></dd>
+            <dt>Betrieb</dt><dd><?= h($u['betrieb'] ?: '–') ?></dd>
+            <dt>Ausbilder/-in</dt><dd><?= h($u['ausbilder'] ?: '–') ?></dd>
+          </dl>
+        </div></div>
+        <?php endif; ?>
+      </div>
+    </div>
+    <?php
+    page('Einsaetze', ob_get_clean(), ['tabs' => einsatz_tabs(), 'aktiv' => 'abteilungen']);
+}
+
+// --- Ansprechpartner -------------------------------------------------------
+function p_kontakte(): void {
+    $u = need_login(); $uid = (int)$u['id'];
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        csrf_check();
+        $a = post('a'); $id = (int)post('id', '0');
+        if ($a === 'save') {
+            $d = ['name' => mb_substr(post('name'), 0, 80), 'rolle' => mb_substr(post('rolle'), 0, 80),
+                'bereich' => in_array(post('bereich'), ['betrieb','schule','ihk','sonst'], true) ? post('bereich') : 'betrieb',
+                'telefon' => mb_substr(post('telefon'), 0, 40), 'mail' => mb_substr(post('mail'), 0, 120),
+                'raum' => mb_substr(post('raum'), 0, 40), 'notiz' => mb_substr(post('notiz'), 0, 400),
+                'subject_id' => inull(postn('subject_id'))];
+            if ($d['name'] === '') flash('Name fehlt.', 'err');
+            elseif ($id) { upd('kontakte', $d, 'id = :id AND user_id = :u', ['id' => $id, 'u' => $uid]); flash('Gespeichert.'); }
+            else { $d['user_id'] = $uid; ins('kontakte', $d); flash('Angelegt.'); }
+        } elseif ($a === 'del') {
+            del('kontakte', 'id = ? AND user_id = ?', [$id, $uid]);
+        }
+        redirect(url('kontakte'));
+    }
+    $edit = get('id') !== '' ? one("SELECT * FROM kontakte WHERE id = ? AND user_id = ?", [(int)get('id'), $uid]) : null;
+    if (get('neu') !== '') $edit = ['id' => 0];
+    $rows = all("SELECT k.*, s.short FROM kontakte k LEFT JOIN subjects s ON s.id = k.subject_id
+                 WHERE k.user_id = ? ORDER BY k.bereich, k.name", [$uid]);
+    $grp = [];
+    foreach ($rows as $r) $grp[$r['bereich']][] = $r;
+    $titel = ['betrieb' => 'Betrieb', 'schule' => 'Schule', 'ihk' => 'IHK', 'sonst' => 'Sonstige'];
+    ob_start(); ?>
+    <div class="sp2">
+      <div>
+        <?php if (!$rows): ?><div class="c"><?= em('Noch niemand hinterlegt.') ?></div><?php endif; ?>
+        <?php foreach ($titel as $b => $lbl): if (empty($grp[$b])) continue; ?>
+          <div class="c"><div class="hd"><h2><?= h($lbl) ?></h2><span class="sp"></span>
+            <span class="sm mu2"><?= count($grp[$b]) ?></span></div>
+            <div class="tw"><table><tbody>
+              <?php foreach ($grp[$b] as $k): ?>
+                <tr>
+                  <td style="width:34%"><a href="<?= url('kontakte', ['id' => $k['id']]) ?>"><?= h($k['name']) ?></a>
+                    <?= $k['short'] ? ' <span class="tg">' . h($k['short']) . '</span>' : '' ?>
+                    <div class="sm mu2"><?= h($k['rolle']) ?></div></td>
+                  <td class="sm"><?php if ($k['mail']): ?><a href="mailto:<?= h($k['mail']) ?>"><?= h($k['mail']) ?></a><br><?php endif; ?>
+                    <?= h($k['telefon']) ?></td>
+                  <td class="sm mu"><?= h($k['raum']) ?><?= $k['notiz'] ? '<div class="sm mu2">' . h($k['notiz']) . '</div>' : '' ?></td>
+                  <td style="width:30px"><form method="post" data-q="Loeschen?"><?= csrf_field() ?>
+                    <input type="hidden" name="a" value="del"><input type="hidden" name="id" value="<?= (int)$k['id'] ?>">
+                    <button class="g s d" type="submit">&times;</button></form></td>
+                </tr>
+              <?php endforeach; ?>
+            </tbody></table></div>
+          </div>
+        <?php endforeach; ?>
+      </div>
+      <div class="c"><div class="hd"><h2><?= $edit && !empty($edit['id']) ? 'Bearbeiten' : 'Neu' ?></h2></div><div class="bo">
+        <form method="post">
+          <?= csrf_field() ?><input type="hidden" name="a" value="save">
+          <input type="hidden" name="id" value="<?= (int)($edit['id'] ?? 0) ?>">
+          <div class="f"><label for="kn">Name</label><input id="kn" name="name" required data-new value="<?= h($edit['name'] ?? '') ?>"></div>
+          <div class="fg">
+            <div class="f"><label for="kb">Bereich</label><select id="kb" name="bereich"><?= optm(
+              ['betrieb'=>'Betrieb','schule'=>'Schule','ihk'=>'IHK','sonst'=>'Sonstige'], $edit['bereich'] ?? 'betrieb') ?></select></div>
+            <div class="f"><label for="kr">Rolle</label><input id="kr" name="rolle" value="<?= h($edit['rolle'] ?? '') ?>"></div>
+          </div>
+          <div class="fg">
+            <div class="f"><label for="kt">Telefon</label><input id="kt" name="telefon" value="<?= h($edit['telefon'] ?? '') ?>"></div>
+            <div class="f"><label for="km">E-Mail</label><input id="km" name="mail" value="<?= h($edit['mail'] ?? '') ?>"></div>
+          </div>
+          <div class="fg">
+            <div class="f"><label for="kz">Raum</label><input id="kz" name="raum" value="<?= h($edit['raum'] ?? '') ?>"></div>
+            <div class="f"><label for="kf">Fach</label><select id="kf" name="subject_id"><?= fach_opts($uid, $edit['subject_id'] ?? null) ?></select></div>
+          </div>
+          <div class="f"><label for="kx">Notiz</label><textarea id="kx" name="notiz" style="min-height:56px"><?= h($edit['notiz'] ?? '') ?></textarea></div>
+          <div class="rw"><button class="p" type="submit">Speichern</button>
+            <?php if ($edit && !empty($edit['id'])): ?><a class="bt g" href="<?= url('kontakte') ?>">Neu</a><?php endif; ?></div>
+        </form>
+      </div></div>
+    </div>
+    <?php
+    page('Kontakte', ob_get_clean(), ['unter' => 'Ansprechpartner in Betrieb, Schule und IHK']);
 }
 
 // --- Pruefung --------------------------------------------------------------
+/** Ein Abschlussprojekt je Konto, bei Bedarf aus der alten Notiz uebernommen. */
+function projekt_get(int $uid): array {
+    $p = one("SELECT * FROM projekt WHERE user_id = ? ORDER BY id LIMIT 1", [$uid]);
+    if ($p) return $p;
+    $alt = json_decode((string)val("SELECT v FROM meta WHERE k = ?", ['prj' . $uid], '{}'), true) ?: [];
+    $id = ins('projekt', ['user_id' => $uid, 'titel' => mb_substr((string)($alt['titel'] ?? ''), 0, 200),
+        'beschreibung' => (string)($alt['antrag'] ?? ''),
+        'stunden' => (float)($alt['stunden'] ?? 80) ?: 80,
+        'status' => in_array($alt['status'] ?? '', ['idee','antrag','genehmigt','laeuft','doku','fertig'], true)
+            ? $alt['status'] : 'idee']);
+    return one("SELECT * FROM projekt WHERE id = ?", [$id]);
+}
+function projekt_termine(): array {
+    return ['antrag' => 'Antrag eingereicht', 'genehmigt' => 'Antrag genehmigt', 'von' => 'Durchfuehrung ab',
+            'bis' => 'Durchfuehrung bis', 'doku' => 'Dokumentation abgeben', 'praesentation' => 'Praesentation'];
+}
+function pruef_projekt(array $u): void {
+    $uid = (int)$u['id'];
+    $p = projekt_get($uid);
+    $ph = all("SELECT * FROM projekt_phasen WHERE projekt_id = ? ORDER BY sort, id", [(int)$p['id']]);
+    $soll = array_sum(array_map(fn($x) => (float)$x['stunden'], $ph));
+    $ist  = array_sum(array_map(fn($x) => (float)$x['ist'], $ph));
+    $budget = (float)$p['stunden'] ?: 80;
+    $naechst = null;
+    foreach (projekt_termine() as $k => $lbl) {
+        if ($p[$k] && $p[$k] >= today() && ($naechst === null || $p[$k] < $naechst[0])) $naechst = [$p[$k], $lbl];
+    }
+    ob_start(); ?>
+    <div class="g g3" style="margin-bottom:14px">
+      <div class="c"><div class="bo"><div class="lb">Naechster Schritt</div>
+        <div style="font-size:20px;font-weight:640;letter-spacing:-.02em"><?= $naechst ? h(dt($naechst[0])) : '–' ?></div>
+        <div class="sm mu2"><?= $naechst ? h($naechst[1]) : 'kein Termin gesetzt' ?></div></div></div>
+      <div class="c"><div class="bo"><div class="lb">Stunden geplant</div>
+        <div style="font-size:20px;font-weight:640;letter-spacing:-.02em"><?= num($soll, 1) ?>
+          <span class="sm mu2" style="font-weight:400">von <?= num($budget, 0) ?></span></div>
+        <div class="br" style="margin-top:8px"><i style="width:<?= min(100, round($soll / max(1, $budget) * 100)) ?>%;background:<?= $soll > $budget ? 'var(--er)' : 'var(--ac)' ?>"></i></div></div></div>
+      <div class="c"><div class="bo"><div class="lb">Stunden geleistet</div>
+        <div style="font-size:20px;font-weight:640;letter-spacing:-.02em"><?= num($ist, 1) ?>
+          <span class="sm mu2" style="font-weight:400">h</span></div>
+        <div class="br" style="margin-top:8px"><i style="width:<?= min(100, round($ist / max(1, $budget) * 100)) ?>%"></i></div></div></div>
+    </div>
+
+    <div class="sp2">
+      <div>
+        <div class="c"><div class="hd"><h2>Projekt</h2><span class="sp"></span>
+          <span class="tg <?= $p['status'] === 'fertig' ? 'o' : 'a' ?>"><?= h($p['status']) ?></span></div><div class="bo">
+          <form method="post">
+            <?= csrf_field() ?><input type="hidden" name="a" value="projekt">
+            <div class="f"><label for="pt">Titel</label><input id="pt" name="titel" value="<?= h($p['titel']) ?>"></div>
+            <div class="fg">
+              <div class="f"><label for="px">Status</label><select id="px" name="status"><?= optm(
+                ['idee'=>'Idee','antrag'=>'Antrag gestellt','genehmigt'=>'genehmigt','laeuft'=>'in Umsetzung',
+                 'doku'=>'Dokumentation','fertig'=>'abgeschlossen'], $p['status']) ?></select></div>
+              <div class="f"><label for="ps">Stundenbudget</label><input id="ps" name="stunden" inputmode="decimal" value="<?= h(num($budget, 0)) ?>"></div>
+            </div>
+            <div class="fg">
+              <?php foreach (projekt_termine() as $k => $lbl): ?>
+                <div class="f"><label for="pd<?= h($k) ?>"><?= h($lbl) ?></label>
+                  <input id="pd<?= h($k) ?>" name="<?= h($k) ?>" type="date" value="<?= h($p[$k] ?? '') ?>"></div>
+              <?php endforeach; ?>
+            </div>
+            <div class="f"><label for="pb">Antrag / Beschreibung</label>
+              <textarea id="pb" name="beschreibung" style="min-height:190px" data-d="prj<?= (int)$p['id'] ?>"><?= h($p['beschreibung']) ?></textarea></div>
+            <div class="f"><label for="pn">Notiz</label><textarea id="pn" name="notiz" style="min-height:56px"><?= h($p['notiz']) ?></textarea></div>
+            <div class="rw"><button class="p" type="submit">Speichern</button>
+              <button class="s" name="a" value="prjtermine" type="submit">Termine in den Plan</button></div>
+          </form>
+        </div></div>
+      </div>
+      <div>
+        <div class="c"><div class="hd"><h2>Phasen</h2><span class="sp"></span>
+          <span class="sm mu2"><?= num($soll, 1) ?> h</span></div>
+          <?php if ($ph): ?>
+          <div class="tw"><table><tbody>
+            <?php foreach ($ph as $x): ?>
+              <tr>
+                <td><?= h($x['name']) ?></td>
+                <td style="width:120px">
+                  <form method="post" class="rw" style="gap:4px;flex-wrap:nowrap"><?= csrf_field() ?>
+                    <input type="hidden" name="a" value="phist"><input type="hidden" name="id" value="<?= (int)$x['id'] ?>">
+                    <input name="ist" inputmode="decimal" value="<?= h(num((float)$x['ist'], 1)) ?>" style="height:24px;width:56px">
+                    <span class="sm mu2">/ <?= num((float)$x['stunden'], 1) ?></span>
+                    <button class="s g" type="submit">ok</button>
+                  </form>
+                </td>
+                <td style="width:30px"><form method="post"><?= csrf_field() ?>
+                  <input type="hidden" name="a" value="phdel"><input type="hidden" name="id" value="<?= (int)$x['id'] ?>">
+                  <button class="g s d" type="submit">&times;</button></form></td>
+              </tr>
+            <?php endforeach; ?>
+          </tbody></table></div>
+          <?php else: ?><?= em('Noch keine Phasen.') ?><?php endif; ?>
+          <div class="bo" style="border-top:1px solid var(--li)">
+            <form method="post" class="rw" style="flex-wrap:nowrap">
+              <?= csrf_field() ?><input type="hidden" name="a" value="phneu">
+              <input name="name" required placeholder="Phase" style="flex:1;min-width:0">
+              <input name="stunden" inputmode="decimal" placeholder="h" style="width:60px;flex:none">
+              <button class="p" type="submit" style="flex:none">+</button>
+            </form>
+          </div>
+        </div>
+        <div class="c"><div class="hd"><h2>Ablauf</h2></div>
+          <ul class="li">
+            <?php foreach (projekt_termine() as $k => $lbl): ?>
+              <li><span style="flex:1"><?= h($lbl) ?></span>
+                <span class="mo sm <?= $p[$k] ? '' : 'mu2' ?>"><?= $p[$k] ? h(dt($p[$k])) : '–' ?></span></li>
+            <?php endforeach; ?>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <?php
+    page('Abschlussprojekt', ob_get_clean(), ['tabs' => pruef_tabs(), 'aktiv' => 'projekt',
+        'unter' => h($p['titel'] ?: 'Teil 2 der gestreckten Abschlusspruefung')]);
+}
+function pruef_tabs(): array {
+    return ['start' => ['Uebersicht', url('pruefung')],
+            'projekt' => ['Projekt', url('pruefung', ['t' => 'projekt'])],
+            'lf' => ['Lernfelder', url('pruefung', ['t' => 'lf'])]];
+}
+
 function p_pruefung(): void {
     $u = need_login(); $uid = (int)$u['id'];
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -4245,17 +5024,47 @@ function p_pruefung(): void {
             q("INSERT INTO meta (k,v) VALUES (:k,:v) ON CONFLICT(k) DO UPDATE SET v = :v2",
               ['k' => 'ihk' . $uid, 'v' => json_encode($p), 'v2' => json_encode($p)]);
             flash('Gespeichert.');
-        } elseif (post('a') === 'projekt') {
-            $d = ['titel' => mb_substr(post('titel'), 0, 200), 'kunde' => mb_substr(post('kunde'), 0, 100),
-                  'stunden' => (int)post('stunden', '0'), 'status' => post('status'), 'antrag' => post('antrag')];
-            q("INSERT INTO meta (k,v) VALUES (:k,:v) ON CONFLICT(k) DO UPDATE SET v = :v2",
-              ['k' => 'prj' . $uid, 'v' => json_encode($d), 'v2' => json_encode($d)]);
-            flash('Gespeichert.');
+        } elseif (post('a') === 'projekt' || post('a') === 'prjtermine') {
+            $pj = projekt_get($uid);
+            $d = ['titel' => mb_substr(post('titel'), 0, 200),
+                  'beschreibung' => mb_substr(post('beschreibung'), 0, 20000),
+                  'notiz' => mb_substr(post('notiz'), 0, 2000),
+                  'stunden' => max(0, min(400, (float)str_replace(',', '.', post('stunden', '80')))),
+                  'status' => in_array(post('status'), ['idee','antrag','genehmigt','laeuft','doku','fertig'], true)
+                      ? post('status') : 'idee',
+                  'updated_at' => date('Y-m-d H:i:s')];
+            foreach (array_keys(projekt_termine()) as $k) $d[$k] = isodate(post($k)) ? post($k) : null;
+            upd('projekt', $d, 'id = :id AND user_id = :u', ['id' => (int)$pj['id'], 'u' => $uid]);
+            if (post('a') === 'prjtermine') {
+                $n = 0;
+                foreach (projekt_termine() as $k => $lbl) {
+                    if (!$d[$k]) continue;
+                    $t = 'Projekt: ' . $lbl;
+                    if (one("SELECT id FROM events WHERE user_id = ? AND datum = ? AND titel = ?", [$uid, $d[$k], $t])) continue;
+                    ins('events', ['user_id' => $uid, 'typ' => 'frist', 'titel' => $t, 'datum' => $d[$k],
+                        'beschreibung' => $d['titel'], 'quelle' => 'projekt']);
+                    $n++;
+                }
+                flash($n . ' Termine im Plan.');
+            } else flash('Gespeichert.');
+        } elseif (post('a') === 'phneu') {
+            $pj = projekt_get($uid);
+            if (post('name') !== '') {
+                ins('projekt_phasen', ['projekt_id' => (int)$pj['id'], 'user_id' => $uid,
+                    'name' => mb_substr(post('name'), 0, 80),
+                    'stunden' => max(0, (float)str_replace(',', '.', post('stunden', '0'))),
+                    'sort' => (int)val("SELECT COALESCE(MAX(sort),0)+10 FROM projekt_phasen WHERE projekt_id = ?", [(int)$pj['id']], 10)]);
+            }
+        } elseif (post('a') === 'phist') {
+            upd('projekt_phasen', ['ist' => max(0, (float)str_replace(',', '.', post('ist', '0')))],
+                'id = :id AND user_id = :u', ['id' => (int)post('id', '0'), 'u' => $uid]);
+        } elseif (post('a') === 'phdel') {
+            del('projekt_phasen', 'id = ? AND user_id = ?', [(int)post('id', '0'), $uid]);
         }
         redirect(url('pruefung', get('t') ? ['t' => get('t')] : []));
     }
+    if (get('t') === 'projekt') { pruef_projekt($u); return; }
     $ihk = json_decode((string)val("SELECT v FROM meta WHERE k = ?", ['ihk' . $uid], '{}'), true) ?: [];
-    $prj = json_decode((string)val("SELECT v FROM meta WHERE k = ?", ['prj' . $uid], '{}'), true) ?: [];
     $pg  = ihk_prognose($ihk);
     $pb  = ihk_probleme($ihk);
     $cd  = function (?string $d): ?int { return $d ? (int)ceil((strtotime($d) - strtotime(today())) / 86400) : null; };
@@ -4263,8 +5072,7 @@ function p_pruefung(): void {
     $tab = get('t');
     ob_start(); ?>
     <?php if ($tab === 'lf'): ?>
-      <div class="c"><div class="hd"><h2>Lernfelder</h2><span class="sp"></span>
-        <a class="bt s g" href="<?= url('pruefung') ?>">Pruefung</a></div>
+      <div class="c"><div class="hd"><h2>Lernfelder</h2></div>
         <div class="tw"><table><thead><tr><th>LF</th><th>Titel</th><th class="n">Jahr</th><th class="n">Std</th><th class="n">Notizen</th></tr></thead><tbody>
           <?php foreach (all("SELECT l.*, (SELECT COUNT(*) FROM notes n WHERE n.user_id = ? AND n.lf_no = l.nr) AS anz
                               FROM lernfelder l ORDER BY l.nr", [$uid]) as $l): ?>
@@ -4298,8 +5106,7 @@ function p_pruefung(): void {
             </div>
           </div>
         </div></div>
-        <div class="c"><div class="hd"><h2>Pruefungsbereiche</h2><span class="sp"></span>
-          <a class="bt s g" href="<?= url('pruefung', ['t' => 'lf']) ?>">Lernfelder</a></div><div class="bo">
+        <div class="c"><div class="hd"><h2>Pruefungsbereiche</h2></div><div class="bo">
           <form method="post">
             <?= csrf_field() ?><input type="hidden" name="a" value="punkte">
             <div class="tw"><table><thead><tr><th>Bereich</th><th class="n">Gewicht</th><th style="width:110px">Punkte</th></tr></thead><tbody>
@@ -4316,32 +5123,18 @@ function p_pruefung(): void {
           </form>
         </div></div>
       </div>
-      <div class="c"><div class="hd"><h2>Projektarbeit</h2></div><div class="bo">
-        <form method="post">
-          <?= csrf_field() ?><input type="hidden" name="a" value="projekt">
-          <div class="f"><label for="pt">Titel</label><input id="pt" name="titel" value="<?= h($prj['titel'] ?? '') ?>"></div>
-          <div class="fg">
-            <div class="f"><label for="pk">Kunde</label><input id="pk" name="kunde" value="<?= h($prj['kunde'] ?? '') ?>"></div>
-            <div class="f"><label for="ps">Stunden</label><input id="ps" name="stunden" type="number" min="0" max="80" value="<?= (int)($prj['stunden'] ?? 0) ?>"></div>
-          </div>
-          <div class="f"><label for="px">Status</label><select id="px" name="status"><?= optm(
-            ['idee'=>'Idee','antrag'=>'Antrag geschrieben','eingereicht'=>'eingereicht','genehmigt'=>'genehmigt',
-             'umsetzung'=>'Umsetzung','doku'=>'Dokumentation','abgegeben'=>'abgegeben','praesentiert'=>'praesentiert'],
-            $prj['status'] ?? 'idee') ?></select></div>
-          <div class="f"><label for="pa">Antrag</label>
-            <textarea id="pa" name="antrag" style="min-height:150px" data-d="prj"><?= h($prj['antrag'] ?? '') ?></textarea></div>
-          <button class="p" type="submit">Speichern</button>
-        </form>
-        <?php $st = (int)($prj['stunden'] ?? 0); if ($st): ?>
-          <hr><div class="rw" style="justify-content:space-between"><span class="sm mu">Stunden</span>
-            <span class="sm mo"><?= $st ?> / 80</span></div>
-          <div class="br"><i style="width:<?= min(100, (int)round($st / 80 * 100)) ?>%"></i></div>
-        <?php endif; ?>
-      </div></div>
+      <div>
+        <div class="c"><div class="hd"><h2>Abschlussprojekt</h2></div><div class="bo">
+          <?php $pj = projekt_get($uid); ?>
+          <div style="font-size:15px;font-weight:590"><?= h($pj['titel'] ?: 'noch kein Titel') ?></div>
+          <div class="sm mu2" style="margin-bottom:10px"><?= h($pj['status']) ?></div>
+          <a class="bt s" href="<?= url('pruefung', ['t' => 'projekt']) ?>">Projekt oeffnen</a>
+        </div></div>
+      </div>
     </div>
     <?php endif; ?>
     <?php
-    page('Pruefung', ob_get_clean());
+    page('Pruefung', ob_get_clean(), ['tabs' => pruef_tabs(), 'aktiv' => $tab === 'lf' ? 'lf' : 'start']);
 }
 
 // --- Suche -----------------------------------------------------------------
@@ -4376,7 +5169,7 @@ function p_suche(): void {
       <?php endforeach; ?>
     <?php endif; ?>
     <?php
-    page('Suche', ob_get_clean());
+    page('Suche', ob_get_clean(), ['unter' => mb_strlen($qs) >= 2 ? count($treffer) . ' Treffer fuer &bdquo;' . h($qs) . '&ldquo;' : '']);
 }
 
 // --- Einstellungen ---------------------------------------------------------
@@ -4388,14 +5181,13 @@ function p_einstellungen(): void {
         $a = post('a');
         if ($a === 'profil') {
             $kl = mb_substr(post('klasse'), 0, 20);
-            $zg = (int)post('zeitgruppe', '0');
-            if (!$zg) $zg = (int)(klasse_zerlegen($kl)['zeitgruppe'] ?? 0);
+            $teile = klasse_teile($kl);
+            $zg = (int)post('zeitgruppe', '0') ?: (int)$teile['zeitgruppe'];
             $srv = preg_match('~^[a-z0-9.-]+\.webuntis\.com$~i', post('untis_server')) ? post('untis_server') : '';
             upd('users', ['schule' => mb_substr(post('schule'), 0, 120),
                 'untis_server' => $srv,
                 'untis_schule' => mb_substr(preg_replace('/[^A-Za-z0-9._-]/', '', post('untis_schule')), 0, 60),
-                'name' => mb_substr(post('name'), 0, 80),
-                'email' => filter_var(post('email'), FILTER_VALIDATE_EMAIL) ?: null,
+                'kl_kuerzel' => $teile['kuerzel'], 'kl_nr' => $teile['nr'], 'verkuerzt' => $teile['verkuerzt'],
                 'beruf' => mb_substr(post('beruf'), 0, 100), 'klasse' => $kl, 'zeitgruppe' => max(0, min(9, $zg)),
                 'betrieb' => mb_substr(post('betrieb'), 0, 120), 'ausbilder' => mb_substr(post('ausbilder'), 0, 80),
                 'abteilung' => mb_substr(post('abteilung'), 0, 80),
@@ -4406,7 +5198,8 @@ function p_einstellungen(): void {
         } elseif ($a === 'qsave') {
             $id = (int)post('id', '0');
             $d = ['name' => mb_substr(post('name'), 0, 60) ?: 'Quelle',
-                'typ' => post('typ') === 'webuntis' ? 'webuntis' : 'ics',
+                'typ' => in_array(post('typ'), ['webuntis','feiertage'], true) ? post('typ') : 'ics',
+                'region' => isset(laender()[post('region')]) ? post('region') : 'DE-BY',
                 'modus' => post('modus') === 'stundenplan' ? 'stundenplan' : 'termine',
                 'url' => mb_substr(post('url'), 0, 500),
                 'server' => mb_substr(post('server'), 0, 120), 'schule' => mb_substr(post('schule'), 0, 80),
@@ -4431,9 +5224,17 @@ function p_einstellungen(): void {
                 catch (Throwable $ex) { $r = ['fehler' => $ex->getMessage(), 'n' => 0]; quelle_status($id, 'fehler', $ex->getMessage()); }
                 flash($r['fehler'] !== '' ? $r['fehler'] : $r['n'] . ' Termine uebernommen.', $r['fehler'] !== '' ? 'err' : 'ok');
             }
+        } elseif ($a === 'ferien') {
+            $land = isset(laender()[post('region')]) ? post('region') : 'DE-BY';
+            $sid = ins('sources', ['user_id' => $uid, 'name' => 'Ferien und Feiertage', 'typ' => 'feiertage',
+                'modus' => 'termine', 'url' => '', 'region' => $land, 'intervall' => 10080, 'aktiv' => 1]);
+            $r = feiertage_sync(one("SELECT * FROM sources WHERE id = ?", [$sid]), $u);
+            flash($r['fehler'] !== '' ? $r['fehler'] : $r['n'] . ' Ferien und Feiertage uebernommen.',
+                  $r['fehler'] !== '' ? 'err' : 'ok');
         } elseif ($a === 'qdel') {
             $id = (int)post('id', '0');
             del('events', 'user_id = ? AND quelle = ?', [$uid, 'q' . $id]);
+            del('blocks', 'user_id = ? AND quelle = ?', [$uid, 'q' . $id]);
             del('sources', 'id = ? AND user_id = ?', [$id, $uid]);
             flash('Quelle geloescht.');
         } elseif ($a === 'ziel') {
@@ -4448,7 +5249,7 @@ function p_einstellungen(): void {
             if (!rl('pw:' . $uid, 10, 900)) flash('Zu viele Versuche.', 'err');
             elseif (!password_verify($alt, $u['pass_hash'])) flash('Aktuelles Passwort falsch.', 'err');
             elseif ($neu !== (string)($_POST['neu2'] ?? '')) flash('Passwoerter ungleich.', 'err');
-            elseif ($p = pw_problems($neu, $u['username'], $u['name'])) flash('Passwort: ' . implode(', ', $p), 'err');
+            elseif ($p = pw_problems($neu, $u['username'])) flash('Passwort: ' . implode(', ', $p), 'err');
             else {
                 upd('users', ['pass_hash' => pw_hash($neu), 'pw_changed' => date('Y-m-d H:i:s')], 'id = :id', ['id' => $uid]);
                 q("UPDATE sessions SET revoked = 1 WHERE user_id = ? AND sid_hash <> ?", [$uid, hash('sha256', session_id())]);
@@ -4487,41 +5288,41 @@ function p_einstellungen(): void {
     $rc = $_SESSION['rc'] ?? null; unset($_SESSION['rc']);
     $sec = $_SESSION['tfa'] ?? null;
     ob_start(); ?>
-    <div class="rw np" style="margin-bottom:14px"><div class="seg">
-      <?php foreach (['profil'=>'Profil','quellen'=>'Quellen','sicherheit'=>'Sicherheit','daten'=>'Daten'] as $k => $l): ?>
-        <a class="<?= $t === $k ? 'on' : '' ?>" href="<?= url('einstellungen', ['t' => $k]) ?>"><?= h($l) ?></a>
-      <?php endforeach; ?>
-    </div></div>
-
     <?php if ($t === 'profil'): ?>
-      <div class="c" style="max-width:620px"><div class="bo">
-        <form method="post">
-          <?= csrf_field() ?><input type="hidden" name="a" value="profil"><input type="hidden" name="t" value="profil">
-          <div class="fg">
-            <div class="f"><label>Benutzername</label><input value="<?= h($u['username']) ?>" disabled></div>
-            <div class="f"><label for="nm">Name</label><input id="nm" name="name" value="<?= h($u['name']) ?>"></div>
-          </div>
-          <div class="f"><label for="em">E-Mail</label><input id="em" name="email" type="email" value="<?= h($u['email']) ?>"></div>
-          <?= schul_felder(['schule' => $u['schule'], 'klasse' => $u['klasse'],
-              'untis_server' => $u['untis_server'], 'untis_schule' => $u['untis_schule'],
-              'zeitgruppe' => (int)$u['zeitgruppe'] ?: '']) ?>
-          <div class="f"><label for="br">Beruf</label><input id="br" name="beruf" value="<?= h($u['beruf']) ?>"></div>
-          <div class="fg">
-            <div class="f"><label for="st">Beginn</label><input id="st" name="start" type="date" value="<?= h($u['start']) ?>"></div>
-            <div class="f"><label for="en">Ende</label><input id="en" name="ende" type="date" value="<?= h($u['ende']) ?>"></div>
-            <div class="f"><label for="ws">Wochenstunden</label><input id="ws" name="wochenstunden" inputmode="decimal" value="<?= h($u['wochenstunden']) ?>"></div>
-          </div>
-          <div class="fg">
+      <form method="post">
+        <?= csrf_field() ?><input type="hidden" name="a" value="profil"><input type="hidden" name="t" value="profil">
+        <div class="g g2">
+          <div class="c"><div class="hd"><h2>Schule</h2></div><div class="bo">
+            <?= schul_felder(['schule' => $u['schule'], 'klasse' => $u['klasse'], 'start' => $u['start'],
+                'untis_server' => $u['untis_server'], 'untis_schule' => $u['untis_schule']]) ?>
+            <div class="fg">
+              <div class="f"><label for="br">Beruf</label><input id="br" name="beruf" value="<?= h($u['beruf']) ?>"></div>
+              <div class="f"><label for="en">Ausbildungsende</label><input id="en" name="ende" type="date" value="<?= h($u['ende']) ?>"></div>
+            </div>
+          </div></div>
+
+          <div class="c"><div class="hd"><h2>Betrieb</h2></div><div class="bo">
             <div class="f"><label for="bt">Betrieb</label><input id="bt" name="betrieb" value="<?= h($u['betrieb']) ?>"></div>
-            <div class="f"><label for="ab">Abteilung</label><input id="ab" name="abteilung" value="<?= h($u['abteilung']) ?>"></div>
-          </div>
-          <div class="fg">
-            <div class="f"><label for="au">Ausbilder/-in</label><input id="au" name="ausbilder" value="<?= h($u['ausbilder']) ?>"></div>
-            <div class="f"><label for="bh">Berichtsheft</label><select id="bh" name="bh_art"><?= optm(['woche'=>'woechentlich','monat'=>'monatlich'], $u['bh_art']) ?></select></div>
-          </div>
-          <button class="p" type="submit">Speichern</button>
-        </form>
-      </div></div>
+            <div class="fg">
+              <div class="f"><label for="ab">Abteilung</label><input id="ab" name="abteilung" value="<?= h($u['abteilung']) ?>"
+                placeholder="<?= h(einsatz_am($uid, today())) ?>"></div>
+              <div class="f"><label for="au">Ausbilder/-in</label><input id="au" name="ausbilder" value="<?= h($u['ausbilder']) ?>"></div>
+            </div>
+            <div class="fg">
+              <div class="f"><label for="ws">Wochenstunden</label><input id="ws" name="wochenstunden" inputmode="decimal" value="<?= h($u['wochenstunden']) ?>"></div>
+              <div class="f"><label for="bh">Nachweis</label><select id="bh" name="bh_art"><?= optm(['woche'=>'woechentlich','monat'=>'monatlich'], $u['bh_art']) ?></select></div>
+            </div>
+            <div class="lb" style="margin-top:4px">Fuer Ausdrucke</div>
+            <?php if ((int)$u['dok_merken'] === 1 && $u['dok_name'] !== ''): ?>
+              <div class="sm"><?= h($u['dok_name']) ?><?= $u['dok_geb'] ? ' · ' . h(dt($u['dok_geb'])) : '' ?>
+                <span class="mu2">gespeichert</span></div>
+            <?php else: ?>
+              <div class="sm mu2">Kein Name gespeichert. Er wird vor einem Ausdruck abgefragt.</div>
+            <?php endif; ?>
+          </div></div>
+        </div>
+        <button class="p" type="submit">Speichern</button>
+      </form>
 
     <?php elseif ($t === 'quellen'):
       $quellen = all("SELECT * FROM sources WHERE user_id = ? ORDER BY id", [$uid]);
@@ -4531,14 +5332,20 @@ function p_einstellungen(): void {
       <div class="sp2">
         <div>
           <div class="c"><div class="hd"><h2>Kalender und Stundenplan</h2><span class="sp"></span>
+            <?php if (!array_filter($quellen, fn($x) => $x['typ'] === 'feiertage')): ?>
+              <form method="post" style="display:inline"><?= csrf_field() ?>
+                <input type="hidden" name="a" value="ferien"><input type="hidden" name="t" value="quellen">
+                <select name="region" style="height:24px;font-size:12.5px;width:150px"><?= optm(laender(), 'DE-BY') ?></select>
+                <button class="s" type="submit">Ferien holen</button></form>
+            <?php endif; ?>
             <a class="bt p s" data-new href="<?= url('einstellungen', ['t' => 'quellen', 'neu' => 1]) ?>">Neu</a></div>
             <?php if (!$quellen): ?><?= em('Keine Quelle eingerichtet.') ?><?php else: ?>
             <div class="tw"><table><tbody>
               <?php foreach ($quellen as $s2): ?>
                 <tr><td style="width:14px"><span class="dot" style="background:<?= $s2['status'] === 'fehler' ? 'var(--er)' : ($s2['status'] === 'ok' ? 'var(--ok)' : 'var(--fg3)') ?>"></span></td>
                   <td><a href="<?= url('einstellungen', ['t' => 'quellen', 'id' => $s2['id']]) ?>"><?= h($s2['name']) ?></a>
-                    <div class="sm mu2"><?= h($s2['typ'] === 'webuntis' ? 'WebUntis' : 'iCal') ?> ·
-                      <?= h($s2['modus'] === 'stundenplan' ? 'Stundenplan' : 'Termine') ?>
+                    <div class="sm mu2"><?= h(['webuntis'=>'WebUntis','feiertage'=>'Ferien und Feiertage'][$s2['typ']] ?? 'iCal') ?>
+                      <?= $s2['typ'] === 'feiertage' ? '· ' . h(laender()[$s2['region']] ?? '') : '· ' . h($s2['modus'] === 'stundenplan' ? 'Stundenplan' : 'Termine') ?>
                       <?= $s2['meldung'] ? ' · ' . h($s2['meldung']) : '' ?></div></td>
                   <td class="sm mu2 mo" style="width:110px"><?= $s2['letzter_sync'] ? h(date('d.m.y H:i', (int)$s2['letzter_sync'])) : 'nie' ?></td>
                   <td style="width:96px">
@@ -4581,11 +5388,14 @@ function p_einstellungen(): void {
             <input type="hidden" name="id" value="<?= (int)($e['id'] ?? 0) ?>">
             <div class="f"><label for="qn">Name</label><input id="qn" name="name" required value="<?= h($e['name'] ?? '') ?>"></div>
             <div class="fg">
-              <div class="f"><label for="qt">Art</label><select id="qt" name="typ"><?= optm(['ics'=>'iCal-Adresse','webuntis'=>'WebUntis'], $e['typ'] ?? 'ics') ?></select></div>
+              <div class="f"><label for="qt">Art</label><select id="qt" name="typ"><?= optm(
+                ['ics'=>'iCal-Adresse','webuntis'=>'WebUntis','feiertage'=>'Ferien und Feiertage'], $e['typ'] ?? 'ics') ?></select></div>
               <div class="f"><label for="qm">Ziel</label><select id="qm" name="modus"><?= optm(['termine'=>'Termine','stundenplan'=>'Stundenplan'], $e['modus'] ?? 'termine') ?></select></div>
             </div>
             <div class="f"><label for="qu">iCal-Adresse</label>
               <input id="qu" name="url" value="<?= h($e['url'] ?? '') ?>" placeholder="https://.../Ical.do?school=...&amp;id=...&amp;token=..."></div>
+            <div class="f"><label for="qr">Bundesland <span class="mu sm">fuer Ferien und Feiertage</span></label>
+              <select id="qr" name="region"><?= optm(laender(), $e['region'] ?? 'DE-BY') ?></select></div>
             <fieldset style="border:1px solid var(--li);border-radius:var(--r2);padding:10px;margin:0 0 9px">
               <legend class="sm mu2" style="padding:0 4px">WebUntis</legend>
               <div class="fg">
@@ -4710,6 +5520,11 @@ function p_einstellungen(): void {
             <li><a href="<?= url('export', ['w' => 'notizen']) ?>">Notizen (CSV)</a></li>
           </ul>
         </div></div>
+        <div class="c"><div class="hd"><h2>Geteilte Links</h2><span class="sp"></span>
+          <span class="sm mu2"><?= (int)val("SELECT COUNT(*) FROM shares WHERE user_id = ?", [$uid], 0) ?> aktiv</span></div><div class="bo">
+          <p class="sm mu">Notizen, Faecher und Nachweise, die ueber eine eigene Adresse erreichbar sind.</p>
+          <a class="bt s" href="<?= url('geteilt') ?>">Verwalten</a>
+        </div></div>
         <div class="c"><div class="hd"><h2>Kalender</h2></div><div class="bo">
           <pre id="ic" style="white-space:pre-wrap;word-break:break-all;font-size:11px"><?= h(abs_url(url('ics', ['t' => $u['ics_token'] ?: '-']))) ?></pre>
           <div class="rw"><button class="s" data-copy="ic" type="button">Kopieren</button>
@@ -4737,7 +5552,248 @@ function p_einstellungen(): void {
       </div>
     <?php endif; ?>
     <?php
-    page('Einstellungen', ob_get_clean());
+    $stTabs = [];
+    foreach (['profil'=>'Profil','quellen'=>'Quellen','sicherheit'=>'Sicherheit','daten'=>'Daten'] as $k => $l) {
+        $stTabs[$k] = [$l, url('einstellungen', ['t' => $k])];
+    }
+    page('Einstellungen', ob_get_clean(), ['tabs' => $stTabs, 'aktiv' => $t,
+        'unter' => h($u['username']) . ' · ' . stand_text($u)]);
+}
+
+// --- Geteilte Links --------------------------------------------------------
+// Der einzige Weg, auf dem Inhalte dieses Kontos jemand anderen erreichen.
+function share_arten(): array {
+    return ['notiz' => 'Notiz', 'fach' => 'Fach', 'bericht' => 'Ausbildungsnachweis'];
+}
+function share_url(string $token): string { return abs_url(url('geteilt', ['t' => $token])); }
+function share_of(int $uid, string $art, int $ref): ?array {
+    return one("SELECT * FROM shares WHERE user_id = ? AND art = ? AND ref = ?", [$uid, $art, $ref]);
+}
+/** Knopf zum Teilen, ueberall gleich. */
+function share_box(int $uid, string $art, int $ref, string $titel, string $zurueck): string {
+    $sh = share_of($uid, $art, $ref);
+    ob_start(); ?>
+    <form method="post" action="<?= url('geteilt') ?>" class="rw np" style="gap:8px;flex-wrap:wrap">
+      <?= csrf_field() ?>
+      <input type="hidden" name="art" value="<?= h($art) ?>"><input type="hidden" name="ref" value="<?= (int)$ref ?>">
+      <input type="hidden" name="titel" value="<?= h($titel) ?>"><input type="hidden" name="zu" value="<?= h($zurueck) ?>">
+      <?php if ($sh): ?>
+        <input class="mo sm" readonly value="<?= h(share_url($sh['token'])) ?>" style="flex:1;min-width:180px"
+               data-sel>
+        <button class="s" type="button" data-copy-val="<?= h(share_url($sh['token'])) ?>">Kopieren</button>
+        <button class="s g d" name="a" value="weg" type="submit">Link aufheben</button>
+        <span class="sm mu2"><?= $sh['sichtbar'] === 'konten' ? h($sh['wer'] ?: 'nur angemeldete') : 'jeder mit Link' ?>
+          · <?= (int)$sh['aufrufe'] ?>&times; geoeffnet</span>
+      <?php else: ?>
+        <button class="s" name="a" value="neu" type="submit">Link erstellen</button>
+        <input name="wer" placeholder="nur diese Benutzernamen, mit Komma" style="flex:1;min-width:150px">
+      <?php endif; ?>
+    </form>
+    <?php
+    return ob_get_clean();
+}
+/** Verwaltung und oeffentliche Ansicht liegen auf derselben Adresse. */
+function p_geteilt(): void {
+    if (get('t') !== '') { share_zeigen(get('t')); return; }
+    $u = need_login(); $uid = (int)$u['id'];
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        csrf_check();
+        $art = post('art'); $ref = (int)post('ref', '0'); $a = post('a');
+        $zu  = post('zu');
+        $zurueck = str_starts_with($zu, base_path()) && !str_contains($zu, "\n") ? $zu : url('geteilt');
+        if (!isset(share_arten()[$art]) || $ref <= 0) { redirect(url('geteilt')); }
+        if ($a === 'weg') {
+            del('shares', 'user_id = ? AND art = ? AND ref = ?', [$uid, $art, $ref]);
+            flash('Link aufgehoben.', 'warn');
+        } elseif ($a === 'neu' && !share_of($uid, $art, $ref)) {
+            $wer = [];
+            foreach (preg_split('/[\s,;]+/', post('wer')) as $w) {
+                $w = preg_replace('/[^A-Za-z0-9._-]/', '', $w);
+                if ($w !== '') $wer[] = mb_strtolower($w);
+            }
+            $wer = array_slice(array_unique($wer), 0, 20);
+            ins('shares', ['user_id' => $uid, 'token' => bin2hex(random_bytes(16)), 'art' => $art, 'ref' => $ref,
+                'titel' => mb_substr(post('titel'), 0, 160),
+                'wer' => implode(',', $wer),
+                'sichtbar' => $wer ? 'konten' : 'link']);
+            flash($wer ? 'Link fuer ' . count($wer) . ' Konten erstellt.' : 'Link erstellt.');
+        }
+        redirect($zurueck);
+    }
+    $rows = all("SELECT * FROM shares WHERE user_id = ? ORDER BY id DESC", [$uid]);
+    ob_start(); ?>
+    <div class="c">
+      <div class="hd"><h2>Geteilte Links</h2><span class="sp"></span>
+        <span class="sm mu2"><?= count($rows) ?> aktiv</span></div>
+      <?php if (!$rows): ?><div class="bo"><?= em('Noch nichts geteilt. Der Knopf dazu steht bei der Notiz, beim Fach und beim Nachweis.') ?></div>
+      <?php else: ?>
+      <div class="tw"><table><thead><tr><th style="width:112px">Art</th><th>Inhalt</th>
+        <th style="width:150px">Sichtbar</th><th class="n" style="width:70px">Aufrufe</th><th style="width:150px"></th></tr></thead><tbody>
+        <?php foreach ($rows as $r): ?>
+          <tr>
+            <td><span class="tg"><?= h(share_arten()[$r['art']] ?? $r['art']) ?></span></td>
+            <td><a href="<?= h(share_url($r['token'])) ?>"><?= h($r['titel'] ?: '(ohne Titel)') ?></a>
+              <div class="sm mu2 mo"><?= h(share_url($r['token'])) ?></div></td>
+            <td class="sm"><?= $r['sichtbar'] === 'konten' ? h($r['wer'] ?: 'nur angemeldete') : 'jeder mit Link' ?></td>
+            <td class="n"><?= (int)$r['aufrufe'] ?></td>
+            <td>
+              <button class="s" type="button" data-copy-val="<?= h(share_url($r['token'])) ?>">Kopieren</button>
+              <form method="post" style="display:inline"><?= csrf_field() ?>
+                <input type="hidden" name="art" value="<?= h($r['art']) ?>"><input type="hidden" name="ref" value="<?= (int)$r['ref'] ?>">
+                <button class="s g d" name="a" value="weg" type="submit">Aufheben</button></form>
+            </td>
+          </tr>
+        <?php endforeach; ?>
+      </tbody></table></div>
+      <?php endif; ?>
+    </div>
+    <?php
+    page('Geteilt', ob_get_clean(), ['unter' => 'Der einzige Weg, auf dem etwas dieses Konto verlaesst']);
+}
+function share_404(): void {
+    http_response_code(404);
+    page('Nicht gefunden', '<div class="bo">Diesen Link gibt es nicht mehr.</div>', ['bare' => true]);
+    exit;
+}
+function share_zeigen(string $token): void {
+    header('X-Robots-Tag: noindex, nofollow');
+    if (!preg_match('/^[0-9a-f]{32}$/', $token) || !rl('share:' . client_ip(), 120, 600)) share_404();
+    $sh = one("SELECT * FROM shares WHERE token = ?", [$token]);
+    if (!$sh) share_404();
+    if ($sh['ablauf'] && $sh['ablauf'] < today()) share_404();
+    if ($sh['sichtbar'] === 'konten') {
+        $ich = me();
+        if (!$ich) {
+            $_SESSION['nach'] = url('geteilt', ['t' => $token]);
+            page('Anmeldung noetig', '<div class="bo"><h2>Nur fuer bestimmte Konten</h2>'
+                . '<p class="mu sm">Dieser Link ist nicht oeffentlich.</p>'
+                . '<a class="bt p" href="' . url('login') . '">Anmelden</a></div>', ['bare' => true]);
+            exit;
+        }
+        $erlaubt = array_filter(explode(',', (string)($sh['wer'] ?? '')));
+        if ($erlaubt && (int)$ich['id'] !== (int)$sh['user_id']
+            && !in_array(mb_strtolower($ich['username']), $erlaubt, true)) share_404();
+    }
+    $uid = (int)$sh['user_id'];
+    $besitzer = one("SELECT * FROM users WHERE id = ?", [$uid]);
+    if (!$besitzer) share_404();
+    if (get('f') !== '') { share_datei($sh, (int)get('f')); }
+    q("UPDATE shares SET aufrufe = aufrufe + 1 WHERE id = ?", [(int)$sh['id']]);
+
+    ob_start();
+    if ($sh['art'] === 'notiz')        share_notiz($sh, $uid);
+    elseif ($sh['art'] === 'fach')     share_fach($sh, $uid);
+    elseif ($sh['art'] === 'bericht')  share_bericht($sh, $uid, $besitzer);
+    else share_404();
+    $inhalt = ob_get_clean();
+    if ($inhalt === '') share_404();
+    ob_start(); ?>
+    <div class="c">
+      <div class="hd"><span class="tg"><?= h(share_arten()[$sh['art']] ?? '') ?></span>
+        <span class="sp"></span>
+        <span class="sm mu2">geteilt von <?= h($besitzer['username']) ?> · <?= h(dt($sh['created_at'])) ?></span></div>
+      <div class="bo"><?= $inhalt ?></div>
+    </div>
+    <p class="sm mu2" style="text-align:center;margin-top:14px">Nur-Lesen-Ansicht aus <?= h(APP_NAME) ?>.</p>
+    <?php
+    page($sh['titel'] ?: 'Geteilt', ob_get_clean(), ['bare' => true, 'weit' => true]);
+    exit;
+}
+function share_datei(array $sh, int $fid): void {
+    $ok = false;
+    if ($sh['art'] === 'notiz') $ok = (bool)one("SELECT id FROM files WHERE id = ? AND user_id = ? AND scope='note' AND scope_id = ?",
+        [$fid, (int)$sh['user_id'], (int)$sh['ref']]);
+    if ($sh['art'] === 'fach') $ok = (bool)one("SELECT fi.id FROM files fi JOIN notes n ON n.id = fi.scope_id
+        WHERE fi.id = ? AND fi.user_id = ? AND fi.scope = 'note' AND n.subject_id = ?",
+        [$fid, (int)$sh['user_id'], (int)$sh['ref']]);
+    if (!$ok) share_404();
+    $f = one("SELECT * FROM files WHERE id = ?", [$fid]);
+    header('Content-Type: ' . $f['mime']);
+    header('Content-Length: ' . strlen($f['daten']));
+    header('X-Content-Type-Options: nosniff');
+    header('Content-Disposition: attachment; filename="' . preg_replace('/[^\x20-\x7e]/', '_', $f['name']) . '"');
+    echo $f['daten'];
+    exit;
+}
+function share_notiz(array $sh, int $uid): void {
+    $n = one("SELECT n.*, s.name AS fach FROM notes n LEFT JOIN subjects s ON s.id = n.subject_id
+              WHERE n.id = ? AND n.user_id = ?", [(int)$sh['ref'], $uid]);
+    if (!$n) return;
+    ?>
+    <h1 style="font-size:20px;margin-bottom:4px"><?= h($n['titel'] ?: 'Notiz') ?></h1>
+    <p class="sm mu2"><?= h(dt($n['datum'])) ?><?= $n['fach'] ? ' · ' . h($n['fach']) : '' ?>
+      <?= $n['lf_no'] ? ' · LF' . (int)$n['lf_no'] : '' ?><?= $n['tags'] ? ' · ' . h($n['tags']) : '' ?></p>
+    <?php if ($n['kind'] === 'snippet'): ?>
+      <pre id="snip"><?= h($n['body']) ?></pre>
+      <button class="s" type="button" data-copy="snip">Code kopieren</button>
+    <?php else: ?>
+      <div><?= md($n['body']) ?></div>
+    <?php endif;
+    $files = all("SELECT id, name, groesse FROM files WHERE scope='note' AND scope_id = ? AND user_id = ?", [(int)$n['id'], $uid]);
+    if ($files): ?>
+      <hr><ul class="li"><?php foreach ($files as $f): ?>
+        <li style="padding:4px 0"><a href="<?= url('geteilt', ['t' => $sh['token'], 'f' => $f['id']]) ?>"><?= h($f['name']) ?></a>
+          <span class="sm mu2 mo"><?= num($f['groesse'] / 1024, 0) ?> kB</span></li>
+      <?php endforeach; ?></ul>
+    <?php endif;
+}
+function share_fach(array $sh, int $uid): void {
+    $f = one("SELECT * FROM subjects WHERE id = ? AND user_id = ?", [(int)$sh['ref'], $uid]);
+    if (!$f) return;
+    $notes = all("SELECT * FROM notes WHERE user_id = ? AND subject_id = ? ORDER BY pinned DESC, datum DESC LIMIT 200", [$uid, (int)$f['id']]);
+    $files = all("SELECT fi.id, fi.name, fi.groesse FROM files fi JOIN notes n ON n.id = fi.scope_id
+                  WHERE fi.user_id = ? AND fi.scope = 'note' AND n.subject_id = ?", [$uid, (int)$f['id']]);
+    ?>
+    <h1 style="font-size:20px;margin-bottom:4px"><?= h($f['name']) ?></h1>
+    <p class="sm mu2"><?= $f['lf_no'] ? 'LF' . (int)$f['lf_no'] . ' · ' : '' ?><?= count($notes) ?> Eintraege</p>
+    <?php if ($files): ?><hr><ul class="li"><?php foreach ($files as $x): ?>
+      <li style="padding:4px 0"><a href="<?= url('geteilt', ['t' => $sh['token'], 'f' => $x['id']]) ?>"><?= h($x['name']) ?></a>
+        <span class="sm mu2 mo"><?= num($x['groesse'] / 1024, 0) ?> kB</span></li>
+    <?php endforeach; ?></ul><?php endif; ?>
+    <?php foreach ($notes as $n): ?>
+      <hr>
+      <h3 style="margin-bottom:2px"><?= h($n['titel'] ?: dt($n['datum'])) ?></h3>
+      <p class="sm mu2"><?= h(dt($n['datum'])) ?> · <?= h($n['kind']) ?></p>
+      <?php if ($n['kind'] === 'snippet'): ?><pre><?= h($n['body']) ?></pre>
+      <?php else: ?><div class="sm"><?= md($n['body']) ?></div><?php endif; ?>
+    <?php endforeach;
+}
+function share_bericht(array $sh, int $uid, array $besitzer): void {
+    $rep = one("SELECT * FROM reports WHERE id = ? AND user_id = ?", [(int)$sh['ref'], $uid]);
+    if (!$rep) return;
+    $s = report_sum((int)$rep['id']);
+    $betrieb = array_filter($s['rows'], fn($r) => $r['ort'] !== 'schule');
+    $schule  = array_filter($s['rows'], fn($r) => $r['ort'] === 'schule');
+    $wer = ((int)$besitzer['dok_merken'] === 1 && $besitzer['dok_name'] !== '') ? $besitzer['dok_name'] : $besitzer['username'];
+    ?>
+    <h1 style="font-size:19px;margin-bottom:2px">Ausbildungsnachweis Nr. <?= (int)$rep['nr'] ?></h1>
+    <p class="mu sm"><?= $rep['art'] === 'monat' ? 'Monatsnachweis' : 'Wochennachweis' ?> ·
+      <?= h(periode_label($rep['periode'], $rep['art'])) ?></p>
+    <div class="tw"><table style="margin-bottom:12px">
+      <tr><th style="width:20%">Auszubildende/-r</th><td><?= h($wer) ?></td>
+          <th style="width:16%">Ausbildungsjahr</th><td><?= (int)$rep['jahr'] ?></td></tr>
+      <tr><th>Beruf</th><td><?= h($besitzer['beruf']) ?></td>
+          <th>Zeitraum</th><td><?= h(dt($rep['von'])) ?> – <?= h(dt($rep['bis'])) ?></td></tr>
+      <tr><th>Betrieb</th><td><?= h($besitzer['betrieb']) ?></td>
+          <th>Abteilung</th><td><?= h($rep['abteilung']) ?></td></tr>
+    </table></div>
+    <h3>Betriebliche Taetigkeiten</h3>
+    <div class="tw"><table><thead><tr><th style="width:13%">Tag</th><th style="width:8%" class="n">Std</th><th>Taetigkeit</th>
+      <th style="width:27%">Ausbildungsinhalt</th></tr></thead><tbody>
+      <?php foreach ($betrieb as $r): ?>
+        <tr><td><?= h(dt($r['datum'], 'D d.m.')) ?></td><td class="n"><?= $r['stunden'] > 0 ? num((float)$r['stunden'], 2) : '' ?></td>
+          <td><?= h($r['text']) ?></td>
+          <td class="sm"><?= h(($r['pos_no'] ? $r['pos_no'] . '  ' : '') . ($r['kategorie'] ?: '')) ?></td></tr>
+      <?php endforeach; ?>
+    </tbody></table></div>
+    <?php if ($rep['schule_text'] !== '' || $schule): ?>
+      <h3 style="margin-top:12px">Berufsschule</h3>
+      <?php if ($rep['schule_text'] !== ''): ?><p><?= nl2br(h($rep['schule_text'])) ?></p><?php endif; ?>
+      <?php if ($schule): ?><div class="tw"><table><tbody>
+        <?php foreach ($schule as $r): ?><tr><td style="width:13%"><?= h(dt($r['datum'], 'D d.m.')) ?></td><td><?= h($r['text']) ?></td></tr><?php endforeach; ?>
+      </tbody></table></div><?php endif;
+    endif;
+    if ($rep['sonstiges'] !== ''): ?><h3 style="margin-top:12px">Sonstiges</h3><p><?= nl2br(h($rep['sonstiges'])) ?></p><?php endif;
 }
 
 // --- Dateien, Export, Kalender --------------------------------------------
@@ -4926,8 +5982,12 @@ switch ($p) {
     case 'termine':       redirect(url('plan', get('id') !== '' ? ['id' => (int)get('id')] : []));
     case 'aufgaben':      redirect(url('plan', ['t' => 'aufgaben'] + (get('id') !== '' ? ['id' => (int)get('id')] : [])));
     case 'routinen':      redirect(url('berichtsheft', ['t' => 'routinen']));
+    case 'abwesend':      redirect(url('einsaetze', ['t' => 'zeiten']));
     case 'einstellungen': p_einstellungen(); break;
     case 'suche':         p_suche(); break;
+    case 'geteilt':       p_geteilt(); break;
+    case 'einsaetze':     p_einsaetze(); break;
+    case 'kontakte':      p_kontakte(); break;
     default:
         http_response_code(404);
         need_login();
