@@ -18,8 +18,8 @@ notepad C:\caddy\caddyfile
 ---
 
 ## Start&Stop
-| Using | Create | Start | Stop |
-|---|---|---|
+| Using | Start | Stop | Create |
+|---|---|---|---|
 | Task Scheduler `recommendet` | schtasks /create /tn "caddy start" /sc onstart /ru SYSTEM /rl HIGHEST /tr "C:\caddy\caddy.exe run --config C:\caddy\caddyfile" /f | schtasks /run /tn "caddy start" | schtasks /end /tn "caddy start" |
 | Manuelly | / | C:\caddy\caddy.exe start | C:\caddy\caddy.exe stop |
 
