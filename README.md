@@ -30,5 +30,4 @@ Refresh
 
 ## PHP
 
-https://downloads.php.net/~windows/releases/archives/php-8.5.10-nts-Win32-vs17-x64.zip
-VSXXX x64 Non Thread Safe 
+[VSXXX x64 Non Thread Safe](https://www.php.net/downloads.php?os=windows&osvariant=windows-downloads&version=default)
