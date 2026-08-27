@@ -1,4 +1,8 @@
 ```
+.\caddy.exe run
+.\caddy.exe run --config .\Caddyfile
+```
+```
 # ============================================================
 # GLOBALE OPTIONEN
 # Diese Optionen stehen außerhalb aller Domain-Blöcke.
