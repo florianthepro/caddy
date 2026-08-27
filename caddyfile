@@ -9,7 +9,7 @@ buergerabstimmung.org {
     encode gzip zstd
     file_server
 }
-
+2
 idr.getitsec.com {
     root * C:/caddy/www/idr.getitsec.com
     encode gzip zstd
