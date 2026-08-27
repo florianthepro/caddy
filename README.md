@@ -35,6 +35,8 @@ C:\caddy\caddy.exe start
 ```
 C:\caddy\caddy.exe stop
 ```
+
+Refresh
 ```
 C:\caddy\caddy.exe reload
 ```
