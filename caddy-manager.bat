@@ -1374,6 +1374,20 @@ function Read-SiteDirectives {
             'php_fastcgi' {
                 $Site.type = 'php'
                 $Config.php.enabled = $true
+                # Anzahl und Startport aus der vorhandenen Zeile uebernehmen. Sonst
+                # wuerden aus einem laufenden PHP-Prozess stillschweigend vier, und
+                # drei davon liefen ins Leere, bis die Einrichtung nachgezogen hat.
+                $pports = New-Object System.Collections.ArrayList
+                foreach ($u in ($tk | Select-Object -Skip 1)) {
+                    if ($u -match '^127\.0\.0\.1:(\d{2,5})$') { [void]$pports.Add([int]$Matches[1]) }
+                }
+                if ($pports.Count -gt 0) {
+                    $sorted = @($pports.ToArray() | Sort-Object)
+                    if ($sorted.Count -gt $Config.php.poolSize) {
+                        $Config.php.poolSize = $sorted.Count
+                        $Config.php.basePort = $sorted[0]
+                    }
+                }
                 Read-HandlerOptions $d $Site
             }
             'reverse_proxy' {
@@ -1500,6 +1514,9 @@ function Read-BasicAuth {
 function Import-Caddyfile {
     param([string]$Text)
     $cfg = New-DefaultConfig
+    # 0 heisst: noch keine php_fastcgi-Zeile gesehen. Am Ende wird daraus die
+    # Vorgabe, falls die Datei keine Angabe enthielt.
+    $cfg.php.poolSize = 0
     $clean = Remove-CaddyComments $Text
     $statements = Split-CaddyStatements $clean
     $sites = New-Object System.Collections.ArrayList
@@ -1598,6 +1615,7 @@ function Import-Caddyfile {
         if ($cleanSite) { [void]$sites.Add($cleanSite) }
     }
 
+    if ($cfg.php.poolSize -lt 1) { $cfg.php.poolSize = 4 }
     $cfg.sites = $sites.ToArray()
     $joinedSnippets = ($snippets.ToArray() -join "`n`n")
     if ($joinedSnippets.Length -le 16000 -and (Test-BalancedBraces $joinedSnippets)) {
