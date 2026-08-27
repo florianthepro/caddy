@@ -7,9 +7,10 @@ ftpcraft.com {
 buergerabstimmung.org {
     root * C:/caddy/www/buergerabstimmung.org
     encode gzip zstd
+    php_fastcgi 127.0.0.1:9000
     file_server
 }
-2
+
 idr.getitsec.com {
     root * C:/caddy/www/idr.getitsec.com
     encode gzip zstd
