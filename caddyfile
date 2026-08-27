@@ -5,7 +5,13 @@ ftpcraft.com {
 }
 
 buergerabstimmung.org {
-    root * C:/caddy/www/2.example.com
+    root * C:/caddy/www/buergerabstimmung.org
+    encode gzip zstd
+    file_server
+}
+
+idr.getitsec.com {
+    root * C:/caddy/www/idr.getitsec.com
     encode gzip zstd
     file_server
 }
