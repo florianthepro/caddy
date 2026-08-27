@@ -24,8 +24,17 @@ title Caddy Manager
 set "SELF=%~f0"
 
 rem --- Administratorrechte pruefen -----------------------------------------
+rem  Das Kennwort --elevated bekommt nur die Fassung, die wir selbst mit
+rem  erhoehten Rechten gestartet haben. Es verhindert eine Endlosschleife,
+rem  falls fltmc gesperrt ist oder fehlt: die Pruefung meldet dann auch mit
+rem  Adminrechten einen Fehler, und die Datei wuerde sich endlos neu starten.
+rem  Ueber die Umgebung ginge das nicht - der erhoehte Prozess erbt sie nicht.
+if /i "%~1"=="--elevated" goto :elevated
 fltmc >nul 2>&1
 if "%errorlevel%"=="0" goto :elevated
+
+where powershell.exe >nul 2>&1
+if not "%errorlevel%"=="0" goto :nopowershell
 
 echo.
 echo   Caddy Manager braucht Administratorrechte.
@@ -33,14 +42,11 @@ echo   Geplante Aufgaben, Firewallregeln und C:\caddy gehen sonst nicht.
 echo.
 echo   Windows fragt gleich nach.
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Start-Process -FilePath $env:SELF -Verb RunAs } catch { Write-Host '  Abgebrochen. Ohne Administratorrechte laeuft die Einrichtung nicht.' -ForegroundColor Yellow; Start-Sleep -Seconds 4 }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Start-Process -FilePath $env:SELF -ArgumentList '--elevated' -Verb RunAs } catch { Write-Host '  Abgebrochen. Ohne Administratorrechte laeuft die Einrichtung nicht.' -ForegroundColor Yellow; Start-Sleep -Seconds 4 }"
 endlocal
 exit /b
 
 :elevated
-where powershell.exe >nul 2>&1
-if not "%errorlevel%"=="0" goto :nopowershell
-
 rem --- Eingebetteten PowerShell-Teil einlesen und ausfuehren ----------------
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $marker=':::PS'+'START:::'; $lines=@(Get-Content -LiteralPath $env:SELF -Encoding UTF8); $i=[array]::IndexOf($lines,$marker); if ($i -lt 0) { Write-Host '  Der eingebettete Programmteil fehlt - ist die Datei vollstaendig?' -ForegroundColor Red; exit 2 }; $code=($lines[($i+1)..($lines.Count-1)] -join [Environment]::NewLine); Invoke-Expression $code"
 
@@ -139,10 +145,12 @@ $LegacyTaskNames = @('caddy watchdog', 'caddy start', 'php fastcgi')
 # ---------------------------------------------------------------------------
 #  TLS fuer alle ausgehenden Downloads erzwingen
 # ---------------------------------------------------------------------------
+# Nur TLS 1.2 dazuschalten. TLS 1.3 wird bewusst nicht gesetzt: auf aelteren
+# Windows-Ausgaben existiert der Enum-Wert zwar, der Aufbau scheitert dann aber
+# bei jeder Verbindung. Alle benoetigten Gegenstellen koennen TLS 1.2.
 try {
-    $proto = [Net.SecurityProtocolType]::Tls12
-    try { $proto = $proto -bor [Net.SecurityProtocolType]::Tls13 } catch { }
-    [Net.ServicePointManager]::SecurityProtocol = $proto
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 } catch { }
 
 # ---------------------------------------------------------------------------
@@ -161,9 +169,26 @@ function Write-Audit {
         $fi = Get-Item -LiteralPath $Paths.Audit -ErrorAction SilentlyContinue
         if ($fi -and $fi.Length -gt 900KB) {
             $keep = Get-Content -LiteralPath $Paths.Audit -Tail 2000
-            Set-Content -LiteralPath $Paths.Audit -Value $keep -Encoding UTF8
+            Write-TextFile $Paths.Audit (($keep -join "`r`n") + "`r`n")
         }
     } catch { }
+}
+
+# Set-Content -Encoding UTF8 schreibt unter Windows PowerShell 5.1 eine
+# Bytefolgemarkierung an den Dateianfang. Caddy verkraftet sie zwar, meldet die
+# Datei dann aber als "nicht formatiert". Deshalb ueberall ohne Markierung.
+function Write-TextFile {
+    param([string]$Path, [string]$Text)
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, [string]$Text, $enc)
+}
+
+# Textdateien enden mit genau einem Zeilenumbruch. Fehlt er, meldet
+# "caddy fmt" die Datei als nicht formatiert.
+function ConvertTo-FileText {
+    param([string]$Text)
+    if ($null -eq $Text) { return "`r`n" }
+    return ($Text.TrimEnd("`r", "`n") + [Environment]::NewLine)
 }
 
 function Write-Host2 {
@@ -227,7 +252,8 @@ function Invoke-Exe {
         [string[]]$Arguments = @(),
         [int]$TimeoutSec = 120,
         [hashtable]$Environment = $null,
-        [string]$WorkDir = $null
+        [string]$WorkDir = $null,
+        [string]$StdIn = $null
     )
     $result = [ordered]@{ ok = $false; code = -1; stdout = ''; stderr = ''; timedOut = $false }
     if (-not (Test-Path -LiteralPath $FilePath)) {
@@ -241,6 +267,7 @@ function Invoke-Exe {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
+    if ($null -ne $StdIn) { $psi.RedirectStandardInput = $true }
     if ($WorkDir) { $psi.WorkingDirectory = $WorkDir }
     if ($Environment) {
         foreach ($k in $Environment.Keys) { $psi.EnvironmentVariables[$k] = [string]$Environment[$k] }
@@ -249,6 +276,10 @@ function Invoke-Exe {
     $proc.StartInfo = $psi
     try {
         [void]$proc.Start()
+        if ($null -ne $StdIn) {
+            try { $proc.StandardInput.WriteLine($StdIn) } catch { }
+            try { $proc.StandardInput.Close() } catch { }
+        }
         $tOut = $proc.StandardOutput.ReadToEndAsync()
         $tErr = $proc.StandardError.ReadToEndAsync()
         if ($proc.WaitForExit($TimeoutSec * 1000)) {
@@ -258,8 +289,10 @@ function Invoke-Exe {
             $result.timedOut = $true
             try { $proc.Kill() } catch { }
         }
-        try { $result.stdout = $tOut.Result } catch { }
-        try { $result.stderr = $tErr.Result } catch { }
+        # Nach einem Abbruch koennen Enkelprozesse die Ausgabekanaele offen
+        # halten. Deshalb auch hier mit Zeitgrenze warten statt zu blockieren.
+        try { if ($tOut.Wait(3000)) { $result.stdout = $tOut.Result } } catch { }
+        try { if ($tErr.Wait(3000)) { $result.stderr = $tErr.Result } } catch { }
     } catch {
         $result.stderr = $_.Exception.Message
     } finally {
@@ -399,6 +432,15 @@ function ConvertTo-CaddyPath {
     return $Value.Replace('\', '/')
 }
 
+# Pfade mit Leerzeichen brauchen in der Caddyfile Anfuehrungszeichen, sonst
+# zerfaellt der Pfad in mehrere Argumente und Caddy lehnt die Zeile ab.
+function ConvertTo-PathToken {
+    param([string]$Value)
+    $p = ConvertTo-CaddyPath $Value
+    if ($p -match '[\s"]') { return '"' + ($p -replace '"', '\"') + '"' }
+    return $p
+}
+
 function Test-EmailAddress {
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
@@ -462,6 +504,31 @@ function Get-SafeString {
 # ---------------------------------------------------------------------------
 #  Umwandlung PSCustomObject -> Hashtable (PS 5.1 kennt kein -AsHashtable)
 # ---------------------------------------------------------------------------
+# Nimmt den Inhalt eines Blocks und ruecke ihn relativ ein, statt alles auf
+# eine Ebene zu ziehen. Sonst passt die erzeugte Datei nicht mehr zu "caddy fmt".
+function Get-ReindentedLines {
+    param([string]$Body, [string]$Prefix = "`t")
+    $out = New-Object System.Collections.ArrayList
+    if ([string]::IsNullOrWhiteSpace($Body)) { return ,@() }
+    $raw = ($Body -replace "`r`n", "`n").Split("`n")
+    $min = -1
+    foreach ($l in $raw) {
+        if (-not $l.Trim()) { continue }
+        $lead = 0
+        foreach ($ch in $l.ToCharArray()) {
+            if ($ch -eq ' ' -or $ch -eq "`t") { $lead++ } else { break }
+        }
+        if ($min -lt 0 -or $lead -lt $min) { $min = $lead }
+    }
+    if ($min -lt 0) { $min = 0 }
+    foreach ($l in $raw) {
+        if (-not $l.Trim()) { continue }
+        $t = $(if ($l.Length -ge $min) { $l.Substring($min) } else { $l.TrimStart() })
+        [void]$out.Add($Prefix + $t.TrimEnd())
+    }
+    return ,@($out.ToArray())
+}
+
 function ConvertTo-Hash {
     param($InputObject)
     if ($null -eq $InputObject) { return $null }
@@ -819,7 +886,7 @@ function Save-Config {
     }
     if (Test-Path -LiteralPath $Paths.State) { Backup-File -Path $Paths.State -Prefix 'config' | Out-Null }
     $json = $Config | ConvertTo-Json -Depth 8
-    Set-Content -LiteralPath $Paths.State -Value $json -Encoding UTF8
+    Write-TextFile $Paths.State $json
 }
 
 function Backup-File {
@@ -862,7 +929,7 @@ function Add-RawBlock {
 function Add-LogDirective {
     param([System.Text.StringBuilder]$Sb, [int]$Indent, $Config, [string]$FileName)
     Add-Line $Sb $Indent 'log {'
-    Add-Line $Sb ($Indent + 1) ('output file ' + (ConvertTo-CaddyPath ($Paths.Logs + '\' + $FileName)) + ' {')
+    Add-Line $Sb ($Indent + 1) ('output file ' + (ConvertTo-PathToken ($Paths.Logs + '\' + $FileName)) + ' {')
     Add-Line $Sb ($Indent + 2) ('roll_size ' + $Config.global.rollSize)
     Add-Line $Sb ($Indent + 2) ('roll_keep ' + $Config.global.rollKeep)
     Add-Line $Sb ($Indent + 1) '}'
@@ -891,7 +958,7 @@ function Build-SiteBlock {
     if ($Site.tlsMode -eq 'internal') {
         Add-Line $Sb 1 'tls internal'
     } elseif ($Site.tlsMode -eq 'custom') {
-        Add-Line $Sb 1 ('tls ' + (ConvertTo-CaddyPath $Site.tlsCert) + ' ' + (ConvertTo-CaddyPath $Site.tlsKey))
+        Add-Line $Sb 1 ('tls ' + (ConvertTo-PathToken $Site.tlsCert) + ' ' + (ConvertTo-PathToken $Site.tlsKey))
     }
 
     if ($Site.basicAuthUser -and $Site.basicAuthHash) {
@@ -911,7 +978,8 @@ function Build-SiteBlock {
     }
 
     if ($Site.type -eq 'respond') {
-        Add-Line $Sb 1 ('respond "' + ($Site.respondBody -replace '"', '\"') + '" ' + $Site.respondStatus)
+        $body = $Site.respondBody.Replace('\', '\\').Replace('"', '\"')
+        Add-Line $Sb 1 ('respond "' + $body + '" ' + $Site.respondStatus)
         if ($Site.accessLog) { Add-LogDirective $Sb 1 $Config ((Get-HostLabel $Site.domains[0]) + '-access.log') }
         Add-RawBlock $Sb 1 $Site.extra
         Add-Line $Sb 0 '}'
@@ -921,7 +989,7 @@ function Build-SiteBlock {
     }
 
     if ($Site.type -eq 'static' -or $Site.type -eq 'php') {
-        Add-Line $Sb 1 ('root * ' + (ConvertTo-CaddyPath $Site.root))
+        Add-Line $Sb 1 ('root * ' + (ConvertTo-PathToken $Site.root))
     }
 
     if ($Site.encode) { Add-Line $Sb 1 'encode gzip zstd' }
@@ -1044,9 +1112,9 @@ function Build-Caddyfile {
     Add-Line $sb 0 '{'
     if ($Config.global.email) { Add-Line $sb 1 ('email ' + $Config.global.email) }
     Add-Line $sb 1 ('admin ' + $Config.global.adminListen)
-    Add-Line $sb 1 ('storage file_system ' + (ConvertTo-CaddyPath $Paths.Data))
+    Add-Line $sb 1 ('storage file_system ' + (ConvertTo-PathToken $Paths.Data))
     Add-Line $sb 1 'log {'
-    Add-Line $sb 2 ('output file ' + (ConvertTo-CaddyPath ($Paths.Logs + '\caddy.log')) + ' {')
+    Add-Line $sb 2 ('output file ' + (ConvertTo-PathToken ($Paths.Logs + '\caddy.log')) + ' {')
     Add-Line $sb 3 ('roll_size ' + $Config.global.rollSize)
     Add-Line $sb 3 ('roll_keep ' + $Config.global.rollKeep)
     Add-Line $sb 2 '}'
@@ -1308,9 +1376,7 @@ function Read-SiteDirectives {
             default {
                 if ($d.body) {
                     [void]$ExtraLines.Add($d.head + ' {')
-                    foreach ($ln in ($d.body -replace "`r`n", "`n").Split("`n")) {
-                        if ($ln.Trim()) { [void]$ExtraLines.Add("`t" + $ln.Trim()) }
-                    }
+                    foreach ($ln in (Get-ReindentedLines $d.body)) { [void]$ExtraLines.Add($ln) }
                     [void]$ExtraLines.Add('}')
                 } else {
                     [void]$ExtraLines.Add($d.head)
@@ -1333,9 +1399,7 @@ function Read-HandlerOptions {
         if ($t -match '^(lb_try_duration|fail_duration)\s') { continue }
         if ($o.body) {
             [void]$keep.Add($t + ' {')
-            foreach ($l in (($o.body -replace "`r`n", "`n").Split("`n"))) {
-                if ($l.Trim()) { [void]$keep.Add("`t" + $l.Trim()) }
-            }
+            foreach ($l in (Get-ReindentedLines $o.body)) { [void]$keep.Add($l) }
             [void]$keep.Add('}')
         } else {
             [void]$keep.Add($t)
@@ -1380,8 +1444,7 @@ function Import-Caddyfile {
         # Baustein: (name) { ... } - wird woertlich uebernommen, weil Site-Bloecke
         # ihn per import verwenden koennen.
         if ($st.head -match '^\([A-Za-z0-9_\-\.]+\)$') {
-            $inner = @(($st.body -replace "`r`n", "`n").Split("`n") |
-                       Where-Object { $_.Trim() } | ForEach-Object { "`t" + $_.Trim() })
+            $inner = Get-ReindentedLines $st.body
             [void]$snippets.Add($st.head + ' {' + "`n" + ($inner -join "`n") + "`n" + '}')
             continue
         }
@@ -1400,9 +1463,7 @@ function Import-Caddyfile {
                         if ($null -eq $g.body) {
                             $cfg.global.extra = ($cfg.global.extra + "`n" + $g.head).Trim()
                         } else {
-                            $indented = @(($g.body -replace "`r`n", "`n").Split("`n") |
-                                          Where-Object { $_.Trim() } |
-                                          ForEach-Object { "`t" + $_.Trim() })
+                            $indented = Get-ReindentedLines $g.body
                             $blockText = $g.head + ' {' + "`n" + ($indented -join "`n") + "`n" + '}'
                             $cfg.global.extra = ($cfg.global.extra + "`n" + $blockText).Trim()
                         }
@@ -1841,12 +1902,13 @@ function Set-PhpIni {
 
         $base = ''
         if (Test-Path -LiteralPath $Paths.PhpIni) {
-            $base = Get-Content -LiteralPath $Paths.PhpIni -Raw
+            $base = [string](Get-Content -LiteralPath $Paths.PhpIni -Raw)
             Backup-File -Path $Paths.PhpIni -Prefix 'php.ini' | Out-Null
         } else {
             $prod = Join-Path $Paths.Php 'php.ini-production'
-            if (Test-Path -LiteralPath $prod) { $base = Get-Content -LiteralPath $prod -Raw }
+            if (Test-Path -LiteralPath $prod) { $base = [string](Get-Content -LiteralPath $prod -Raw) }
         }
+        if ($null -eq $base) { $base = '' }
         # frueheren Block entfernen
         $idx = $base.IndexOf($PhpIniMarkerStart)
         if ($idx -ge 0) { $base = $base.Substring(0, $idx) }
@@ -1881,8 +1943,13 @@ function Get-TaskSettings {
         MultipleInstances          = 'IgnoreNew'
         ExecutionTimeLimit         = ([TimeSpan]::Zero)
     }
-    try { return (New-ScheduledTaskSettingsSet @args2) }
-    catch { return (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) }
+    try { return (New-ScheduledTaskSettingsSet @args2) } catch { }
+    # Ohne ExecutionTimeLimit gilt die Vorgabe von 72 Stunden - Caddy wuerde
+    # danach beendet. Deshalb im Ersatzweg nachtraeglich auf "unbegrenzt" setzen.
+    $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    try { $set.ExecutionTimeLimit = 'PT0S' } catch { }
+    try { $set.MultipleInstances = 'IgnoreNew' } catch { }
+    return $set
 }
 
 function Register-Task {
@@ -1923,12 +1990,9 @@ function New-RepeatTrigger {
         return (New-ScheduledTaskTrigger -Once -At $start -RepetitionInterval $span `
                    -RepetitionDuration (New-TimeSpan -Days 3650))
     } catch { }
-    $t = New-ScheduledTaskTrigger -Once -At $start
-    try {
-        $t.Repetition.Interval = 'PT' + $Minutes + 'M'
-        $t.Repetition.StopAtDurationEnd = $false
-    } catch { }
-    return $t
+    # Kein stiller Rueckfall auf einen Einmal-Trigger: lieber nichts liefern,
+    # dann meldet die Sicherheitspruefung den fehlenden Takt ehrlich.
+    return $null
 }
 
 # Register-ScheduledTask legt den Ordner normalerweise selbst an. Auf einigen
@@ -1989,7 +2053,7 @@ function Write-WatchdogScript {
         '}'
     )
     if (-not (Test-Path -LiteralPath $Paths.Manager)) { New-Item -ItemType Directory -Path $Paths.Manager -Force | Out-Null }
-    Set-Content -LiteralPath $Paths.Watchdog -Value ($lines -join "`r`n") -Encoding UTF8
+    Write-TextFile $Paths.Watchdog (($lines -join "`r`n") + "`r`n")
 }
 
 function Remove-LegacyTasks {
@@ -2061,11 +2125,18 @@ function Install-Automation {
         Remove-ManagedPhpTasks -Keep $keep
 
         # Watchdog
+        $repeat = New-RepeatTrigger 3
+        $wdTriggers = $(if ($repeat) { @((New-StartupTrigger), $repeat) } else { @(New-StartupTrigger) })
         Register-Task -Name $TaskWatch -Execute 'powershell.exe' `
             -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $Paths.Watchdog + '"') `
-            -Triggers @((New-StartupTrigger), (New-RepeatTrigger 3)) -RunAs 'SYSTEM' `
+            -Triggers $wdTriggers -RunAs 'SYSTEM' `
             -Description 'Pr{ue}ft alle 3 Minuten, ob Caddy und PHP laufen.'
-        [void]$notes.Add('Watchdog alle 3 Minuten eingerichtet')
+        $wd = Get-TaskState $TaskWatch
+        if ($wd -and $wd.repeats) {
+            [void]$notes.Add('Watchdog alle 3 Minuten eingerichtet')
+        } else {
+            [void]$notes.Add('Watchdog eingerichtet, aber ohne Wiederholungstakt - er greift nur beim Hochfahren')
+        }
 
         Write-Audit 'tasks.install' ("runAs=$runAs php=$($Config.php.enabled)")
         return @{ ok = $true; message = 'Automatischer Betrieb eingerichtet.'; notes = @($notes.ToArray()) }
@@ -2195,21 +2266,34 @@ function Get-TaskState {
     try {
         $t = Get-ScheduledTask -TaskPath $TaskFolder -TaskName $Name -ErrorAction SilentlyContinue
         if (-not $t) { return $null }
-        return @{ exists = $true; state = [string]$t.State; enabled = ($t.State -ne 'Disabled') }
+        $repeats = $false
+        try {
+            foreach ($tr in @($t.Triggers)) {
+                if ($tr.Repetition -and $tr.Repetition.Interval) { $repeats = $true }
+            }
+        } catch { }
+        return @{ exists = $true; state = [string]$t.State; enabled = ($t.State -ne 'Disabled'); repeats = $repeats }
     } catch { return $null }
 }
 
 function Start-CaddyServer {
     Clear-StatusCache
+    if (-not (Test-Path -LiteralPath $Paths.Exe)) { return @{ ok = $false; message = 'Caddy ist noch nicht installiert.' } }
     $t = Get-TaskState $TaskServer
     if ($t) {
-        try {
-            Start-ScheduledTask -TaskPath $TaskFolder -TaskName $TaskServer -ErrorAction Stop
-            Start-Sleep -Milliseconds 1200
+        # Ueber die geplante Aufgabe starten, damit Caddy unter dem
+        # vorgesehenen Dienstkonto laeuft - niemals ersatzweise unter dem
+        # angemeldeten Administrator, das waere ein stiller Rechteausbruch.
+        try { Start-ScheduledTask -TaskPath $TaskFolder -TaskName $TaskServer -ErrorAction Stop } catch {
+            return @{ ok = $false; message = "Die Aufgabe liess sich nicht starten: $($_.Exception.Message)" }
+        }
+        for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Milliseconds 400
             if (Get-CaddyProcess) { return @{ ok = $true; message = 'Caddy gestartet.' } }
-        } catch { }
+        }
+        return @{ ok = $false
+                  message = 'Die Aufgabe wurde gestartet, Caddy laeuft aber nicht. Bitte das Protokoll pruefen.' }
     }
-    if (-not (Test-Path -LiteralPath $Paths.Exe)) { return @{ ok = $false; message = 'Caddy ist noch nicht installiert.' } }
     try {
         Start-Process -FilePath $Paths.Exe `
             -ArgumentList @('run', '--config', ('"' + $Paths.Config + '"'), '--adapter', 'caddyfile') `
@@ -2348,7 +2432,8 @@ function Write-CaddyfileAndReload {
     if (-not (Test-Path -LiteralPath $Paths.Logs)) { New-Item -ItemType Directory -Path $Paths.Logs -Force | Out-Null }
 
     # 1. In eine Zwischendatei schreiben und pruefen
-    Set-Content -LiteralPath $Paths.Staging -Value $NewText -Encoding UTF8
+    $NewText = ConvertTo-FileText $NewText
+    Write-TextFile $Paths.Staging $NewText
     $check = Test-CaddyConfigFile $Paths.Staging
     $result.validation = $check.output
     if (-not $check.ok) {
@@ -2413,9 +2498,13 @@ function Test-ConfigDirty {
     $gen = Build-Caddyfile $Config
     $live = Get-LiveCaddyfile
     # Kopfzeile mit Zeitstempel beim Vergleich ausblenden
+    # Kommentare, Leerzeilen und Einzuege bleiben beim Vergleich aussen vor
     $strip = {
         param($t)
-        return ((($t -replace "`r`n", "`n").Split("`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n").Trim()
+        $keep = @(($t -replace "`r`n", "`n").Split("`n") |
+                  ForEach-Object { $_.Trim() } |
+                  Where-Object { $_ -and $_ -notmatch '^#' })
+        return ($keep -join "`n")
     }
     return ((& $strip $gen) -ne (& $strip $live))
 }
@@ -2684,6 +2773,11 @@ function Get-SecurityFindings {
 
     if (-not $Status.taskWatchdog) {
         [void]$f.Add((New-Finding 'warn' 'Kein Watchdog eingerichtet' 'Nach einem Absturz w{ue}rde Caddy nicht von allein zur{ue}ckkommen.' 'setup-tasks' 'Watchdog einrichten'))
+    } elseif (-not $Status.taskWatchdog.repeats) {
+        [void]$f.Add((New-Finding 'warn' 'Watchdog l{ae}uft nur beim Hochfahren' `
+            ('Der Wiederholungstakt konnte auf diesem Windows nicht gesetzt werden. Nach einem Absturz ' +
+             'im laufenden Betrieb kommt Caddy erst beim n{ae}chsten Neustart zur{ue}ck.') `
+            'setup-tasks' 'Erneut versuchen'))
     } else {
         [void]$f.Add((New-Finding 'ok' 'Watchdog aktiv' 'Pr{ue}ft alle 3 Minuten, ob alles l{ae}uft.'))
     }
@@ -2863,6 +2957,15 @@ function Restore-Backup {
 # ---------------------------------------------------------------------------
 #  Passworthash fuer den Zugriffsschutz
 # ---------------------------------------------------------------------------
+function Find-BcryptLine {
+    param([string]$Text)
+    foreach ($line in (([string]$Text) -split "`n")) {
+        $t = $line.Trim()
+        if (Test-BcryptHash $t) { return $t }
+    }
+    return ''
+}
+
 function New-PasswordHash {
     param([string]$Plain)
     if (-not (Test-Path -LiteralPath $Paths.Exe)) { return @{ ok = $false; message = 'Caddy ist noch nicht installiert.' } }
@@ -2872,14 +2975,18 @@ function New-PasswordHash {
     if ($Plain.Length -gt 128 -or -not (Test-NoControlChars $Plain)) {
         return @{ ok = $false; message = 'Das Passwort enth{ae}lt unzul{ae}ssige Zeichen.' }
     }
-    $r = Invoke-Caddy @('hash-password', '--plaintext', $Plain) 60
-    $out = (Get-ExeOutput $r)
-    foreach ($line in ($out -split "`n")) {
-        $t = $line.Trim()
-        if (Test-BcryptHash $t) {
-            Write-Audit 'password.hash' 'Neuer Hash erzeugt'
-            return @{ ok = $true; hash = $t }
-        }
+    # Bevorzugt ueber die Standardeingabe: dann steht das Passwort nicht in der
+    # Befehlszeile, die jeder lokale Benutzer auslesen kann.
+    $r = Invoke-Exe -FilePath $Paths.Exe -Arguments @('hash-password') -TimeoutSec 60 -StdIn $Plain
+    $hash = Find-BcryptLine (Get-ExeOutput $r)
+    if (-not $hash) {
+        # Aeltere Caddy-Ausgaben lesen nicht von der Standardeingabe
+        $r = Invoke-Exe -FilePath $Paths.Exe -Arguments @('hash-password', '--plaintext', $Plain) -TimeoutSec 60
+        $hash = Find-BcryptLine (Get-ExeOutput $r)
+    }
+    if ($hash) {
+        Write-Audit 'password.hash' 'Neuer Hash erzeugt'
+        return @{ ok = $true; hash = $hash }
     }
     return @{ ok = $false; message = 'Der Hash konnte nicht erzeugt werden.' }
 }
@@ -2958,8 +3065,9 @@ function Send-Text {
 # Meldungsfelder tragen Umlaut-Platzhalter, weil die Quelldatei reines ASCII
 # ist. Felder mit Nutzerdaten (Caddyfile-Text, Konfiguration, Pfade) bleiben
 # bewusst unberuehrt.
-$UmlautSkipKeys = @('text', 'validation', 'config', 'site', 'status', 'hash',
-                    'csrf', 'backups', 'files', 'skipped', 'addresses', 'domain')
+$UmlautSkipKeys = @('text', 'live', 'validation', 'config', 'site', 'status', 'hash',
+                    'csrf', 'backups', 'files', 'skipped', 'addresses', 'domain',
+                    'created', 'removed', 'backup')
 
 function Convert-Umlauts {
     param($Obj, [int]$Depth = 0)
@@ -3005,8 +3113,20 @@ function Read-RequestBody {
     param($Ctx, [int]$MaxBytes = 1048576)
     try {
         if ($Ctx.Request.ContentLength64 -gt $MaxBytes) { return $null }
+        # Bei zerstueckelten Anfragen ist ContentLength64 gleich -1. Deshalb
+        # nicht auf die Angabe verlassen, sondern hart begrenzt einlesen.
+        $buf = New-Object char[] 8192
+        $sb = New-Object System.Text.StringBuilder
         $sr = New-Object System.IO.StreamReader($Ctx.Request.InputStream, [Text.Encoding]::UTF8)
-        try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+        try {
+            while ($true) {
+                $n = $sr.Read($buf, 0, $buf.Length)
+                if ($n -le 0) { break }
+                [void]$sb.Append($buf, 0, $n)
+                if ($sb.Length -gt $MaxBytes) { return $null }
+            }
+        } finally { $sr.Dispose() }
+        return $sb.ToString()
     } catch { return $null }
 }
 
@@ -3109,6 +3229,17 @@ function Invoke-Request {
     if (-not (Test-Authorized $Ctx)) {
         Send-Json $Ctx @{ ok = $false; message = 'Nicht angemeldet. Bitte die Startadresse erneut {oe}ffnen.' } 401
         return
+    }
+
+    # Aendernde Aufrufe gehen ausschliesslich ueber POST. Sonst liessen sich
+    # Routen ohne Nutzdaten (etwa /api/apply) per GET ohne CSRF-Pruefung ausloesen.
+    if ($method -ne 'POST' -and $path -like '/api/*') {
+        $readOnly = @('/api/state', '/api/status', '/api/security', '/api/preview',
+                      '/api/logs', '/api/log', '/api/backups', '/api/audit', '/api/caddyfile')
+        if ($readOnly -notcontains $path) {
+            Send-Json $Ctx @{ ok = $false; message = 'Diese Aktion ist nur per POST erlaubt.' } 405
+            return
+        }
     }
 
     if ($method -eq 'POST') {
@@ -3226,9 +3357,21 @@ function Invoke-ApiRoute {
         '/api/settings' {
             $data = Read-RequestJson $Ctx
             if (-not $data) { Send-Json $Ctx @{ ok = $false; message = 'Keine Daten empfangen.' } 400; return }
+            # Erst alles pruefen, dann uebernehmen. Sonst bliebe bei einer
+            # Ablehnung ein halb geaenderter Stand im Speicher zurueck.
             $email = Get-SafeString (Get-StringField $data 'email' '') 254
             if ($email -and -not (Test-EmailAddress $email)) {
                 Send-Json $Ctx @{ ok = $false; message = 'Die E-Mail-Adresse ist ung{ue}ltig.' } 400
+                return
+            }
+            $geCheck = Get-StringField $data 'globalExtra' $cfg.global.extra
+            if ($geCheck.Length -gt 8000 -or -not (Test-BalancedBraces $geCheck)) {
+                Send-Json $Ctx @{ ok = $false; message = 'Die zus{ae}tzlichen globalen Zeilen haben unpaarige geschweifte Klammern.' } 400
+                return
+            }
+            $snCheck = Get-StringField $data 'snippets' $cfg.global.snippets
+            if ($snCheck.Length -gt 16000 -or -not (Test-BalancedBraces $snCheck)) {
+                Send-Json $Ctx @{ ok = $false; message = 'Die Bausteine haben unpaarige geschweifte Klammern.' } 400
                 return
             }
             $cfg.global.email = $email
@@ -3240,12 +3383,8 @@ function Invoke-ApiRoute {
             if ([int]::TryParse((Get-StringField $data 'rollKeep' '7'), [ref]$rk) -and $rk -ge 1 -and $rk -le 100) {
                 $cfg.global.rollKeep = $rk
             }
-            $ge = Get-StringField $data 'globalExtra' $cfg.global.extra
-            if ($ge.Length -le 8000 -and (Test-BalancedBraces $ge)) { $cfg.global.extra = $ge }
-            else { Send-Json $Ctx @{ ok = $false; message = 'Die zus{ae}tzlichen globalen Zeilen haben unpaarige geschweifte Klammern.' } 400; return }
-            $sn = Get-StringField $data 'snippets' $cfg.global.snippets
-            if ($sn.Length -le 16000 -and (Test-BalancedBraces $sn)) { $cfg.global.snippets = $sn }
-            else { Send-Json $Ctx @{ ok = $false; message = 'Die Bausteine haben unpaarige geschweifte Klammern.' } 400; return }
+            $cfg.global.extra = $geCheck
+            $cfg.global.snippets = $snCheck
 
             $cfg.php.enabled = Get-BoolField $data 'phpEnabled' $cfg.php.enabled
             $psz = 0
@@ -3301,7 +3440,7 @@ function Invoke-ApiRoute {
             $data = Read-RequestJson $Ctx
             $text = Get-StringField $data 'text' ''
             if ([string]::IsNullOrWhiteSpace($text)) { Send-Json $Ctx @{ ok = $false; message = 'Kein Text.' } 400; return }
-            Set-Content -LiteralPath $Paths.Staging -Value $text -Encoding UTF8
+            Write-TextFile $Paths.Staging (ConvertTo-FileText $text)
             $check = Test-CaddyConfigFile $Paths.Staging
             Remove-Item -LiteralPath $Paths.Staging -Force -ErrorAction SilentlyContinue
             Send-Json $Ctx @{ ok = $check.ok
@@ -3314,7 +3453,7 @@ function Invoke-ApiRoute {
             $data = Read-RequestJson $Ctx
             $text = Get-StringField $data 'text' ''
             if ([string]::IsNullOrWhiteSpace($text)) { Send-Json $Ctx @{ ok = $false; message = 'Kein Text.' } 400; return }
-            Set-Content -LiteralPath $Paths.Staging -Value $text -Encoding UTF8
+            Write-TextFile $Paths.Staging (ConvertTo-FileText $text)
             $r = Invoke-Caddy @('fmt', '--overwrite', $Paths.Staging) 60
             $out = ''
             if (Test-Path -LiteralPath $Paths.Staging) { $out = Get-Content -LiteralPath $Paths.Staging -Raw -Encoding UTF8 }
@@ -3470,10 +3609,14 @@ function Invoke-ApiRoute {
                     New-Item -ItemType Directory -Path $p -Force | Out-Null
                     $index = Join-Path $p 'index.html'
                     if (-not (Test-Path -LiteralPath $index)) {
-                        $html = T "<!doctype html>`r`n<meta charset=`"utf-8`">`r`n<title>Neue Seite</title>`r`n" +
-                                "<h1>Es funktioniert.</h1>`r`n<p>Diesen Ordner mit den eigenen Dateien fuellen:<br>" +
-                                (ConvertTo-HtmlText $p) + "</p>`r`n"
-                        Set-Content -LiteralPath $index -Value $html -Encoding UTF8
+                        # Klammern sind hier zwingend: "T \"a\" + \"b\"" wuerde als
+                        # Befehlsaufruf gelesen und alles nach dem ersten Wert verwerfen.
+                        $html = T ("<!doctype html>`r`n<meta charset=`"utf-8`">`r`n" +
+                                   "<title>Neue Seite</title>`r`n" +
+                                   "<h1>Es funktioniert.</h1>`r`n" +
+                                   "<p>Diesen Ordner mit den eigenen Dateien f{ue}llen:<br>" +
+                                   (ConvertTo-HtmlText $p) + "</p>`r`n")
+                        Write-TextFile $index $html
                     }
                     Write-Audit 'folder.create' $p
                     Send-Json $Ctx @{ ok = $true; message = "Ordner angelegt: $p"; created = $true }
@@ -3639,13 +3782,15 @@ function Invoke-Fix {
             Save-Config $cfg
             $acl = Grant-ServiceRights 'LOCAL SERVICE'
             $tasks = Install-Automation $cfg
-            $restart = Restart-CaddyServer
+            $restart = $(if ($tasks.ok) { Restart-CaddyServer } else { @{ ok = $false; message = $tasks.message } })
             if (-not $restart.ok) {
                 $cfg.manager.runAs = 'SYSTEM'
                 Save-Config $cfg
                 Install-Automation $cfg | Out-Null
                 Restart-CaddyServer | Out-Null
-                return @{ ok = $false; message = 'Der Start mit eingeschr{ae}nkten Rechten hat nicht geklappt. Es wurde auf SYSTEM zur{ue}ckgestellt.' }
+                return @{ ok = $false
+                          message = ('Der Start mit eingeschr{ae}nkten Rechten hat nicht geklappt. Es wurde auf SYSTEM zur{ue}ckgestellt. ' +
+                                     [string]$restart.message) }
             }
             return @{ ok = $true; message = 'Caddy l{ae}uft jetzt als LOCAL SERVICE. ' + $acl.message }
         }
