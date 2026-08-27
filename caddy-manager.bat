@@ -133,6 +133,7 @@ $Paths = [ordered]@{
     Backups   = "$Root\manager\backups"
     Audit     = "$Root\manager\manager.log"
     Watchdog  = "$Root\manager\watchdog.ps1"
+    Lock      = "$Root\manager\manager.pid"
     Staging   = "$Root\manager\caddyfile.staged"
     Php       = 'C:\php'
     PhpExe    = 'C:\php\php-cgi.exe'
@@ -653,6 +654,8 @@ function New-DefaultConfig {
             logLevel    = 'INFO'
             rollSize    = '10MiB'
             rollKeep    = 7
+            storage     = ''
+            trustedProxies = $false
             extra       = ''
             snippets    = ''
         }
@@ -741,6 +744,9 @@ function Merge-Config {
         $ge = Get-StringField $g 'extra' ''
         if ($ge.Length -gt 8000) { $ge = $ge.Substring(0, 8000) }
         $out.global.extra       = $(if (Test-BalancedBraces $ge) { $ge } else { '' })
+        $out.global.trustedProxies = Get-BoolField $g 'trustedProxies' $false
+        $st2 = Resolve-LocalPath (Get-StringField $g 'storage' '')
+        $out.global.storage     = $(if ($st2) { $st2 } else { '' })
         $sn = Get-StringField $g 'snippets' ''
         if ($sn.Length -gt 16000) { $sn = $sn.Substring(0, 16000) }
         $out.global.snippets    = $(if (Test-BalancedBraces $sn) { $sn } else { '' })
@@ -1062,7 +1068,7 @@ function Build-SiteBlock {
         }
     }
 
-    if ($Site.blockSensitive -and $Site.type -ne 'proxy') {
+    if ($Site.blockSensitive -and $Site.type -ne 'proxy' -and (Test-CaddyAtLeast 2 5)) {
         Add-Line $Sb 1 '@geschuetzt {'
         Add-Line $Sb 2 'not path /.well-known/*'
         Add-Line $Sb 2 'path */.* *.env *.log *.sql *.bak *.ini *.sqlite /composer.json /composer.lock /package-lock.json'
@@ -1112,7 +1118,12 @@ function Build-Caddyfile {
     Add-Line $sb 0 '{'
     if ($Config.global.email) { Add-Line $sb 1 ('email ' + $Config.global.email) }
     Add-Line $sb 1 ('admin ' + $Config.global.adminListen)
-    Add-Line $sb 1 ('storage file_system ' + (ConvertTo-PathToken $Paths.Data))
+    # Eine eigene storage-Zeile aus der uebernommenen Caddyfile hat Vorrang:
+    # ein Wechsel des Speicherorts wuerde alle Zertifikate neu beantragen.
+    if ($Config.global.extra -notmatch '(?m)^\s*storage\b') {
+        $storeDir = $(if ($Config.global.storage) { $Config.global.storage } else { $Paths.Data })
+        Add-Line $sb 1 ('storage file_system ' + (ConvertTo-PathToken $storeDir))
+    }
     Add-Line $sb 1 'log {'
     Add-Line $sb 2 ('output file ' + (ConvertTo-PathToken ($Paths.Logs + '\caddy.log')) + ' {')
     Add-Line $sb 3 ('roll_size ' + $Config.global.rollSize)
@@ -1121,8 +1132,12 @@ function Build-Caddyfile {
     Add-Line $sb 2 'format json'
     Add-Line $sb 2 ('level ' + $Config.global.logLevel)
     Add-Line $sb 1 '}'
-    # Nur ergaenzen, wenn nicht schon ein eigener servers-Block uebernommen wurde
-    if ((Test-CaddyAtLeast 2 7) -and ($Config.global.extra -notmatch '(?m)^\s*servers\b')) {
+    # Nur auf ausdruecklichen Wunsch. Caddy vertraut von Haus aus keinem
+    # vorgelagerten Proxy. Das pauschal zu lockern waere ein Rueckschritt, wenn
+    # gar keiner davorsteht: dann koennte jeder aus dem lokalen Netz die
+    # Client-Adresse in Protokollen und Zugriffsregeln faelschen.
+    if ($Config.global.trustedProxies -and (Test-CaddyAtLeast 2 7) -and
+        ($Config.global.extra -notmatch '(?m)^\s*servers\b')) {
         Add-Line $sb 1 'servers {'
         Add-Line $sb 2 'trusted_proxies static private_ranges'
         Add-Line $sb 1 '}'
@@ -1457,8 +1472,30 @@ function Import-Caddyfile {
                 switch ($tk[0].ToLower()) {
                     'email'   { if ($tk.Count -gt 1 -and (Test-EmailAddress $tk[1])) { $cfg.global.email = $tk[1] } }
                     'admin'   { if ($tk.Count -gt 1) { $cfg.global.adminListen = (Get-SafeString $tk[1] 120) } }
-                    'storage' { }
+                    'storage' {
+                        # file_system kennt der Manager, alles andere bleibt woertlich stehen
+                        if ($tk.Count -ge 3 -and $tk[1] -eq 'file_system') {
+                            $sp = Resolve-LocalPath $tk[2]
+                            if ($sp) { $cfg.global.storage = $sp }
+                        } else {
+                            $keep = $g.head
+                            if ($g.body) {
+                                $keep = $g.head + ' {' + "`n" +
+                                        ((Get-ReindentedLines $g.body) -join "`n") + "`n" + '}'
+                            }
+                            $cfg.global.extra = ($cfg.global.extra + "`n" + $keep).Trim()
+                        }
+                    }
                     'log'     { }
+                    'servers' {
+                        if ($g.body -and $g.body -match 'trusted_proxies') {
+                            $cfg.global.trustedProxies = $true
+                        } elseif ($g.body) {
+                            $blockText = $g.head + ' {' + "`n" +
+                                         ((Get-ReindentedLines $g.body) -join "`n") + "`n" + '}'
+                            $cfg.global.extra = ($cfg.global.extra + "`n" + $blockText).Trim()
+                        }
+                    }
                     default {
                         if ($null -eq $g.body) {
                             $cfg.global.extra = ($cfg.global.extra + "`n" + $g.head).Trim()
@@ -1690,6 +1727,14 @@ function Install-Caddy {
         return @{ ok = $false; message = "Caddy konnte nicht ersetzt werden: $($_.Exception.Message)" }
     }
 
+    # Ein Virenschutz greift oft erst zu, wenn die Datei am endgueltigen Platz liegt
+    Start-Sleep -Milliseconds 500
+    if (-not (Test-Path -LiteralPath $Paths.Exe)) {
+        return @{ ok = $false
+                  message = ('caddy.exe ist direkt nach dem Kopieren wieder verschwunden. ' +
+                             'Sehr wahrscheinlich hat ein Virenschutz sie in Quarant{ae}ne verschoben. ' +
+                             'Bitte ' + $Paths.Root + ' dort als Ausnahme eintragen und erneut versuchen.') }
+    }
     $script:CaddyVersion = $null
     Get-CaddyVersionInfo -Refresh | Out-Null
     if ($wasRunning) { Start-CaddyServer | Out-Null }
@@ -1954,6 +1999,7 @@ function Get-TaskSettings {
 
 function Register-Task {
     param([string]$Name, [string]$Execute, [string]$Argument, $Triggers, [string]$RunAs, [string]$Description = '')
+    try { Clear-TaskCache } catch { }
     $action = New-ScheduledTaskAction -Execute $Execute -Argument $Argument
     $principal = Get-TaskPrincipal $RunAs
     $settings = Get-TaskSettings
@@ -2057,6 +2103,7 @@ function Write-WatchdogScript {
 }
 
 function Remove-LegacyTasks {
+    try { Clear-TaskCache } catch { }
     $removed = New-Object System.Collections.ArrayList
     foreach ($n in $LegacyTaskNames) {
         try {
@@ -2078,6 +2125,7 @@ function Get-ManagedTasks {
 
 function Remove-ManagedPhpTasks {
     param([int[]]$Keep = @())
+    try { Clear-TaskCache } catch { }
     foreach ($t in (Get-ManagedTasks)) {
         if ($t.TaskName -notmatch '^PHP (\d+)$') { continue }
         $port = [int]$Matches[1]
@@ -2146,6 +2194,7 @@ function Install-Automation {
 }
 
 function Uninstall-Automation {
+    try { Clear-TaskCache } catch { }
     $removed = New-Object System.Collections.ArrayList
     foreach ($t in (Get-ManagedTasks)) {
         try {
@@ -2223,6 +2272,138 @@ function Grant-ServiceRights {
     }
     Write-Audit 'acl.grant' ($notes -join '; ')
     return @{ ok = $true; message = 'Dateirechte f{ue}r LOCAL SERVICE gesetzt.'; notes = @($notes.ToArray()) }
+}
+
+# ---------------------------------------------------------------------------
+#  Dateirechte des Installationsverzeichnisses
+#
+#  Ein Ordner, der direkt unter C:\ angelegt wird, erbt von dort die Regel
+#  "Authentifizierte Benutzer: Aendern". Damit duerfte jeder angemeldete
+#  Benutzer ohne Administratorrechte caddy.exe oder manager\watchdog.ps1
+#  austauschen - beide werden als SYSTEM ausgefuehrt. Das ist eine glatte
+#  Rechteausweitung. Deshalb wird die Vererbung aufgeloest und alles ausser
+#  Administratoren und SYSTEM entfernt.
+# ---------------------------------------------------------------------------
+
+# Everyone, Authentifizierte Benutzer, Benutzer, Interaktiv, Gaeste, Jeder-Netz
+$WeakSids = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4', 'S-1-5-32-546', 'S-1-5-7')
+
+# Schreiben, Anhaengen, Loeschen, Rechte aendern, Besitz uebernehmen
+$DangerousRights = 0x2 -bor 0x4 -bor 0x10000 -bor 0x40000 -bor 0x80000
+
+function Get-AceSid {
+    param($Ace)
+    try {
+        return $Ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        try { return ([string]$Ace.IdentityReference) } catch { return '' }
+    }
+}
+
+# Liefert die Liste der Konten, die dort schreiben duerfen, obwohl sie es nicht
+# sollten. Leere Liste heisst: sauber.
+function Get-WeakDirectoryAccess {
+    param([string]$Path)
+    $weak = New-Object System.Collections.ArrayList
+    if (-not (Test-Path -LiteralPath $Path)) { return ,@() }
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        foreach ($ace in $acl.Access) {
+            if ($ace.AccessControlType -ne 'Allow') { continue }
+            $sid = Get-AceSid $ace
+            if ($WeakSids -notcontains $sid) { continue }
+            if (([int]$ace.FileSystemRights -band $DangerousRights) -eq 0) { continue }
+            $name = ''
+            try { $name = [string]$ace.IdentityReference } catch { $name = $sid }
+            if (-not $weak.Contains($name)) { [void]$weak.Add($name) }
+        }
+    } catch { }
+    return ,@($weak.ToArray())
+}
+
+function Invoke-Icacls {
+    param([string[]]$Arguments, [int]$TimeoutSec = 300)
+    return (Invoke-Exe -FilePath "$env:SystemRoot\System32\icacls.exe" -Arguments $Arguments -TimeoutSec $TimeoutSec)
+}
+
+function Protect-InstallDirectory {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @{ ok = $true; message = "$Path gibt es nicht - nichts zu tun."; changed = $false }
+    }
+    $before = Get-WeakDirectoryAccess $Path
+    try {
+        # 1. Geerbte Regeln in eigene umwandeln. Danach haengt nichts mehr an C:\
+        #    und es kann bei keinem Schritt eine leere Rechteliste entstehen.
+        Invoke-Icacls @($Path, '/inheritance:d', '/T', '/C', '/Q') | Out-Null
+        # 2. Die zu weit gefassten Gruppen im ganzen Baum entfernen
+        $rm = @($Path, '/remove:g')
+        foreach ($s in $WeakSids) { $rm += ('*' + $s) }
+        $rm += @('/T', '/C', '/Q')
+        Invoke-Icacls $rm | Out-Null
+        # 3. Administratoren und SYSTEM sicherstellen, vererbbar fuer alles Neue
+        Invoke-Icacls @($Path, '/grant', '*S-1-5-32-544:(OI)(CI)(F)', '*S-1-5-18:(OI)(CI)(F)', '/C', '/Q') | Out-Null
+    } catch {
+        return @{ ok = $false; message = "Dateirechte konnten nicht gesetzt werden: $($_.Exception.Message)" }
+    }
+    $after = Get-WeakDirectoryAccess $Path
+    if ($after.Count -gt 0) {
+        return @{ ok = $false
+                  message = ("In $Path duerfen weiterhin schreiben: " + ($after -join ', ') +
+                             '. Bitte die Rechte im Explorer pruefen.') }
+    }
+    Write-Audit 'acl.protect' ("$Path - vorher offen fuer: " + $(if ($before.Count) { $before -join ', ' } else { 'niemanden' }))
+    $verb = $(if ($before.Count -gt 0) { 'Schreibrecht entzogen: ' + ($before -join ', ') } else { 'war bereits abgesichert' })
+    return @{ ok = $true; message = "$Path abgesichert ($verb)."; changed = ($before.Count -gt 0) }
+}
+
+function Protect-AllInstallDirectories {
+    $notes = New-Object System.Collections.ArrayList
+    $ok = $true
+    foreach ($p in @($Paths.Root, $Paths.Php)) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $r = Protect-InstallDirectory $p
+        [void]$notes.Add($r.message)
+        if (-not $r.ok) { $ok = $false }
+    }
+    # Das Dienstkonto braucht danach wieder Leserechte
+    if ($script:Config -and $script:Config.manager.runAs -eq 'LOCAL SERVICE') {
+        $g = Grant-ServiceRights 'LOCAL SERVICE'
+        [void]$notes.Add($g.message)
+    }
+    return @{ ok = $ok
+              message = $(if ($ok) { 'Dateirechte abgesichert.' } else { 'Dateirechte nur teilweise abgesichert.' })
+              notes = @($notes.ToArray()) }
+}
+
+# Erlaubt einem zusaetzlichen Konto das Bearbeiten der Webseiten-Dateien, ohne
+# dass es Administrator sein muss. Der Name wird zu einer SID aufgeloest und nur
+# diese landet im Aufruf - der Eingabetext selbst nie.
+function Grant-WwwAccess {
+    param([string]$Account)
+    $a = Get-SafeString $Account 104
+    if ($a -notmatch '^[A-Za-z0-9 ._\-]+(\\[A-Za-z0-9 ._\-]+)?$') {
+        return @{ ok = $false; message = 'Der Kontoname enthaelt unzulaessige Zeichen.' }
+    }
+    $sid = ''
+    try {
+        $nt = New-Object System.Security.Principal.NTAccount($a)
+        $sid = $nt.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        return @{ ok = $false; message = "Das Konto '$a' gibt es auf diesem Rechner nicht." }
+    }
+    if ($WeakSids -contains $sid) {
+        return @{ ok = $false; message = 'Das waere eine Gruppe, die jeden einschliesst. Bitte ein einzelnes Konto angeben.' }
+    }
+    if (-not (Test-Path -LiteralPath $Paths.Www)) {
+        return @{ ok = $false; message = 'Das Webseiten-Verzeichnis gibt es noch nicht.' }
+    }
+    $r = Invoke-Icacls @($Paths.Www, '/grant', ('*' + $sid + ':(OI)(CI)(M)'), '/T', '/C', '/Q')
+    if (-not $r.ok) {
+        return @{ ok = $false; message = ('Die Rechte liessen sich nicht setzen: ' + (Get-ExeOutput $r)) }
+    }
+    Write-Audit 'acl.grant.www' "$a ($sid)"
+    return @{ ok = $true; message = "'$a' darf jetzt die Dateien unter $($Paths.Www) bearbeiten." }
 }
 
 # ===========================================================================
@@ -2512,27 +2693,69 @@ function Test-ConfigDirty {
 # ---------------------------------------------------------------------------
 #  Zertifikate
 # ---------------------------------------------------------------------------
-$script:CertCache = $null
-$script:CertCacheAt = [datetime]::MinValue
-$script:PortCache = @{}
+# ---------------------------------------------------------------------------
+#  Zwischenspeicher
+#
+#  Get-ScheduledTask, Get-NetFirewallRule und Get-NetTCPConnection gehen ueber
+#  CIM und brauchen unter Windows jeweils hunderte Millisekunden bis Sekunden.
+#  Ohne Zwischenspeicher kostet ein Statusabruf mehrere Sekunden und laesst die
+#  Maschine dauernd arbeiten. Alles hier drin aendert sich nur, wenn der Manager
+#  selbst etwas aendert - dann wird der Speicher verworfen.
+# ---------------------------------------------------------------------------
+$script:AclCache   = $null;  $script:AclCacheAt   = [datetime]::MinValue
+$CacheSecAcl = 300
+$script:CertCache  = $null;  $script:CertCacheAt  = [datetime]::MinValue
+$script:FwCache    = $null;  $script:FwCacheAt    = [datetime]::MinValue
+$script:LegacyCache = $null; $script:LegacyCacheAt = [datetime]::MinValue
+$script:PortCache  = @{}
+$script:TaskCache  = @{}
+
+$CacheSecCert   = 300
+$CacheSecFw     = 300
+$CacheSecLegacy = 300
+$CacheSecPort   = 60
+$CacheSecTask   = 120
+
+function Clear-StatusCache {
+    $script:AclCache = $null;    $script:AclCacheAt = [datetime]::MinValue
+    $script:CertCache = $null;   $script:CertCacheAt = [datetime]::MinValue
+    $script:FwCache = $null;     $script:FwCacheAt = [datetime]::MinValue
+    $script:LegacyCache = $null; $script:LegacyCacheAt = [datetime]::MinValue
+    $script:PortCache = @{}
+    $script:TaskCache = @{}
+}
+
+function Clear-TaskCache {
+    $script:TaskCache = @{}
+    $script:LegacyCache = $null
+    $script:LegacyCacheAt = [datetime]::MinValue
+}
+
+function Get-CachedTaskState {
+    param([string]$Name)
+    if ($script:TaskCache.ContainsKey($Name)) {
+        $e = $script:TaskCache[$Name]
+        if (((Get-Date) - $e.at).TotalSeconds -lt $CacheSecTask) { return $e.value }
+    }
+    $v = Get-TaskState $Name
+    $script:TaskCache[$Name] = @{ at = (Get-Date); value = $v }
+    return $v
+}
 
 function Get-CachedPortOwner {
     param([int]$Port)
     $key = [string]$Port
     if ($script:PortCache.ContainsKey($key)) {
         $e = $script:PortCache[$key]
-        if (((Get-Date) - $e.at).TotalSeconds -lt 20) { return $e.value }
+        if (((Get-Date) - $e.at).TotalSeconds -lt $CacheSecPort) { return $e.value }
     }
     $v = Get-PortOwner $Port
     $script:PortCache[$key] = @{ at = (Get-Date); value = $v }
     return $v
 }
 
-$script:FwCache = $null
-$script:FwCacheAt = [datetime]::MinValue
-
 function Get-CachedFirewallCount {
-    if ($null -ne $script:FwCache -and ((Get-Date) - $script:FwCacheAt).TotalSeconds -lt 60) {
+    if ($null -ne $script:FwCache -and ((Get-Date) - $script:FwCacheAt).TotalSeconds -lt $CacheSecFw) {
         return $script:FwCache
     }
     $n = 0
@@ -2542,16 +2765,35 @@ function Get-CachedFirewallCount {
     return $n
 }
 
-function Clear-StatusCache {
-    $script:CertCache = $null
-    $script:CertCacheAt = [datetime]::MinValue
-    $script:PortCache = @{}
-    $script:FwCache = $null
-    $script:FwCacheAt = [datetime]::MinValue
+function Get-CachedLegacyTasks {
+    if ($null -ne $script:LegacyCache -and ((Get-Date) - $script:LegacyCacheAt).TotalSeconds -lt $CacheSecLegacy) {
+        return ,$script:LegacyCache
+    }
+    $script:LegacyCache = Get-LegacyTaskNames
+    $script:LegacyCacheAt = Get-Date
+    return ,$script:LegacyCache
+}
+
+# Wer darf in den Programmverzeichnissen schreiben, obwohl er es nicht sollte?
+function Get-CachedWeakAcl {
+    if ($null -ne $script:AclCache -and ((Get-Date) - $script:AclCacheAt).TotalSeconds -lt $CacheSecAcl) {
+        return ,$script:AclCache
+    }
+    $weak = New-Object System.Collections.ArrayList
+    foreach ($p in @($Paths.Root, $Paths.Php)) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        foreach ($w in (Get-WeakDirectoryAccess $p)) {
+            $e = "$w ($p)"
+            if (-not $weak.Contains($e)) { [void]$weak.Add($e) }
+        }
+    }
+    $script:AclCache = @($weak.ToArray())
+    $script:AclCacheAt = Get-Date
+    return ,$script:AclCache
 }
 
 function Get-CachedCertificates {
-    if ($null -ne $script:CertCache -and ((Get-Date) - $script:CertCacheAt).TotalSeconds -lt 90) {
+    if ($null -ne $script:CertCache -and ((Get-Date) - $script:CertCacheAt).TotalSeconds -lt $CacheSecCert) {
         return ,$script:CertCache
     }
     $script:CertCache = Get-Certificates
@@ -2564,7 +2806,13 @@ function Get-CachedCertificates {
 function Get-CertificateRoots {
     $roots = New-Object System.Collections.ArrayList
     try {
-        foreach ($c in @(($Paths.Data + '\certificates'), ($Paths.Data + '\caddy\certificates'))) {
+        $base = $Paths.Data
+        try {
+            if ($script:Config -and $script:Config.global.storage) { $base = $script:Config.global.storage }
+        } catch { }
+        foreach ($c in @(($base + '\certificates'), ($base + '\caddy\certificates'),
+                         ($Paths.Data + '\certificates'))) {
+            if ($roots.Contains($c)) { continue }
             if (Test-Path -LiteralPath $c) { [void]$roots.Add($c) }
         }
         if ($roots.Count -eq 0) {
@@ -2605,6 +2853,25 @@ function Get-Certificates {
 # ---------------------------------------------------------------------------
 #  Gesamtstatus
 # ---------------------------------------------------------------------------
+# Prueft die aktive Caddyfile - aber nur neu, wenn sich die Datei geaendert hat.
+$script:CfgCheck = $null
+$script:CfgCheckKey = ''
+
+function Get-CachedConfigCheck {
+    $key = ''
+    try {
+        $fi = Get-Item -LiteralPath $Paths.Config -ErrorAction SilentlyContinue
+        if ($fi) { $key = [string]$fi.LastWriteTimeUtc.Ticks + '-' + [string]$fi.Length }
+    } catch { }
+    if (-not $key) { return @{ broken = $false; error = '' } }
+    if ($script:CfgCheckKey -eq $key -and $null -ne $script:CfgCheck) { return $script:CfgCheck }
+    $r = Test-CaddyConfigFile $Paths.Config
+    $res = @{ broken = (-not $r.ok); error = $(if ($r.ok) { '' } else { (Get-SafeString $r.output 300) }) }
+    $script:CfgCheck = $res
+    $script:CfgCheckKey = $key
+    return $res
+}
+
 function Get-Status {
     param($Config)
     $caddy = Get-CaddyProcess
@@ -2626,6 +2893,7 @@ function Get-Status {
         } catch { }
     }
 
+    $cfgChk = $(if ($ver.installed) { Get-CachedConfigCheck } else { @{ broken = $false; error = '' } })
     $owner80 = Get-CachedPortOwner 80
     $owner443 = Get-CachedPortOwner 443
 
@@ -2646,21 +2914,26 @@ function Get-Status {
         caddyVersion   = $ver.version
         caddyRunning   = [bool]$caddy
         caddyPid       = $(if ($caddy) { $caddy.Id } else { 0 })
+        caddyPaths     = (Get-CaddyProcessPaths)
         caddyUptime    = $uptime
         phpInstalled   = (Test-Path -LiteralPath $Paths.PhpExe)
         phpEnabled     = [bool]$Config.php.enabled
         phpRunning     = $php.Count
         phpPorts       = @($phpPorts.ToArray())
-        taskServer     = (Get-TaskState $TaskServer)
-        taskWatchdog   = (Get-TaskState $TaskWatch)
-        legacyTasks    = (Get-LegacyTaskNames)
+        taskServer     = (Get-CachedTaskState $TaskServer)
+        taskWatchdog   = (Get-CachedTaskState $TaskWatch)
+        legacyTasks    = (Get-CachedLegacyTasks)
         firewallRules  = (Get-CachedFirewallCount)
+        aclWeak        = (Get-CachedWeakAcl)
+        aclOk          = ((Get-CachedWeakAcl).Count -eq 0)
         port80         = $owner80
         port443        = $owner443
         certificates   = (Get-CachedCertificates)
         siteCount      = @($Config.sites).Count
         siteActive     = @($Config.sites | Where-Object { $_.enabled }).Count
         dirty          = ($ver.installed -and (Test-ConfigDirty $Config))
+        configBroken   = $cfgChk.broken
+        configError    = $cfgChk.error
         mode           = $Config.mode
         runAs          = $Config.manager.runAs
         disk           = $disk
@@ -2782,6 +3055,46 @@ function Get-SecurityFindings {
         [void]$f.Add((New-Finding 'ok' 'Watchdog aktiv' 'Pr{ue}ft alle 3 Minuten, ob alles l{ae}uft.'))
     }
 
+    # --- Was sonst noch auf dieser Maschine mitspielt ---
+    $paths = @($Status.caddyPaths)
+    if ($paths.Count -gt 1) {
+        [void]$f.Add((New-Finding 'bad' 'Mehrere Caddy-Prozesse laufen gleichzeitig' `
+            ('Sie streiten sich um Port 80 und 443. Laufende Programmdateien: ' + ($paths -join ' | '))))
+    } elseif ($paths.Count -eq 1 -and $paths[0] -ne $Paths.Exe -and $paths[0] -ne '(Pfad nicht lesbar)') {
+        [void]$f.Add((New-Finding 'bad' 'Der laufende Caddy stammt aus einem anderen Verzeichnis' `
+            ('L{ae}uft: ' + $paths[0] + '. Verwaltet wird aber ' + $Paths.Exe + '. Solange das so ist, ' +
+             'wirken {Ae}nderungen hier nicht auf den laufenden Server. Erst die fremde Einrichtung ' +
+             'beenden, dann hier neu starten.')))
+    }
+
+    $foreign = Get-ForeignSetup
+    if (@($foreign.services).Count -gt 0) {
+        $txt = (@($foreign.services | ForEach-Object { $_.display + ' (' + $_.state + ')' }) -join ', ')
+        [void]$f.Add((New-Finding 'bad' 'Caddy laeuft zusaetzlich als Windows-Dienst' `
+            ("Gefunden: $txt. Dienst und geplante Aufgabe starten denselben Server doppelt. " +
+             'Bitte einen der beiden Wege abschalten - der Manager fasst fremde Dienste nicht an.')))
+    }
+    $fremd = @($foreign.tasks | Where-Object { $LegacyTaskNames -notcontains ($_.name -replace '^\\', '') })
+    if ($fremd.Count -gt 0) {
+        [void]$f.Add((New-Finding 'warn' 'Fremde geplante Aufgaben mit Caddy-Bezug' `
+            ('Sie stammen nicht vom Manager und k{oe}nnen dagegenarbeiten: ' +
+             ((@($fremd | ForEach-Object { $_.name })) -join ', '))))
+    }
+
+    $missing = Get-MissingSiteRoots $Config
+    if ($missing.Count -gt 0) {
+        [void]$f.Add((New-Finding 'warn' "$($missing.Count) Seite(n) zeigen auf ein Verzeichnis, das es nicht gibt" `
+            ('Besucher bekommen dort nur Fehler. Betroffen: ' +
+             ((@($missing | ForEach-Object { $_.domain + ' -> ' + $_.root })) -join '; ')) `
+            'create-roots' 'Verzeichnisse anlegen'))
+    }
+
+    if ($Status.configBroken) {
+        [void]$f.Add((New-Finding 'bad' 'Die aktive Caddyfile ist fehlerhaft' `
+            ('Caddy kann sie nicht laden: ' + [string]$Status.configError +
+             ' Der Server startet damit nicht. Unter Caddyfile pr{ue}fen oder eine Sicherung zur{ue}ckholen.')))
+    }
+
     if (@($Status.legacyTasks).Count -gt 0) {
         [void]$f.Add((New-Finding 'warn' 'Alte Aufgaben aus der Handinstallation gefunden' `
             ('Diese k{oe}nnen sich mit der neuen Automatik ins Gehege kommen: ' + (@($Status.legacyTasks) -join ', ')) `
@@ -2797,13 +3110,24 @@ function Get-SecurityFindings {
             'fix-admin' 'Auf localhost begrenzen'))
     }
 
-    if ($Status.port80 -and $Status.port80.name -ne 'caddy') {
-        [void]$f.Add((New-Finding 'warn' 'Port 80 geh{oe}rt einem anderen Programm' `
-            "Auf Port 80 lauscht '$($Status.port80.name)' (PID $($Status.port80.pid)). Caddy kann den Port dann nicht belegen."))
+    foreach ($pc in @(@{ n = 80; o = $Status.port80 }, @{ n = 443; o = $Status.port443 })) {
+        if (-not $pc.o -or $pc.o.name -eq 'caddy') { continue }
+        $hint = ''
+        switch -Regex ($pc.o.name) {
+            '(?i)^(w3wp|inetinfo)$' { $hint = ' Das ist der IIS. Er muss beendet oder umgestellt werden: in der Systemsteuerung unter Dienste "World Wide Web-Publishingdienst" (W3SVC) beenden und auf Deaktiviert setzen.' }
+            '(?i)^System$'          { $hint = ' Der Port haengt an http.sys - meist IIS, WinRM oder die Windows-Freigabe von Hyper-V. Mit "netsh http show servicestate" laesst sich der Verursacher finden.' }
+            '(?i)^(vmware|Skype)'   { $hint = ' Im Programm laesst sich der Port umstellen.' }
+        }
+        [void]$f.Add((New-Finding 'bad' ("Port $($pc.n) geh{oe}rt einem anderen Programm") `
+            ("Dort lauscht '$($pc.o.name)' (Prozess $($pc.o.pid)). Caddy kann den Port nicht belegen und " +
+             'startet damit nicht.' + $hint)))
     }
-    if ($Status.port443 -and $Status.port443.name -ne 'caddy') {
-        [void]$f.Add((New-Finding 'warn' 'Port 443 geh{oe}rt einem anderen Programm' `
-            "Auf Port 443 lauscht '$($Status.port443.name)' (PID $($Status.port443.pid))."))
+
+    if ($Status.caddyVersion -and -not (Test-CaddyAtLeast 2 5)) {
+        [void]$f.Add((New-Finding 'warn' "Caddy $($Status.caddyVersion) ist alt" `
+            ('Der Schutz versteckter Dateien wird bei dieser Fassung weggelassen, weil sie die ' +
+             'n{oe}tigen Direktiven noch nicht kennt. Ein Update bringt ihn zur{ue}ck.') `
+            'setup-caddy-update' 'Caddy aktualisieren'))
     }
 
     try {
@@ -2815,6 +3139,21 @@ function Get-SecurityFindings {
             [void]$f.Add((New-Finding 'ok' 'Firewallfreigaben vorhanden' "$($fw.Count) Regeln f{ue}r Port 80/443."))
         }
     } catch { }
+
+    if (-not $Status.aclOk) {
+        [void]$f.Add((New-Finding 'bad' 'Programmverzeichnis ist f{ue}r jeden beschreibbar' `
+            ('Ein Ordner direkt unter C:\ erbt von dort das Recht "{Ae}ndern" f{ue}r alle angemeldeten ' +
+             'Benutzer. Wer keine Administratorrechte hat, kann so caddy.exe oder watchdog.ps1 ' +
+             'austauschen - beide laufen als SYSTEM. Betrifft: ' + ((@($Status.aclWeak)) -join '; ')) `
+            'harden-acl' 'Rechte entziehen'))
+    } else {
+        [void]$f.Add((New-Finding 'ok' 'Programmverzeichnis abgesichert' 'Nur Administratoren und SYSTEM d{ue}rfen schreiben.'))
+    }
+
+    [void]$f.Add((New-Finding 'warn' 'Oberfl{ae}che ohne Anmeldung' `
+        ('So eingestellt. Jedes Programm und jeder angemeldete Benutzer auf diesem Rechner kann ' +
+         '{ue}ber 127.0.0.1 den Webserver umbauen. Von aussen ist die Oberfl{ae}che nicht erreichbar, ' +
+         'und fremde Webseiten werden durch die Kopfzeilenpr{ue}fung abgewiesen.')))
 
     if ($Config.manager.runAs -eq 'SYSTEM') {
         [void]$f.Add((New-Finding 'warn' 'Caddy l{ae}uft mit vollen Systemrechten' `
@@ -2992,22 +3331,123 @@ function New-PasswordHash {
 }
 
 # ===========================================================================
+#  BESTANDSAUFNAHME
+#  Was laeuft auf diesem Rechner schon, das mit Caddy zu tun hat und nicht vom
+#  Manager stammt? Die Abfragen gehen ueber CIM und sind langsam, deshalb nur
+#  auf Anforderung (Sicherheitsansicht) und mit langem Zwischenspeicher.
+# ===========================================================================
+$script:ForeignCache = $null
+$script:ForeignCacheAt = [datetime]::MinValue
+$CacheSecForeign = 300
+
+function Get-CaddyProcessPaths {
+    $list = New-Object System.Collections.ArrayList
+    foreach ($p in @(Get-Process -Name caddy -ErrorAction SilentlyContinue)) {
+        $path = ''
+        try { $path = [string]$p.Path } catch { }
+        if (-not $path) { $path = '(Pfad nicht lesbar)' }
+        if (-not $list.Contains($path)) { [void]$list.Add($path) }
+    }
+    return ,@($list.ToArray())
+}
+
+function Get-ForeignSetup {
+    if ($null -ne $script:ForeignCache -and ((Get-Date) - $script:ForeignCacheAt).TotalSeconds -lt $CacheSecForeign) {
+        return $script:ForeignCache
+    }
+    $services = New-Object System.Collections.ArrayList
+    $tasks = New-Object System.Collections.ArrayList
+
+    # Dienste, die caddy ausfuehren - typisch nach einer Einrichtung mit nssm oder WinSW
+    try {
+        foreach ($s in @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue)) {
+            $pn = [string]$s.PathName
+            if ($pn -and $pn -match '(?i)caddy') {
+                [void]$services.Add(@{ name = [string]$s.Name; display = [string]$s.DisplayName
+                                       state = [string]$s.State; path = (Get-SafeString $pn 200) })
+            }
+        }
+    } catch { }
+
+    # Geplante Aufgaben ausserhalb unseres Ordners, die caddy oder php-cgi starten
+    try {
+        foreach ($t in @(Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+            if ([string]$t.TaskPath -eq $TaskFolder) { continue }
+            $hit = $false
+            $what = ''
+            foreach ($a in @($t.Actions)) {
+                $ex = ''
+                $ar = ''
+                try { $ex = [string]$a.Execute } catch { }
+                try { $ar = [string]$a.Arguments } catch { }
+                $both = $ex + ' ' + $ar
+                if ($both -match '(?i)caddy|php-cgi') { $hit = $true; $what = (Get-SafeString $both 160) }
+            }
+            if ($hit) {
+                [void]$tasks.Add(@{ name = ([string]$t.TaskPath + [string]$t.TaskName)
+                                    state = [string]$t.State; action = $what })
+            }
+        }
+    } catch { }
+
+    $script:ForeignCache = @{ services = @($services.ToArray()); tasks = @($tasks.ToArray()) }
+    $script:ForeignCacheAt = Get-Date
+    return $script:ForeignCache
+}
+
+function Get-MissingSiteRoots {
+    param($Config)
+    $miss = New-Object System.Collections.ArrayList
+    foreach ($s in @($Config.sites)) {
+        if (-not $s.enabled) { continue }
+        if ($s.type -ne 'static' -and $s.type -ne 'php') { continue }
+        if (-not $s.root) { continue }
+        if (-not (Test-Path -LiteralPath $s.root)) {
+            [void]$miss.Add(@{ id = $s.id; domain = $s.domains[0]; root = $s.root })
+        }
+    }
+    return ,@($miss.ToArray())
+}
+
+function New-MissingSiteRoots {
+    param($Config)
+    $made = 0
+    foreach ($m in (Get-MissingSiteRoots $Config)) {
+        try {
+            New-Item -ItemType Directory -Path $m.root -Force | Out-Null
+            $index = $m.root + '\index.html'
+            if (-not (Test-Path -LiteralPath $index)) {
+                Write-TextFile $index (T ("<!doctype html>`r`n<meta charset=`"utf-8`">`r`n" +
+                    "<title>" + (ConvertTo-HtmlText $m.domain) + "</title>`r`n" +
+                    "<h1>Es funktioniert.</h1>`r`n"))
+            }
+            $made++
+        } catch { }
+    }
+    Write-Audit 'roots.create' "count=$made"
+    return @{ ok = $true; message = "$made Verzeichnis(se) angelegt." }
+}
+
+# ===========================================================================
 #  LOKALER VERWALTUNGSSERVER
 #
-#  Sicherheitsmodell:
-#   - Der Listener bindet ausschliesslich auf 127.0.0.1. Aus dem Netz ist
-#     die Oberflaeche nicht erreichbar, auch nicht ueber den Rechnernamen.
-#   - Jeder Start erzeugt ein neues Zufallstoken. Ohne dieses Token gibt es
-#     keinen Zugang; es steht nur im Konsolenfenster und in der Startadresse.
-#   - Alle aendernden Aufrufe brauchen zusaetzlich einen CSRF-Wert im Header,
-#     der nur im Seitenquelltext steht. Fremde Webseiten kommen nicht daran.
-#   - Host- und Origin-Pruefung verhindert DNS-Rebinding.
+#  Sicherheitsmodell (bewusst offen gewaehlt):
+#   - Der Listener bindet ausschliesslich auf 127.0.0.1. Aus dem Netz ist die
+#     Oberflaeche nicht erreichbar, auch nicht ueber den Rechnernamen.
+#   - Es gibt KEINE Anmeldung. Wer lokal auf 127.0.0.1 zugreifen kann, darf
+#     alles. Das ist so gewuenscht; der Schutz liegt in den Dateirechten und
+#     darin, dass der Manager nur laeuft, wenn ihn jemand startet.
+#   - Was trotzdem bleibt und bleiben muss: aendernde Aufrufe brauchen einen
+#     eigenen Kopfzeilen-Wert und die richtige Herkunft. Ohne das koennte jede
+#     beliebige Webseite, die im Browser dieses Rechners geoeffnet wird, per
+#     Formular auf 127.0.0.1 schreiben und den Webserver umbauen. Ein eigener
+#     Kopfzeilen-Wert loest eine Vorabanfrage aus, die wir ablehnen.
+#   - Die Host-Pruefung verhindert DNS-Rebinding aus dem Netz.
 #   - Nach Ablauf der Leerlaufzeit beendet sich der Server von selbst.
 # ===========================================================================
 
 $script:Listener     = $null
 $script:Port         = 0
-$script:SessionToken = ''
 $script:CsrfToken    = ''
 $script:LastActivity = Get-Date
 $script:Running      = $true
@@ -3150,34 +3590,10 @@ function Test-RequestOrigin {
     return ($o -eq $script:Origin)
 }
 
-function Test-Authorized {
-    param($Ctx)
-    try {
-        $c = $Ctx.Request.Cookies['cmsid']
-        if ($c -and (Test-SecretEqual $c.Value $script:SessionToken)) { return $true }
-    } catch { }
-    return $false
-}
-
 function Test-Csrf {
     param($Ctx)
     $v = [string]$Ctx.Request.Headers['X-Caddy-Manager-Csrf']
     return (Test-SecretEqual $v $script:CsrfToken)
-}
-
-function Get-LoginPage {
-    $body = @'
-<!doctype html><meta charset="utf-8"><title>Caddy Manager</title>
-<style>body{font-family:Segoe UI,system-ui,sans-serif;background:#12141a;color:#e6e8ee;
-display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-div{max-width:34rem;padding:2rem;background:#1b1e26;border:1px solid #2b3040;border-radius:14px}
-h1{margin:0 0 .6rem;font-size:1.2rem}p{line-height:1.6;color:#a8b0c2}code{color:#8fd2ff}</style>
-<div><h1>Kein gueltiger Zugang</h1>
-<p>Diese Seite laesst sich nur ueber die Adresse oeffnen, die beim Start im
-Konsolenfenster steht. Wechsle in das Fenster von <code>caddy-manager.bat</code>
-und rufe die dort angezeigte Adresse auf.</p></div>
-'@
-    return (T $body)
 }
 
 # ---------------------------------------------------------------------------
@@ -3188,10 +3604,7 @@ function Invoke-Request {
     $path = [string]$Ctx.Request.Url.AbsolutePath
     $method = [string]$Ctx.Request.HttpMethod
 
-    # Die Statusabfrage laeuft im Hintergrund alle paar Sekunden weiter, auch
-    # wenn niemand am Rechner sitzt. Sie zaehlt deshalb nicht als Nutzung -
-    # sonst wuerde die Leerlaufabschaltung nie greifen.
-    if ($path -ne '/api/status') { $script:LastActivity = Get-Date }
+    $script:LastActivity = Get-Date
 
     if (-not (Test-RequestHost $Ctx)) {
         Send-Text $Ctx (T 'Ung{ue}ltiger Host.') 'text/plain; charset=utf-8' 400
@@ -3204,35 +3617,13 @@ function Invoke-Request {
         return
     }
 
-    # --- Anmeldung ueber das Starttoken ---
     if ($path -eq '/' -and $method -eq 'GET') {
-        $t = [string]$Ctx.Request.QueryString['t']
-        if ($t -and (Test-SecretEqual $t $script:SessionToken)) {
-            try {
-                $Ctx.Response.StatusCode = 302
-                Add-CommonHeaders $Ctx.Response
-                $Ctx.Response.AppendHeader('Set-Cookie', "cmsid=$($script:SessionToken); Path=/; HttpOnly; SameSite=Strict")
-                $Ctx.Response.AppendHeader('Location', '/')
-            } catch { }
-            try { $Ctx.Response.Close() } catch { }
-            return
-        }
-        if (-not (Test-Authorized $Ctx)) {
-            Send-Text $Ctx (Get-LoginPage) 'text/html; charset=utf-8' 401
-            return
-        }
         $nonce = New-Secret 16
         Send-Html $Ctx (Get-UiHtml $nonce) $nonce
         return
     }
 
-    if (-not (Test-Authorized $Ctx)) {
-        Send-Json $Ctx @{ ok = $false; message = 'Nicht angemeldet. Bitte die Startadresse erneut {oe}ffnen.' } 401
-        return
-    }
-
-    # Aendernde Aufrufe gehen ausschliesslich ueber POST. Sonst liessen sich
-    # Routen ohne Nutzdaten (etwa /api/apply) per GET ohne CSRF-Pruefung ausloesen.
+    # Aendernde Aufrufe nur ueber POST, sonst greift der Schutz unten nicht.
     if ($method -ne 'POST' -and $path -like '/api/*') {
         $readOnly = @('/api/state', '/api/status', '/api/security', '/api/preview',
                       '/api/logs', '/api/log', '/api/backups', '/api/audit', '/api/caddyfile')
@@ -3242,13 +3633,17 @@ function Invoke-Request {
         }
     }
 
+    # Der einzige verbliebene Schutz - und der einzige, der hier zaehlt: eine
+    # fremde Webseite kann zwar ein Formular an 127.0.0.1 schicken, aber keine
+    # eigene Kopfzeile setzen, ohne vorher eine Vorabanfrage zu stellen. Die
+    # beantworten wir nicht. Damit bleibt Drive-by-Umkonfiguration aussen vor.
     if ($method -eq 'POST') {
         if (-not (Test-RequestOrigin $Ctx)) {
             Send-Json $Ctx @{ ok = $false; message = 'Herkunft der Anfrage abgelehnt.' } 403
             return
         }
         if (-not (Test-Csrf $Ctx)) {
-            Send-Json $Ctx @{ ok = $false; message = 'Sicherheitsmerkmal fehlt. Bitte die Seite neu laden.' } 403
+            Send-Json $Ctx @{ ok = $false; message = 'Kopfzeile fehlt. Bitte die Seite neu laden.' } 403
             return
         }
     }
@@ -3386,6 +3781,7 @@ function Invoke-ApiRoute {
             $cfg.global.extra = $geCheck
             $cfg.global.snippets = $snCheck
 
+            $cfg.global.trustedProxies = Get-BoolField $data 'trustedProxies' $cfg.global.trustedProxies
             $cfg.php.enabled = Get-BoolField $data 'phpEnabled' $cfg.php.enabled
             $psz = 0
             if ([int]::TryParse((Get-StringField $data 'phpPoolSize' '4'), [ref]$psz) -and $psz -ge 1 -and $psz -le 16) {
@@ -3629,6 +4025,12 @@ function Invoke-ApiRoute {
             return
         }
 
+        '/api/acl' {
+            $data = Read-RequestJson $Ctx
+            Send-Json $Ctx (Grant-WwwAccess (Get-StringField $data 'account' ''))
+            return
+        }
+
         '/api/audit' {
             Send-Json $Ctx @{ ok = $true; text = (Get-LogTail 'manager.log' 400) }
             return
@@ -3722,6 +4124,9 @@ function Invoke-SetupStep {
             [void]$notes.Add($r.message)
             foreach ($n in @($r.notes)) { [void]$notes.Add($n) }
 
+            $acl = Protect-AllInstallDirectories
+            [void]$notes.Add($acl.message)
+
             $mig = Import-CertificateStore
             if ($mig.changed) { [void]$notes.Add($mig.message) }
 
@@ -3750,6 +4155,8 @@ function Invoke-Fix {
         'start' { return (Start-CaddyServer) }
 
         'setup-tasks' { return (Install-Automation $cfg) }
+
+        'setup-caddy-update' { return (Install-Caddy -Force) }
 
         'setup-firewall' { return (Set-FirewallRules) }
 
@@ -3805,6 +4212,14 @@ function Invoke-Fix {
 
         'php-ini' { return (Set-PhpIni $cfg) }
 
+        'create-roots' { return (New-MissingSiteRoots $cfg) }
+
+        'harden-acl' {
+            $r = Protect-AllInstallDirectories
+            Clear-StatusCache
+            return $r
+        }
+
         default { return @{ ok = $false; message = 'Unbekannte Aktion.' } }
     }
 }
@@ -3823,21 +4238,24 @@ function Start-ManagerServer {
     $script:Listener = $started.listener
     $script:Port = $started.port
     $script:Origin = "http://127.0.0.1:$($started.port)"
-    $script:SessionToken = New-Secret 32
     $script:CsrfToken = New-Secret 32
     $script:LastActivity = Get-Date
 
-    $url = "$($script:Origin)/?t=$($script:SessionToken)"
+    $url = $script:Origin
 
     Write-Host ''
     Write-Host2 '  Caddy Manager l{ae}uft.' 'Green'
     Write-Host ''
-    Write-Host2 '  Oberfl{ae}che:' 'Gray'
     Write-Host "  $url" -ForegroundColor Cyan
     Write-Host ''
-    Write-Host2 '  Nur {ue}ber diese Adresse ist der Zugang m{oe}glich. Sie gilt bis zum Beenden.' 'DarkGray'
+    Write-Host2 '  Ohne Anmeldung, nur von diesem Rechner aus erreichbar.' 'DarkGray'
     Write-Host2 '  Fenster schlie{ss}en oder Strg+C beendet nur die Oberfl{ae}che - der Webserver l{ae}uft weiter.' 'DarkGray'
     Write-Host ''
+
+    # Aufgabenplanung und Firewall einmal vorab abfragen. Danach liegt alles im
+    # Zwischenspeicher und die Oberflaeche ist beim ersten Aufruf sofort da,
+    # statt mehrere Sekunden auf CIM zu warten.
+    try { Get-Status $Config | Out-Null } catch { }
 
     if ($Config.manager.openBrowser) {
         try { Start-Process $url | Out-Null } catch { }
@@ -3879,8 +4297,8 @@ function Start-ManagerServer {
 
 # ===========================================================================
 #  WEBOBERFLAECHE
-#  Eine einzige Seite, komplett eingebettet. Keine externen Dateien, keine
-#  Schriftarten und keine Skripte von aussen - passend zur strengen CSP.
+#  Eine Seite, alles eingebettet. Kein Nachladen im Hintergrund: aktualisiert
+#  wird beim Oeffnen, nach jeder Aktion und wenn der Reiter wieder Fokus hat.
 # ===========================================================================
 
 function Get-UiHtml {
@@ -3893,1195 +4311,560 @@ function Get-UiHtml {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Caddy Manager</title>
 <style nonce="__NONCE__">
-:root{
-  --bg:#0e1015; --panel:#161922; --panel2:#1c202b; --panel3:#232836; --line:#2a3040;
-  --text:#e8eaf0; --muted:#98a1b5; --dim:#6d768a;
-  --accent:#4d9bff; --accent2:#1f3f6b;
-  --ok:#3fbf80; --warn:#e2a53c; --bad:#e5574d;
-  --radius:12px;
-}
-@media (prefers-color-scheme: light){
-  :root{
-    --bg:#f3f5f9; --panel:#ffffff; --panel2:#f7f8fc; --panel3:#eef1f7; --line:#dde2ec;
-    --text:#141821; --muted:#5c6577; --dim:#8b93a5;
-    --accent:#1c6ee0; --accent2:#dae8ff;
-  }
-}
+:root{--bg:#0f1115;--p1:#171a21;--p2:#1e222b;--ln:#2b313d;--tx:#e6e8ee;--mu:#98a1b3;--dm:#6d768a;
+--ac:#4d9bff;--ok:#3fbf80;--wa:#e2a53c;--ba:#e5574d;--r:8px}
+@media(prefers-color-scheme:light){:root{--bg:#f4f6fa;--p1:#fff;--p2:#f7f8fc;--ln:#dde2ec;
+--tx:#151922;--mu:#5c6577;--dm:#8b93a5;--ac:#1c6ee0}}
 *{box-sizing:border-box}
-html,body{margin:0;padding:0;height:100%}
-body{background:var(--bg);color:var(--text);font:15px/1.55 "Segoe UI",system-ui,-apple-system,sans-serif;overflow:hidden}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--tx);font:14px/1.45 "Segoe UI",system-ui,sans-serif;
+display:flex;flex-direction:column;overflow:hidden}
 button,input,select,textarea{font:inherit;color:inherit}
-a{color:var(--accent)}
-.hidden{display:none !important}
+.hide{display:none!important}
 
-.app{display:flex;height:100vh}
-.nav{width:232px;flex:0 0 232px;background:var(--panel);border-right:1px solid var(--line);
-     display:flex;flex-direction:column;padding:16px 12px}
-.brand{display:flex;align-items:center;gap:10px;padding:6px 8px 18px}
-.brand .logo{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--accent),#7b5cff);
-     display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;font-size:15px}
-.brand b{font-size:15px;letter-spacing:.2px}
-.brand small{display:block;color:var(--dim);font-size:11px;font-weight:400}
-.nav nav{display:flex;flex-direction:column;gap:2px;flex:1}
-.nav button.navitem{display:flex;align-items:center;gap:10px;background:none;border:0;text-align:left;
-     padding:9px 11px;border-radius:9px;cursor:pointer;color:var(--muted);width:100%}
-.nav button.navitem:hover{background:var(--panel2);color:var(--text)}
-.nav button.navitem.active{background:var(--accent2);color:var(--accent);font-weight:600}
-@media (prefers-color-scheme: dark){.nav button.navitem.active{color:#cfe3ff}}
-.nav .ico{width:18px;text-align:center;font-size:14px}
-.nav .badge{margin-left:auto;background:var(--bad);color:#fff;border-radius:20px;
-     font-size:10px;padding:1px 7px;font-weight:700}
-.navfoot{border-top:1px solid var(--line);padding-top:12px;color:var(--dim);font-size:11.5px}
-.navfoot div{margin-bottom:3px}
+header{display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--p1);
+border-bottom:1px solid var(--ln);flex-wrap:wrap}
+header b{font-size:14px;margin-right:6px}
+.st{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--mu);
+padding:2px 8px;border:1px solid var(--ln);border-radius:20px;white-space:nowrap}
+.d{width:7px;height:7px;border-radius:50%;background:var(--dm);flex:0 0 7px}
+.d.ok{background:var(--ok)}.d.wa{background:var(--wa)}.d.ba{background:var(--ba)}
+.sp{flex:1}
 
-main{flex:1;display:flex;flex-direction:column;min-width:0}
-.top{display:flex;align-items:center;gap:10px;padding:12px 22px;border-bottom:1px solid var(--line);
-     background:var(--panel);flex-wrap:wrap}
-.pill{display:inline-flex;align-items:center;gap:7px;background:var(--panel3);border:1px solid var(--line);
-     border-radius:20px;padding:4px 12px;font-size:12.5px;color:var(--muted);white-space:nowrap}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex:0 0 8px}
-.dot.ok{background:var(--ok);box-shadow:0 0 0 3px rgba(63,191,128,.18)}
-.dot.bad{background:var(--bad);box-shadow:0 0 0 3px rgba(229,87,77,.18)}
-.dot.warn{background:var(--warn);box-shadow:0 0 0 3px rgba(226,165,60,.18)}
-.spacer{flex:1}
+nav{display:flex;gap:1px;padding:0 10px;background:var(--p1);border-bottom:1px solid var(--ln);
+overflow-x:auto}
+nav button{background:none;border:0;border-bottom:2px solid transparent;padding:7px 12px;
+cursor:pointer;color:var(--mu);white-space:nowrap;font-size:13.5px}
+nav button:hover{color:var(--tx)}
+nav button.on{color:var(--ac);border-bottom-color:var(--ac);font-weight:600}
+nav .bg{background:var(--ba);color:#fff;border-radius:20px;font-size:10px;padding:0 5px;margin-left:5px}
 
-.scroll{flex:1;overflow-y:auto;padding:22px}
-.wrap{max-width:1080px;margin:0 auto}
+main{flex:1;overflow:auto;padding:14px}
+.w{max-width:940px;margin:0 auto}
+h2{margin:0 0 10px;font-size:15px;font-weight:600}
+.box{background:var(--p1);border:1px solid var(--ln);border-radius:var(--r);padding:12px;margin-bottom:12px}
+.bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
 
-h2.page{margin:0 0 4px;font-size:20px}
-p.lead{margin:0 0 20px;color:var(--muted);font-size:13.5px}
+button.b{background:var(--p2);border:1px solid var(--ln);border-radius:6px;padding:5px 11px;
+cursor:pointer;font-size:13px;white-space:nowrap}
+button.b:hover:not(:disabled){border-color:var(--ac);color:var(--ac)}
+button.b:disabled{opacity:.4;cursor:not-allowed}
+button.b.pri{background:var(--ac);border-color:var(--ac);color:#fff}
+button.b.pri:hover{filter:brightness(1.1);color:#fff}
+button.b.dn:hover{border-color:var(--ba);color:var(--ba)}
+button.b.s{padding:3px 8px;font-size:12px}
+button.lk{background:none;border:0;color:var(--ac);cursor:pointer;padding:0;font-size:12.5px}
 
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:16px}
-.card h3{margin:0 0 4px;font-size:15px}
-.card .sub{color:var(--muted);font-size:13px;margin:0 0 14px}
-.grid{display:grid;gap:14px}
-.g2{grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}
-.g3{grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
-
-.stat{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:15px 16px}
-.stat .k{color:var(--muted);font-size:12px;display:flex;align-items:center;gap:7px;margin-bottom:7px}
-.stat .v{font-size:20px;font-weight:650;letter-spacing:-.2px}
-.stat .m{color:var(--dim);font-size:11.5px;margin-top:3px}
-
-.btn{background:var(--panel3);border:1px solid var(--line);border-radius:9px;padding:8px 14px;
-     cursor:pointer;font-size:13.5px;font-weight:550;transition:.12s;white-space:nowrap}
-.btn:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
-.btn:disabled{opacity:.45;cursor:not-allowed}
-.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.btn.primary:hover:not(:disabled){filter:brightness(1.1);color:#fff}
-.btn.danger:hover:not(:disabled){border-color:var(--bad);color:var(--bad)}
-.btn.sm{padding:5px 10px;font-size:12.5px}
-.btn.link{background:none;border:0;color:var(--accent);padding:4px 6px}
-.btn.link:hover{text-decoration:underline}
-.row{display:flex;gap:9px;flex-wrap:wrap;align-items:center}
-
-.dirty{display:flex;align-items:center;gap:14px;background:linear-gradient(90deg,rgba(226,165,60,.16),transparent);
-       border-bottom:1px solid var(--line);border-left:3px solid var(--warn);padding:11px 22px}
-.dirty .t{font-size:13.5px}
-.dirty .t b{color:var(--warn)}
+.dirty{display:flex;align-items:center;gap:10px;padding:7px 14px;background:rgba(226,165,60,.14);
+border-bottom:1px solid var(--ln);font-size:13px}
 
 table{width:100%;border-collapse:collapse}
-th{text-align:left;font-size:11.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);
-   font-weight:600;padding:0 10px 9px}
-td{padding:11px 10px;border-top:1px solid var(--line);vertical-align:middle;font-size:13.5px}
-tr.off td{opacity:.45}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--dm);
+padding:0 8px 6px;font-weight:600}
+td{padding:7px 8px;border-top:1px solid var(--ln);font-size:13px;vertical-align:middle}
+tr.off td{opacity:.4}
+td.c1{width:40px}td.ce{text-align:right;white-space:nowrap}
 .dom{font-weight:600}
-.dom small{display:block;color:var(--dim);font-weight:400;font-size:11.5px;margin-top:2px;
-           word-break:break-all;font-family:Consolas,monospace}
-.tag{display:inline-block;background:var(--panel3);border:1px solid var(--line);border-radius:6px;
-     padding:2px 8px;font-size:11.5px;color:var(--muted)}
-.tag.php{color:#a78bfa;border-color:#5b4b9b}
-.tag.proxy{color:#4dd0c0;border-color:#2a6a63}
-.tag.static{color:#7fb2ff;border-color:#31527f}
-.tag.redirect{color:#e2a53c;border-color:#7a5c22}
-.tag.respond{color:#9aa3b6}
-.cert{font-size:11.5px;color:var(--dim)}
-.cert.warn{color:var(--warn)}
-.cert.bad{color:var(--bad)}
+.dom em{display:block;font-style:normal;color:var(--dm);font-size:11.5px;font-family:Consolas,monospace;
+word-break:break-all}
+.tg{display:inline-block;padding:1px 6px;border:1px solid var(--ln);border-radius:4px;
+font-size:11px;color:var(--mu)}
+.sw{position:relative;width:30px;height:17px;display:inline-block;cursor:pointer;vertical-align:middle}
+.sw i{position:absolute;inset:0;background:var(--p2);border:1px solid var(--ln);border-radius:20px}
+.sw i:after{content:"";position:absolute;width:11px;height:11px;border-radius:50%;background:var(--dm);
+top:2px;left:2px;transition:.12s}
+.sw.on i{background:var(--ac);border-color:var(--ac)}
+.sw.on i:after{background:#fff;transform:translateX(13px)}
 
-.sw{position:relative;width:36px;height:20px;flex:0 0 36px;cursor:pointer;display:inline-block}
-.sw i{position:absolute;inset:0;background:var(--panel3);border:1px solid var(--line);border-radius:20px;transition:.15s}
-.sw i:after{content:"";position:absolute;width:14px;height:14px;border-radius:50%;background:var(--dim);
-            top:2px;left:2px;transition:.15s}
-.sw.on i{background:var(--accent);border-color:var(--accent)}
-.sw.on i:after{background:#fff;transform:translateX(16px)}
+label.f{display:block;margin-bottom:9px}
+label.f>span{display:block;font-size:12px;color:var(--mu);margin-bottom:3px}
+input[type=text],input[type=password],input[type=number],select,textarea{width:100%;
+background:var(--p2);border:1px solid var(--ln);border-radius:6px;padding:5px 8px}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--ac)}
+textarea{resize:vertical;font-family:Consolas,monospace;font-size:12.5px}
+.ck{display:flex;align-items:center;gap:7px;padding:3px 0;cursor:pointer;font-size:13px}
+.ck input{accent-color:var(--ac);margin:0}
+.g2{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 14px}
 
-label.f{display:block;margin-bottom:13px}
-label.f>span{display:block;font-size:12.5px;color:var(--muted);margin-bottom:5px}
-label.f>span b{color:var(--text);font-weight:600}
-.hint{font-size:11.5px;color:var(--dim);margin-top:4px;line-height:1.45}
-input[type=text],input[type=password],input[type=number],select,textarea{
-  width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 11px}
-input:focus,select:focus,textarea:focus{outline:0;border-color:var(--accent)}
-textarea{resize:vertical;font-family:Consolas,"Courier New",monospace;font-size:13px;line-height:1.5}
-.chk{display:flex;align-items:flex-start;gap:9px;padding:8px 0;cursor:pointer}
-.chk input{margin-top:3px;flex:0 0 auto;accent-color:var(--accent)}
-.chk .cl{font-size:13.5px}
-.chk .cd{font-size:11.5px;color:var(--dim);line-height:1.4}
-
-.types{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px;margin-bottom:16px}
-.type{border:1px solid var(--line);background:var(--panel2);border-radius:10px;padding:11px;cursor:pointer;text-align:left}
-.type:hover{border-color:var(--accent)}
-.type.on{border-color:var(--accent);background:var(--accent2)}
-.type b{display:block;font-size:13.5px;margin-bottom:2px}
-.type span{font-size:11.5px;color:var(--muted);line-height:1.35;display:block}
-
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.62);display:flex;align-items:flex-start;
-       justify-content:center;padding:32px 16px;overflow-y:auto;z-index:60}
-.sheet{background:var(--panel);border:1px solid var(--line);border-radius:14px;width:100%;max-width:660px;
-       box-shadow:0 24px 60px rgba(0,0,0,.45)}
-.sheet header{display:flex;align-items:center;padding:16px 20px;border-bottom:1px solid var(--line)}
-.sheet header h3{margin:0;font-size:16px;flex:1}
-.sheet .body{padding:20px;max-height:calc(100vh - 220px);overflow-y:auto}
-.sheet footer{display:flex;gap:9px;padding:14px 20px;border-top:1px solid var(--line);background:var(--panel2);
-              border-radius:0 0 14px 14px}
-.x{background:none;border:0;color:var(--muted);font-size:20px;cursor:pointer;line-height:1;padding:2px 6px}
-.x:hover{color:var(--text)}
-
-details.more{margin-top:6px;border-top:1px solid var(--line);padding-top:12px}
-details.more summary{cursor:pointer;color:var(--accent);font-size:13px;margin-bottom:12px;list-style:none}
-details.more summary::-webkit-details-marker{display:none}
-details.more summary:before{content:"+ ";font-weight:700}
-details.more[open] summary:before{content:"- "}
-
-pre.out{background:#0a0c11;color:#d5dae6;border:1px solid var(--line);border-radius:9px;padding:13px;
-     font:12.5px/1.5 Consolas,"Courier New",monospace;white-space:pre-wrap;word-break:break-word;
-     max-height:440px;overflow:auto;margin:0}
-@media (prefers-color-scheme: light){pre.out{background:#111520;color:#dfe4ee}}
-
-.find{display:flex;gap:12px;padding:13px 0;border-top:1px solid var(--line);align-items:flex-start}
-.find:first-child{border-top:0}
-.find .ic{flex:0 0 22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;
-      font-size:12px;font-weight:700;color:#fff;margin-top:1px}
-.find .ic.ok{background:var(--ok)}.find .ic.warn{background:var(--warn)}.find .ic.bad{background:var(--bad)}
-.find .tx{flex:1;min-width:0}
-.find .tx b{display:block;font-size:13.5px;margin-bottom:2px}
-.find .tx span{font-size:12.5px;color:var(--muted);line-height:1.5}
-
-#toasts{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:9px;z-index:99;
-        max-width:min(430px,90vw)}
-.toast{background:var(--panel3);border:1px solid var(--line);border-left:3px solid var(--accent);
-       border-radius:10px;padding:11px 15px;font-size:13px;box-shadow:0 10px 30px rgba(0,0,0,.35);
-       animation:slide .18s ease-out}
-.toast.ok{border-left-color:var(--ok)}
-.toast.bad{border-left-color:var(--bad)}
-.toast b{display:block;margin-bottom:2px}
-.toast span{color:var(--muted);font-size:12px;white-space:pre-wrap;word-break:break-word}
-@keyframes slide{from{transform:translateX(20px);opacity:0}to{transform:none;opacity:1}}
-
-.busy{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;
-      justify-content:center;z-index:120;flex-direction:column;gap:16px}
-.spin{width:38px;height:38px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;
-      animation:sp .8s linear infinite}
-@keyframes sp{to{transform:rotate(360deg)}}
-.busy .msg{color:#e8eaf0;font-size:14px;text-align:center;max-width:440px;line-height:1.5}
-
-.empty{text-align:center;padding:46px 20px;color:var(--muted)}
-.empty .big{font-size:34px;margin-bottom:10px;opacity:.5}
-.kv{display:flex;justify-content:space-between;gap:14px;padding:7px 0;border-top:1px solid var(--line);font-size:13px}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-top:1px solid var(--ln);
+font-size:12.5px}
 .kv:first-child{border-top:0}
-.kv .k{color:var(--muted)}
-.kv .v{font-family:Consolas,monospace;word-break:break-all;text-align:right}
-code{font-family:Consolas,monospace;background:var(--panel3);padding:1px 6px;border-radius:5px;font-size:12.5px}
-.card .row{margin-top:12px}
-.grid{margin-bottom:16px}
-.stat .v small{font-size:13px;color:var(--dim);font-weight:400}
-.sheet footer .hint{margin:0}
-.flabel{display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.5px;
-        color:var(--dim);font-weight:600;margin-bottom:7px}
-th.c1,td.c1{width:46px}
-td.cact{text-align:right;white-space:nowrap}
-.warnbox .row,.okbox .row{margin-top:10px}
-#hashPw{max-width:260px}
-#prevSheet{max-width:880px}
-.byebye{display:flex;height:100vh;align-items:center;justify-content:center;color:var(--muted);font-size:15px;text-align:center;padding:20px}
-.byebye>div{max-width:38rem;line-height:1.6}
-.warnbox{background:rgba(226,165,60,.1);border:1px solid rgba(226,165,60,.35);border-radius:9px;
-         padding:12px 14px;font-size:13px;line-height:1.5;margin-bottom:14px}
-.okbox{background:rgba(63,191,128,.1);border:1px solid rgba(63,191,128,.35);border-radius:9px;
-       padding:12px 14px;font-size:13px;line-height:1.5;margin-bottom:14px}
+.kv b{font-weight:400;color:var(--mu)}
+.kv span{font-family:Consolas,monospace;text-align:right;word-break:break-all}
+
+.row{display:flex;gap:9px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--ln)}
+.row:first-child{border-top:0}
+.ic{flex:0 0 16px;height:16px;border-radius:50%;color:#fff;font-size:10px;font-weight:700;
+display:flex;align-items:center;justify-content:center;margin-top:2px}
+.ic.ok{background:var(--ok)}.ic.warn{background:var(--wa)}.ic.bad{background:var(--ba)}
+.row .t{flex:1;min-width:0;font-size:13px}
+.row .t em{display:block;font-style:normal;color:var(--mu);font-size:12px}
+
+pre{background:#0b0d12;color:#d6dae4;border:1px solid var(--ln);border-radius:6px;padding:10px;
+font:12px/1.45 Consolas,monospace;white-space:pre-wrap;word-break:break-word;max-height:60vh;
+overflow:auto;margin:0}
+code{font-family:Consolas,monospace;background:var(--p2);padding:0 4px;border-radius:3px;font-size:12px}
+
+.mo{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:flex-start;
+justify-content:center;padding:24px 12px;overflow:auto;z-index:50}
+.sh{background:var(--p1);border:1px solid var(--ln);border-radius:10px;width:100%;max-width:560px}
+.sh h3{margin:0;font-size:14px;flex:1}
+.sh .hd{display:flex;align-items:center;padding:11px 14px;border-bottom:1px solid var(--ln)}
+.sh .bd{padding:14px;max-height:calc(100vh - 190px);overflow:auto}
+.sh .ft{display:flex;gap:6px;padding:10px 14px;border-top:1px solid var(--ln);background:var(--p2);
+border-radius:0 0 10px 10px}
+.x{background:none;border:0;color:var(--mu);font-size:18px;cursor:pointer;line-height:1;padding:0 4px}
+details{border-top:1px solid var(--ln);margin-top:8px;padding-top:8px}
+summary{cursor:pointer;color:var(--ac);font-size:12.5px;margin-bottom:8px}
+#pv{max-width:860px}
+
+#ts{position:fixed;right:12px;bottom:12px;display:flex;flex-direction:column;gap:6px;z-index:90;
+max-width:min(400px,88vw)}
+.to{background:var(--p2);border:1px solid var(--ln);border-left:3px solid var(--ac);border-radius:6px;
+padding:8px 11px;font-size:12.5px;box-shadow:0 6px 20px rgba(0,0,0,.3);white-space:pre-wrap}
+.to.ok{border-left-color:var(--ok)}.to.bad{border-left-color:var(--ba)}
+#bz{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;
+justify-content:center;flex-direction:column;gap:12px;z-index:99;color:#e6e8ee;font-size:13px}
+.sn{width:30px;height:30px;border:3px solid #2b313d;border-top-color:#4d9bff;border-radius:50%;
+animation:s .8s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}}
+.mut{color:var(--mu);font-size:12.5px}
+.bye{display:flex;height:100vh;align-items:center;justify-content:center;color:var(--mu)}
+.nt{background:rgba(226,165,60,.12);border:1px solid rgba(226,165,60,.3);border-radius:6px;
+padding:8px 10px;font-size:12.5px;margin-bottom:10px}
 </style>
 </head>
 <body>
-<div class="app">
-  <aside class="nav">
-    <div class="brand">
-      <div class="logo">C</div>
-      <div><b>Caddy Manager</b><small>Webserver-Verwaltung</small></div>
-    </div>
-    <nav id="nav">
-      <button class="navitem active" data-view="dash"><span class="ico">#</span>{Ue}bersicht</button>
-      <button class="navitem" data-view="domains"><span class="ico">@</span>Domains</button>
-      <button class="navitem" data-view="setup"><span class="ico">+</span>Einrichtung</button>
-      <button class="navitem" data-view="security"><span class="ico">!</span>Sicherheit<span class="badge hidden" id="secBadge">0</span></button>
-      <button class="navitem" data-view="logs"><span class="ico">=</span>Protokolle</button>
-      <button class="navitem" data-view="settings"><span class="ico">*</span>Einstellungen</button>
-      <button class="navitem" data-view="expert"><span class="ico">&gt;</span>Experte</button>
-    </nav>
-    <div class="navfoot">
-      <div id="footVer">Caddy: unbekannt</div>
-      <div id="footRoot"></div>
-      <button class="btn sm" id="btnQuit">Oberfl{ae}che beenden</button>
-    </div>
-  </aside>
-
-  <main>
-    <div class="top">
-      <span class="pill"><span class="dot" id="dCaddy"></span><span id="tCaddy">Caddy</span></span>
-      <span class="pill hidden" id="pPhp"><span class="dot" id="dPhp"></span><span id="tPhp">PHP</span></span>
-      <span class="pill"><span class="dot" id="dAuto"></span><span id="tAuto">Autostart</span></span>
-      <span class="spacer"></span>
-      <button class="btn sm" data-act="service" data-arg="start">Start</button>
-      <button class="btn sm" data-act="service" data-arg="restart">Neu starten</button>
-      <button class="btn sm danger" data-act="service" data-arg="stop">Stopp</button>
-    </div>
-
-    <div class="dirty hidden" id="dirtyBar">
-      <div class="t"><b>Nicht {ue}bernommene {Ae}nderungen.</b> Die Konfiguration weicht vom laufenden Webserver ab.</div>
-      <span class="spacer"></span>
-      <button class="btn sm" data-act="preview">Vorschau</button>
-      <button class="btn sm primary" data-act="apply">Jetzt {ue}bernehmen</button>
-    </div>
-
-    <div class="scroll"><div class="wrap" id="view"></div></div>
-  </main>
+<header>
+  <b>Caddy Manager</b>
+  <span class="st"><i class="d" id="dC"></i><span id="tC">-</span></span>
+  <span class="st hide" id="sP"><i class="d" id="dP"></i><span id="tP">PHP</span></span>
+  <span class="st"><i class="d" id="dA"></i><span id="tA">-</span></span>
+  <span class="sp"></span>
+  <button class="b s" data-a="rf" title="Aktualisieren">&#8635;</button>
+  <button class="b s" data-a="sv" data-x="start">Start</button>
+  <button class="b s" data-a="sv" data-x="restart">Neu</button>
+  <button class="b s dn" data-a="sv" data-x="stop">Stopp</button>
+  <button class="b s" data-a="quit" title="Nur die Oberfl{ae}che beenden">Beenden</button>
+</header>
+<nav id="nv">
+  <button class="on" data-v="dom">Domains</button>
+  <button data-v="set">Einrichtung</button>
+  <button data-v="sec">Sicherheit<span class="bg hide" id="sb">0</span></button>
+  <button data-v="log">Logs</button>
+  <button data-v="cf">Caddyfile</button>
+  <button data-v="cfg">Einstellungen</button>
+</nav>
+<div class="dirty hide" id="dy">
+  <span><b>Nicht {ue}bernommen.</b> Die Konfiguration weicht vom laufenden Server ab.</span>
+  <span class="sp"></span>
+  <button class="b s" data-a="pv">Vorschau</button>
+  <button class="b s pri" data-a="ap">{Ue}bernehmen</button>
 </div>
-
-<div class="modal hidden" id="modal"></div>
-<div class="busy hidden" id="busy"><div class="spin"></div><div class="msg" id="busyMsg"></div></div>
-<div id="toasts"></div>
+<main><div class="w" id="vw"></div></main>
+<div class="mo hide" id="md"></div>
+<div id="bz" class="hide"><div class="sn"></div><div id="bzm"></div></div>
+<div id="ts"></div>
 
 <script nonce="__NONCE__">
 "use strict";
-const CSRF = "__CSRF__";
-let ST = { status:null, config:null };
-let view = "dash";
-let busyCount = 0;
-let pollTimer = null;
-let editing = null;
-let pendingPw = "";
-let offline = 0;
+const CS="__CSRF__";
+let S={}, C={}, view="dom", busy=0, ed=null, pw="", secLoaded=false;
+const $=(s,r)=>(r||document).querySelector(s);
+const $$=(s,r)=>Array.from((r||document).querySelectorAll(s));
+const A=x=>Array.isArray(x)?x:(x==null||x===""?[]:[x]);
+const E=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
-/* ---------- Helfer ---------- */
-const $ = (s,r) => (r||document).querySelector(s);
-const $$ = (s,r) => Array.from((r||document).querySelectorAll(s));
-function arr(x){ return Array.isArray(x) ? x : (x===null||x===undefined||x==="" ? [] : [x]); }
-function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function toast(m,k){const e=document.createElement("div");e.className="to "+(k||"");e.textContent=m;
+  $("#ts").appendChild(e);setTimeout(()=>e.remove(),k==="bad"?9000:4000);}
+function bz(m){busy++;$("#bzm").textContent=m||"...";$("#bz").classList.remove("hide");}
+function unbz(){busy=Math.max(0,busy-1);if(!busy)$("#bz").classList.add("hide");}
 
-function toast(msg, kind, title){
-  const el = document.createElement("div");
-  el.className = "toast " + (kind||"");
-  el.innerHTML = "<b>"+esc(title|| (kind==="bad"?"Fehler":"Erledigt"))+"</b><span>"+esc(msg)+"</span>";
-  $("#toasts").appendChild(el);
-  setTimeout(()=>{ el.style.opacity="0"; el.style.transform="translateX(20px)";
-                   el.style.transition=".25s"; setTimeout(()=>el.remove(),260); }, kind==="bad"?9000:4500);
-}
-
-function showBusy(msg){
-  busyCount++;
-  $("#busyMsg").textContent = msg || "Einen Moment...";
-  $("#busy").classList.remove("hidden");
-}
-function hideBusy(){
-  busyCount = Math.max(0, busyCount-1);
-  if(!busyCount) $("#busy").classList.add("hidden");
-}
-
-async function api(path, body, busyMsg){
-  if(busyMsg) showBusy(busyMsg);
+async function api(p,b,m){
+  if(m)bz(m);
   try{
-    const opt = { method: body===undefined ? "GET" : "POST",
-                  headers: { "X-Caddy-Manager-Csrf": CSRF } };
-    if(body!==undefined){ opt.headers["Content-Type"]="application/json"; opt.body=JSON.stringify(body); }
-    const r = await fetch(path, opt);
-    let j = null;
-    try{ j = await r.json(); }catch(e){ j = { ok:false, message:"Ung{ue}ltige Antwort vom Manager." }; }
-    if(r.status===401){ toast("Die Sitzung ist abgelaufen. Bitte die Startadresse im Konsolenfenster erneut {oe}ffnen.","bad"); }
-    return j;
-  }catch(e){
-    return { ok:false, message:"Der Manager antwortet nicht: "+e.message };
-  }finally{
-    if(busyMsg) hideBusy();
-  }
+    const o={method:b===undefined?"GET":"POST",headers:{"X-Caddy-Manager-Csrf":CS}};
+    if(b!==undefined){o.headers["Content-Type"]="application/json";o.body=JSON.stringify(b);}
+    const r=await fetch(p,o);
+    try{return await r.json();}catch(e){return{ok:false,message:"Ung{ue}ltige Antwort."};}
+  }catch(e){return{ok:false,message:"Der Manager antwortet nicht."};}
+  finally{if(m)unbz();}
 }
 
-function setCfg(j){ if(j && j.config){ ST.config = j.config; } }
-
-/* ---------- Statuskopf ---------- */
-function paintStatus(){
-  const s = ST.status; if(!s) return;
-  const set = (dot,txt,state,label)=>{ const d=$(dot); d.className="dot "+state; $(txt).textContent=label; };
-
-  if(!s.caddyInstalled) set("#dCaddy","#tCaddy","bad","Caddy nicht installiert");
-  else if(s.caddyRunning) set("#dCaddy","#tCaddy","ok","Caddy l{ae}uft"+(s.caddyUptime?" ("+s.caddyUptime+")":""));
-  else set("#dCaddy","#tCaddy","bad","Caddy gestoppt");
-
-  const php = $("#pPhp");
-  if(s.phpEnabled){
-    php.classList.remove("hidden");
-    const open = arr(s.phpPorts).filter(p=>p.open).length;
-    const tot = arr(s.phpPorts).length;
-    set("#dPhp","#tPhp", open===0?"bad":(open<tot?"warn":"ok"), "PHP "+open+"/"+tot);
-  } else php.classList.add("hidden");
-
-  const auto = s.taskServer && s.taskWatchdog;
-  set("#dAuto","#tAuto", auto?"ok":"warn", auto?"Autostart aktiv":"Kein Autostart");
-
-  $("#footVer").textContent = "Caddy: " + (s.caddyVersion || "nicht installiert");
-  $("#footRoot").textContent = s.root;
-  $("#dirtyBar").classList.toggle("hidden", !s.dirty);
+/* ---------- Kopfzeile ---------- */
+function head(){
+  const s=S;if(!s)return;
+  const set=(d,t,c,l)=>{$(d).className="d "+c;$(t).textContent=l;};
+  if(!s.caddyInstalled)set("#dC","#tC","ba","nicht installiert");
+  else if(s.caddyRunning)set("#dC","#tC","ok","Caddy "+s.caddyVersion);
+  else set("#dC","#tC","ba","gestoppt");
+  const p=$("#sP");
+  if(s.phpEnabled){p.classList.remove("hide");
+    const o=A(s.phpPorts).filter(x=>x.open).length,t=A(s.phpPorts).length;
+    set("#dP","#tP",o===0?"ba":(o<t?"wa":"ok"),"PHP "+o+"/"+t);}
+  else p.classList.add("hide");
+  const au=s.taskServer&&s.taskWatchdog;
+  set("#dA","#tA",au?"ok":"wa",au?"Autostart":"kein Autostart");
+  $("#dy").classList.toggle("hide",!s.dirty);
 }
 
-/* ---------- Navigation ---------- */
-function go(v){
-  view = v;
-  $$(".navitem").forEach(b=>b.classList.toggle("active", b.dataset.view===v));
-  render();
-}
-
-function render(){
-  const el = $("#view");
-  if(view==="dash") renderDash(el);
-  else if(view==="domains") renderDomains(el);
-  else if(view==="setup") renderSetup(el);
-  else if(view==="security") renderSecurity(el);
-  else if(view==="logs") renderLogs(el);
-  else if(view==="settings") renderSettings(el);
-  else if(view==="expert") renderExpert(el);
-}
-
-/* ---------- {Ue}bersicht ---------- */
-function renderDash(el){
-  const s = ST.status, c = ST.config;
-  if(!s){ el.innerHTML = "<p class='lead'>Status wird geladen...</p>"; return; }
-
-  if(!s.caddyInstalled){
-    el.innerHTML = `
-      <h2 class="page">Ersteinrichtung</h2>
-      <p class="lead">Caddy ist auf diesem Rechner noch nicht eingerichtet. Ein Klick gen{ue}gt.</p>
-      <div class="card">
-        <h3>Alles einrichten</h3>
-        <p class="sub">Es werden angelegt: die Verzeichnisse unter ${esc(s.root)}, die aktuelle Caddy-Version,
-           Firewallfreigaben f{ue}r Port 80 und 443 sowie der automatische Start beim Hochfahren samt Watchdog.</p>
-        <label class="chk"><input type="checkbox" id="setupPhp">
-          <span><span class="cl">PHP mitinstallieren</span>
-          <span class="cd">Aktuelles PHP (Non-Thread-Safe) mit abgesicherter php.ini und mehreren
-          FastCGI-Prozessen. Nur n{oe}tig, wenn eine Seite PHP verwendet.</span></span></label>
-        <div class="row"><button class="btn primary" data-act="setup-all">Jetzt einrichten</button></div>
-      </div>`;
-    return;
-  }
-
-  const certs = arr(s.certificates).slice(0,6);
-  const soon = arr(s.certificates).filter(x=>x.daysLeft<21).length;
-
-  el.innerHTML = `
-    <h2 class="page">{Ue}bersicht</h2>
-    <p class="lead">Der Webserver l{ae}uft unabh{ae}ngig von diesem Fenster. Die Oberfl{ae}che wird nur
-       zum {Ae}ndern gebraucht.</p>
-
-    <div class="grid g3">
-      <div class="stat"><div class="k">Webserver</div>
-        <div class="v">${s.caddyRunning?"L{ae}uft":"Gestoppt"}</div>
-        <div class="m">${s.caddyRunning? "Caddy "+esc(s.caddyVersion)+" {bull} PID "+s.caddyPid : "Version "+esc(s.caddyVersion)}</div></div>
-      <div class="stat"><div class="k">Domains</div>
-        <div class="v">${s.siteActive}<small> / ${s.siteCount}</small></div>
-        <div class="m">aktiv von insgesamt</div></div>
-      <div class="stat"><div class="k">Zertifikate</div>
-        <div class="v">${arr(s.certificates).length}</div>
-        <div class="m">${soon? soon+" laufen bald ab" : "alle mit Restlaufzeit"}</div></div>
-      <div class="stat"><div class="k">Automatik</div>
-        <div class="v">${(s.taskServer&&s.taskWatchdog)?"Aktiv":"Fehlt"}</div>
-        <div class="m">Autostart und Watchdog</div></div>
-    </div>
-
-    ${arr(s.legacyTasks).length ? `<div class="warnbox">
-       <b>Alte geplante Aufgaben gefunden:</b> ${esc(arr(s.legacyTasks).join(", "))}.
-       Sie stammen aus der Einrichtung von Hand und k{oe}nnen sich mit der neuen Automatik in die Quere kommen.
-       <div class="row"><button class="btn sm" data-act="fix" data-arg="remove-legacy">Alte Aufgaben entfernen</button></div>
-       </div>` : ""}
-
-    ${s.port80 && s.port80.name!=="caddy" ? `<div class="warnbox">Auf Port 80 lauscht
-       <code>${esc(s.port80.name)}</code> (PID ${s.port80.pid}) statt Caddy.</div>` : ""}
-
-    <div class="grid g2">
-      <div class="card">
-        <h3>Schnellzugriff</h3>
-        <p class="sub">Die h{ae}ufigsten Handgriffe.</p>
-        <div class="row">
-          <button class="btn primary" data-act="newsite">Domain hinzuf{ue}gen</button>
-          <button class="btn" data-act="dnsall">DNS aller Domains pr{ue}fen</button>
-          <button class="btn" data-act="preview">Konfiguration ansehen</button>
-          <button class="btn" data-act="setup" data-arg="caddy-update">Auf Updates pr{ue}fen</button>
-        </div>
-      </div>
-      <div class="card">
-        <h3>Zertifikate</h3>
-        <p class="sub">Caddy verl{ae}ngert automatisch, etwa 30 Tage vor Ablauf.</p>
-        ${certs.length ? certs.map(c=>`<div class="kv"><span class="k">${esc(c.domain)}</span>
-           <span class="v ${c.daysLeft<0?"cert bad":(c.daysLeft<21?"cert warn":"")}">${c.daysLeft<0?"abgelaufen":c.daysLeft+" Tage"}</span></div>`).join("")
-          : "<p class='sub'>Noch keine Zertifikate. Sie entstehen beim ersten Abruf einer Domain {ue}ber HTTPS.</p>"}
-      </div>
-    </div>
-
-    <div class="card">
-      <h3>Ablageorte</h3>
-      <div class="kv"><span class="k">Konfiguration</span><span class="v">${esc(s.configPath)}</span></div>
-      <div class="kv"><span class="k">Webseiten</span><span class="v">${esc(s.root)}\\www</span></div>
-      <div class="kv"><span class="k">Protokolle</span><span class="v">${esc(s.root)}\\logs</span></div>
-      <div class="kv"><span class="k">Zertifikate</span><span class="v">${esc(s.root)}\\data</span></div>
-      ${s.disk? `<div class="kv"><span class="k">Freier Speicher</span><span class="v">${s.disk.freeGb} GB von ${s.disk.totalGb} GB</span></div>`:""}
-    </div>`;
+function go(v){view=v;$$("#nv button").forEach(b=>b.classList.toggle("on",b.dataset.v===v));draw();}
+function draw(){
+  const e=$("#vw");
+  ({dom:vDom,set:vSet,sec:vSec,log:vLog,cf:vCf,cfg:vCfg}[view]||vDom)(e);
 }
 
 /* ---------- Domains ---------- */
-function typeLabel(t){
-  return {static:"Statisch", php:"PHP", proxy:"Proxy", redirect:"Weiterleitung", respond:"Text"}[t] || t;
-}
-function siteTarget(s){
-  if(s.type==="proxy") return s.upstream;
-  if(s.type==="redirect") return s.redirectTo;
-  if(s.type==="respond") return '"'+s.respondBody+'"';
-  return s.root;
-}
-function certFor(dom){
-  const c = arr(ST.status && ST.status.certificates).find(x=>x.domain===String(dom).replace(/^https?:\/\//,"").split(":")[0]);
-  return c;
-}
+const TN={static:"Statisch",php:"PHP",proxy:"Proxy",redirect:"Weiterleitung",respond:"Text"};
+function tgt(s){return s.type==="proxy"?s.upstream:s.type==="redirect"?s.redirectTo:
+  s.type==="respond"?s.respondBody:s.root;}
+function cert(d){return A(S.certificates).find(c=>c.domain===String(d).replace(/^https?:\/\//,"").split(":")[0]);}
 
-function renderDomains(el){
-  const c = ST.config;
-  if(!c){ el.innerHTML=""; return; }
-
-  if(c.mode==="manual"){
-    el.innerHTML = `<h2 class="page">Domains</h2>
-      <div class="warnbox"><b>Manueller Modus ist aktiv.</b> Die Caddyfile wird von Hand gepflegt und
-      nicht mehr erzeugt. Zum Verwalten {ue}ber diese Liste im Reiter <b>Experte</b> wieder auf den
-      verwalteten Modus umschalten - die bestehende Caddyfile wird dabei eingelesen.</div>`;
-    return;
-  }
-
-  const rows = arr(c.sites).map(s=>{
-    const cert = certFor(s.domains[0]);
-    const certTxt = cert ? (cert.daysLeft<0? "Zertifikat abgelaufen"
-                        : "Zertifikat "+cert.daysLeft+" Tage") : "kein Zertifikat";
-    const certCls = cert ? (cert.daysLeft<0?"cert bad":(cert.daysLeft<21?"cert warn":"cert")) : "cert";
+function vDom(e){
+  if(C.mode==="manual"){
+    e.innerHTML=`<h2>Domains</h2><div class="nt">Manueller Modus. Die Caddyfile wird von Hand
+      gepflegt. Umschalten unter <b>Caddyfile</b>.</div>`;return;}
+  const rows=A(C.sites).map(s=>{
+    const c=cert(s.domains[0]);
+    const ct=c?(c.daysLeft<0?"abgelaufen":c.daysLeft+"d"):"-";
     return `<tr class="${s.enabled?"":"off"}">
-      <td class="c1"><span class="sw ${s.enabled?"on":""}" data-act="toggle" data-arg="${esc(s.id)}"><i></i></span></td>
-      <td><div class="dom">${esc(s.domains[0])}${arr(s.domains).length>1?' <span class="tag">+'+(arr(s.domains).length-1)+'</span>':''}
-          <small>${esc(siteTarget(s))}</small></div></td>
-      <td><span class="tag ${s.type}">${typeLabel(s.type)}</span></td>
-      <td><span class="${certCls}">${esc(certTxt)}</span></td>
-      <td class="cact">
-        <button class="btn sm" data-act="edit" data-arg="${esc(s.id)}">Bearbeiten</button>
-        <button class="btn sm" data-act="dns" data-arg="${esc(s.id)}">DNS</button>
-        <button class="btn sm danger" data-act="del" data-arg="${esc(s.id)}">L{oe}schen</button>
-      </td></tr>`;
-  }).join("");
-
-  el.innerHTML = `
-    <h2 class="page">Domains</h2>
-    <p class="lead">Jede Zeile wird beim {Ue}bernehmen in einen sauberen Caddyfile-Block {ue}bersetzt.</p>
-    <div class="card">
-      <div class="row"><button class="btn primary" data-act="newsite">Domain hinzuf{ue}gen</button>
-        <button class="btn" data-act="dnsall">DNS aller Domains pr{ue}fen</button>
-        <button class="btn" data-act="preview">Erzeugte Caddyfile ansehen</button>
-        <span class="spacer"></span>
-        <button class="btn" data-act="import">Bestehende Caddyfile einlesen</button></div>
-    </div>
-    ${arr(c.sites).length ? `<div class="card"><table>
-       <thead><tr><th class="c1">An</th><th>Domain / Ziel</th><th>Art</th><th>TLS</th><th></th></tr></thead>
-       <tbody>${rows}</tbody></table></div>`
-     : `<div class="card"><div class="empty"><div class="big">@</div>
-        <b>Noch keine Domain eingerichtet.</b>
-        <p>Mit "Domain hinzuf{ue}gen" die erste Seite anlegen.</p></div></div>`}`;
-
+      <td class="c1"><span class="sw ${s.enabled?"on":""}" data-a="tg" data-x="${E(s.id)}"><i></i></span></td>
+      <td><span class="dom">${E(s.domains[0])}${A(s.domains).length>1?' <span class="tg">+'+(A(s.domains).length-1)+'</span>':''}
+        <em>${E(tgt(s))}</em></span></td>
+      <td><span class="tg">${TN[s.type]||s.type}</span></td>
+      <td class="mut">${ct}</td>
+      <td class="ce"><button class="b s" data-a="ed" data-x="${E(s.id)}">Bearbeiten</button>
+        <button class="b s" data-a="dns" data-x="${E(s.id)}">DNS</button>
+        <button class="b s dn" data-a="del" data-x="${E(s.id)}">L{oe}schen</button></td></tr>`;}).join("");
+  e.innerHTML=`<div class="bar">
+      <button class="b pri" data-a="new">Domain hinzuf{ue}gen</button>
+      <button class="b" data-a="dnsa">DNS pr{ue}fen</button>
+      <button class="b" data-a="pv">Vorschau</button>
+      <span class="sp"></span>
+      <button class="b" data-a="imp">Caddyfile einlesen</button></div>
+    ${A(C.sites).length?`<div class="box"><table><thead><tr><th></th><th>Domain / Ziel</th>
+      <th>Art</th><th>TLS</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
+     :`<div class="box mut">Noch keine Domain.</div>`}`;
 }
 
 /* ---------- Editor ---------- */
-function openSite(id){
-  const c = ST.config;
-  let s = arr(c.sites).find(x=>x.id===id);
-  const isNew = !s;
-  if(!s){
-    s = { id:"", enabled:true, label:"", domains:[], type:"static", root:"", upstream:"",
-          redirectTo:"", redirectCode:"permanent", respondBody:"OK", respondStatus:200,
-          encode:true, browse:false, indexFiles:"", securityHeaders:true, hsts:false,
-          blockSensitive:true, accessLog:true, wwwRedirect:true, basicAuthUser:"", basicAuthHash:"",
-          maxBody:"", tlsMode:"auto", tlsCert:"", tlsKey:"", handlerExtra:"", extra:"" };
-  }
-  editing = JSON.parse(JSON.stringify(s));
-  pendingPw = "";
-  drawSheet(isNew);
+function open2(id){
+  let s=A(C.sites).find(x=>x.id===id);
+  if(!s)s={id:"",enabled:true,label:"",domains:[],type:"static",root:"",upstream:"",redirectTo:"",
+    redirectCode:"permanent",respondBody:"OK",respondStatus:200,encode:true,browse:false,indexFiles:"",
+    securityHeaders:true,hsts:false,blockSensitive:true,accessLog:true,wwwRedirect:true,
+    basicAuthUser:"",basicAuthHash:"",maxBody:"",tlsMode:"auto",tlsCert:"",tlsKey:"",handlerExtra:"",extra:""};
+  ed=JSON.parse(JSON.stringify(s));pw="";sheet(!id);
 }
-
-const TYPES = [
-  ["static","Statische Seite","HTML, Bilder, JavaScript aus einem Ordner"],
-  ["php","PHP-Seite","WordPress, Nextcloud und andere PHP-Anwendungen"],
-  ["proxy","Reverse Proxy","Leitet an ein Programm auf diesem Rechner weiter"],
-  ["redirect","Weiterleitung","Schickt Besucher auf eine andere Adresse"],
-  ["respond","Fester Text","Antwortet direkt, ohne Dateien - z.B. f{ue}r Statusseiten"]
-];
-
-function drawSheet(isNew){
-  const s = editing;
-  const t = s.type;
-  $("#modal").classList.remove("hidden");
-  $("#modal").innerHTML = `
-  <div class="sheet">
-    <header><h3>${isNew?"Neue Domain":"Domain bearbeiten"}</h3><button class="x" data-act="close">&times;</button></header>
-    <div class="body">
-      <label class="f"><span><b>Domains</b> {ndash} eine pro Zeile</span>
-        <textarea id="fDomains" rows="2" placeholder="beispiel.de">${esc(arr(s.domains).join("\n"))}</textarea>
-        <div class="hint">Ohne https:// davor. Mehrere Adressen liefern dieselbe Seite aus.
-             Umlautdomains werden automatisch umgeschrieben.</div></label>
-
-      <span class="flabel">Art der Seite</span>
-      <div class="types">${TYPES.map(([k,n,d])=>`
-        <button class="type ${t===k?"on":""}" data-act="settype" data-arg="${k}"><b>${n}</b><span>${d}</span></button>`).join("")}
-      </div>
-
-      ${(t==="static"||t==="php") ? `
-      <label class="f"><span><b>Ordner mit den Dateien</b></span>
-        <input type="text" id="fRoot" value="${esc(s.root)}" placeholder="C:\\caddy\\www\\beispiel.de">
-        <div class="hint">Wird beim Speichern automatisch vorgeschlagen, wenn das Feld leer bleibt.
-             <button class="btn link sm" data-act="mkdir">Ordner jetzt anlegen</button></div></label>` : ""}
-
-      ${t==="proxy" ? `
-      <label class="f"><span><b>Ziel</b></span>
-        <input type="text" id="fUpstream" value="${esc(s.upstream)}" placeholder="127.0.0.1:3000">
-        <div class="hint">Adresse und Port des Programms auf diesem Rechner, z.B. <code>127.0.0.1:3000</code>.
-             Mehrere Ziele mit Leerzeichen trennen - Caddy verteilt dann die Anfragen.</div></label>` : ""}
-
-      ${t==="redirect" ? `
-      <label class="f"><span><b>Zieladresse</b></span>
-        <input type="text" id="fRedirect" value="${esc(s.redirectTo)}" placeholder="https://beispiel.de">
-        <div class="hint">Der aufgerufene Pfad wird angeh{ae}ngt.</div></label>
-      <label class="f"><span>Art der Weiterleitung</span>
-        <select id="fRedirectCode">
-          <option value="permanent"${s.redirectCode==="permanent"?" selected":""}>Dauerhaft (301)</option>
-          <option value="temporary"${s.redirectCode==="temporary"?" selected":""}>Vor{ue}bergehend (302)</option>
-        </select></label>` : ""}
-
-      ${t==="respond" ? `
-      <label class="f"><span><b>Antworttext</b></span>
-        <input type="text" id="fRespond" value="${esc(s.respondBody)}" placeholder="Alles in Ordnung"></label>
-      <label class="f"><span>HTTP-Status</span>
-        <input type="number" id="fStatus" value="${s.respondStatus}" min="100" max="599"></label>` : ""}
-
-      <label class="chk"><input type="checkbox" id="fSec"${s.securityHeaders?" checked":""}>
-        <span><span class="cl">Sicherheitskopfzeilen senden</span>
-        <span class="cd">Verhindert MIME-Raten und das Einbetten in fremde Seiten. Sollte an bleiben.</span></span></label>
-
-      ${t!=="proxy" ? `<label class="chk"><input type="checkbox" id="fBlock"${s.blockSensitive?" checked":""}>
-        <span><span class="cl">Versteckte und heikle Dateien sperren</span>
-        <span class="cd">.env, .git, *.sql, *.log und {ae}hnliche Dateien werden nicht ausgeliefert.</span></span></label>`:""}
-
-      <label class="chk"><input type="checkbox" id="fWww"${s.wwwRedirect?" checked":""}>
-        <span><span class="cl">www-Adresse auf die Hauptdomain umleiten</span>
-        <span class="cd">Legt zus{ae}tzlich einen Block f{ue}r www.<i>domain</i> an.</span></span></label>
-
-      <details class="more"><summary>Weitere Einstellungen</summary>
-
-        <label class="f"><span>Bezeichnung (nur zur {Ue}bersicht)</span>
-          <input type="text" id="fLabel" value="${esc(s.label)}" placeholder="z.B. Firmenseite"></label>
-
-        <label class="chk"><input type="checkbox" id="fEncode"${s.encode?" checked":""}>
-          <span><span class="cl">Antworten komprimieren</span><span class="cd">gzip und zstd - spart Bandbreite.</span></span></label>
-        <label class="chk"><input type="checkbox" id="fLog"${s.accessLog?" checked":""}>
-          <span><span class="cl">Zugriffe protokollieren</span>
-          <span class="cd">Eigene Protokolldatei mit automatischer Rotation.</span></span></label>
-        <label class="chk"><input type="checkbox" id="fHsts"${s.hsts?" checked":""}>
-          <span><span class="cl">HSTS erzwingen</span>
-          <span class="cd">Browser merken sich HTTPS f{ue}r ein Jahr. Erst einschalten, wenn die Seite
-          dauerhaft {ue}ber HTTPS l{ae}uft - das l{ae}sst sich nicht schnell zur{ue}cknehmen.</span></span></label>
-        ${(t==="static"||t==="php") ? `<label class="chk"><input type="checkbox" id="fBrowse"${s.browse?" checked":""}>
-          <span><span class="cl">Verzeichnisauflistung erlauben</span>
-          <span class="cd">Besucher sehen alle Dateinamen im Ordner. Normalerweise aus lassen.</span></span></label>
-        <label class="f"><span>Startdateien</span>
-          <input type="text" id="fIndex" value="${esc(s.indexFiles)}" placeholder="index.html index.php">
-          <div class="hint">Leer lassen f{ue}r die Standardreihenfolge.</div></label>`:""}
-
-        <label class="f"><span>Maximale Uploadgr{oe}sse</span>
-          <input type="text" id="fMaxBody" value="${esc(s.maxBody)}" placeholder="z.B. 100MB">
-          <div class="hint">Leer lassen f{ue}r Caddys Voreinstellung.</div></label>
-
-        <label class="f"><span><b>Zugriffsschutz</b> {ndash} Benutzername</span>
-          <input type="text" id="fAuthUser" value="${esc(s.basicAuthUser)}" placeholder="leer lassen f{ue}r offenen Zugang"></label>
-        <label class="f"><span>Passwort</span>
-          <input type="password" id="fAuthPw" placeholder="${s.basicAuthHash?"gesetzt - nur bei {Ae}nderung ausf{ue}llen":"neues Passwort"}">
-          <div class="hint">Das Passwort wird sofort als Hash abgelegt, niemals im Klartext.
-            ${s.basicAuthHash?'<button class="btn link sm" data-act="clearauth">Zugriffsschutz entfernen</button>':""}</div></label>
-
-        <label class="f"><span>Zertifikat</span>
-          <select id="fTls">
-            <option value="auto"${s.tlsMode==="auto"?" selected":""}>Automatisch von Let's Encrypt</option>
-            <option value="internal"${s.tlsMode==="internal"?" selected":""}>Selbst ausgestellt (nur intern)</option>
-            <option value="custom"${s.tlsMode==="custom"?" selected":""}>Eigene Dateien</option>
-          </select></label>
-        <div id="tlsFiles" class="${s.tlsMode==="custom"?"":"hidden"}">
-          <label class="f"><span>Zertifikatsdatei (.crt)</span>
-            <input type="text" id="fTlsCert" value="${esc(s.tlsCert)}"></label>
-          <label class="f"><span>Schl{ue}sseldatei (.key)</span>
-            <input type="text" id="fTlsKey" value="${esc(s.tlsKey)}"></label>
-        </div>
-
-        ${(t==="proxy"||t==="php") ? `<label class="f"><span>Optionen im ${t==="proxy"?"reverse_proxy":"php_fastcgi"}-Block</span>
-          <textarea id="fHandlerExtra" rows="3" placeholder="header_up Host {upstream_hostport}">${esc(s.handlerExtra||"")}</textarea>
-          <div class="hint">Landet unver{ae}ndert innerhalb des Handler-Blocks.</div></label>`:""}
-
-        <label class="f"><span>Zus{ae}tzliche Caddyfile-Zeilen</span>
-          <textarea id="fExtra" rows="4" placeholder="handle_path /api/* {&#10;    reverse_proxy 127.0.0.1:1234&#10;}">${esc(s.extra)}</textarea>
-          <div class="hint">F{ue}r Sonderf{ae}lle. Der Inhalt wird unver{ae}ndert in den Block {ue}bernommen und
-               vor dem Anwenden gepr{ue}ft.</div></label>
-      </details>
-    </div>
-    <footer>
-      <button class="btn primary" data-act="savesite">Speichern</button>
-      <button class="btn" data-act="close">Abbrechen</button>
-      <span class="spacer"></span>
-      <span class="hint">Aktiv wird die {Ae}nderung erst mit "{Ue}bernehmen".</span>
-    </footer>
-  </div>`;
-  const pwEl2 = $("#fAuthPw");
-  if(pwEl2 && pendingPw) pwEl2.value = pendingPw;
-  const tls = $("#fTls");
-  if(tls) tls.addEventListener("change", ()=>{ $("#tlsFiles").classList.toggle("hidden", tls.value!=="custom"); });
+function sheet(isNew){
+  const s=ed,t=s.type;
+  $("#md").classList.remove("hide");
+  $("#md").innerHTML=`<div class="sh"><div class="hd"><h3>${isNew?"Neue Domain":"Domain"}</h3>
+   <button class="x" data-a="cl">&times;</button></div><div class="bd">
+   <label class="f"><span>Domains, eine pro Zeile</span>
+     <textarea id="fD" rows="2" placeholder="beispiel.de">${E(A(s.domains).join("\n"))}</textarea></label>
+   <label class="f"><span>Art</span><select id="fT">
+     ${Object.keys(TN).map(k=>`<option value="${k}"${t===k?" selected":""}>${TN[k]}</option>`).join("")}
+   </select></label>
+   ${(t==="static"||t==="php")?`<label class="f"><span>Ordner
+     <button class="lk" data-a="mk">anlegen</button></span>
+     <input type="text" id="fR" value="${E(s.root)}" placeholder="C:\\caddy\\www\\beispiel.de"></label>`:""}
+   ${t==="proxy"?`<label class="f"><span>Ziel</span>
+     <input type="text" id="fU" value="${E(s.upstream)}" placeholder="127.0.0.1:3000"></label>`:""}
+   ${t==="redirect"?`<label class="f"><span>Zieladresse</span>
+     <input type="text" id="fW" value="${E(s.redirectTo)}" placeholder="https://beispiel.de"></label>
+     <label class="f"><span>Art</span><select id="fWC">
+       <option value="permanent"${s.redirectCode==="permanent"?" selected":""}>dauerhaft (301)</option>
+       <option value="temporary"${s.redirectCode==="temporary"?" selected":""}>tempor{ae}r (302)</option>
+     </select></label>`:""}
+   ${t==="respond"?`<label class="f"><span>Text</span>
+     <input type="text" id="fB" value="${E(s.respondBody)}"></label>
+     <label class="f"><span>Status</span><input type="number" id="fS" value="${s.respondStatus}" min="100" max="599"></label>`:""}
+   <div class="g2">
+     <label class="ck"><input type="checkbox" id="cS"${s.securityHeaders?" checked":""}>Sicherheitskopfzeilen</label>
+     ${t!=="proxy"?`<label class="ck"><input type="checkbox" id="cB"${s.blockSensitive?" checked":""}>Versteckte Dateien sperren</label>`:""}
+     <label class="ck"><input type="checkbox" id="cW"${s.wwwRedirect?" checked":""}>www umleiten</label>
+     <label class="ck"><input type="checkbox" id="cE"${s.encode?" checked":""}>Komprimieren</label>
+     <label class="ck"><input type="checkbox" id="cL"${s.accessLog?" checked":""}>Zugriffe protokollieren</label>
+     <label class="ck" title="Browser merken sich HTTPS ein Jahr lang. Schwer zur{ue}cknehmbar."><input type="checkbox" id="cH"${s.hsts?" checked":""}>HSTS</label>
+     ${(t==="static"||t==="php")?`<label class="ck"><input type="checkbox" id="cV"${s.browse?" checked":""}>Verzeichnisauflistung</label>`:""}
+   </div>
+   <details><summary>Mehr</summary>
+     <label class="f"><span>Bezeichnung</span><input type="text" id="fL" value="${E(s.label)}"></label>
+     ${(t==="static"||t==="php")?`<label class="f"><span>Startdateien</span>
+       <input type="text" id="fI" value="${E(s.indexFiles)}" placeholder="index.html index.php"></label>`:""}
+     <label class="f"><span>Max. Upload</span><input type="text" id="fM" value="${E(s.maxBody)}" placeholder="100MB"></label>
+     <label class="f"><span>Zugriffsschutz Benutzer</span><input type="text" id="fAU" value="${E(s.basicAuthUser)}"></label>
+     <label class="f"><span>Passwort${s.basicAuthHash?" (gesetzt)":""}</span>
+       <input type="password" id="fAP" placeholder="${s.basicAuthHash?"nur bei {Ae}nderung":"neu"}"></label>
+     <label class="f"><span>Zertifikat</span><select id="fTL">
+       <option value="auto"${s.tlsMode==="auto"?" selected":""}>Let's Encrypt</option>
+       <option value="internal"${s.tlsMode==="internal"?" selected":""}>selbst ausgestellt</option>
+       <option value="custom"${s.tlsMode==="custom"?" selected":""}>eigene Dateien</option>
+     </select></label>
+     <div id="tf" class="${s.tlsMode==="custom"?"":"hide"}">
+       <label class="f"><span>.crt</span><input type="text" id="fTC" value="${E(s.tlsCert)}"></label>
+       <label class="f"><span>.key</span><input type="text" id="fTK" value="${E(s.tlsKey)}"></label></div>
+     ${(t==="proxy"||t==="php")?`<label class="f"><span>Zeilen im ${t==="proxy"?"reverse_proxy":"php_fastcgi"}-Block</span>
+       <textarea id="fHX" rows="2" placeholder="header_up Host {upstream_hostport}">${E(s.handlerExtra||"")}</textarea></label>`:""}
+     <label class="f"><span>Zus{ae}tzliche Zeilen im Block</span>
+       <textarea id="fX" rows="3" placeholder="handle_path /api/* {&#10;  reverse_proxy 127.0.0.1:1234&#10;}">${E(s.extra)}</textarea></label>
+   </details></div>
+   <div class="ft"><button class="b pri" data-a="sa">Speichern</button>
+     <button class="b" data-a="cl">Abbrechen</button></div></div>`;
+  const p=$("#fAP");if(p&&pw)p.value=pw;
+  const tl=$("#fTL");if(tl)tl.addEventListener("change",()=>$("#tf").classList.toggle("hide",tl.value!=="custom"));
+  const ty=$("#fT");if(ty)ty.addEventListener("change",()=>{grab();ed.type=ty.value;sheet(!ed.id);});
 }
-
-function collectSheet(){
-  const s = editing;
-  const g = id => { const e=$(id); return e? e.value : undefined; };
-  const b = id => { const e=$(id); return e? e.checked : undefined; };
-  const dom = g("#fDomains");
-  if(dom!==undefined) s.domains = dom.split(/[\n,;]+/).map(x=>x.trim()).filter(Boolean);
-  if(g("#fRoot")!==undefined) s.root = g("#fRoot").trim();
-  if(g("#fUpstream")!==undefined) s.upstream = g("#fUpstream").trim();
-  if(g("#fRedirect")!==undefined) s.redirectTo = g("#fRedirect").trim();
-  if(g("#fRedirectCode")!==undefined) s.redirectCode = g("#fRedirectCode");
-  if(g("#fRespond")!==undefined) s.respondBody = g("#fRespond");
-  if(g("#fStatus")!==undefined) s.respondStatus = parseInt(g("#fStatus"),10)||200;
-  if(g("#fLabel")!==undefined) s.label = g("#fLabel").trim();
-  if(g("#fIndex")!==undefined) s.indexFiles = g("#fIndex").trim();
-  if(g("#fMaxBody")!==undefined) s.maxBody = g("#fMaxBody").trim();
-  if(g("#fAuthUser")!==undefined) s.basicAuthUser = g("#fAuthUser").trim();
-  if(g("#fTls")!==undefined) s.tlsMode = g("#fTls");
-  if(g("#fTlsCert")!==undefined) s.tlsCert = g("#fTlsCert").trim();
-  if(g("#fTlsKey")!==undefined) s.tlsKey = g("#fTlsKey").trim();
-  if(g("#fExtra")!==undefined) s.extra = g("#fExtra");
-  if(g("#fHandlerExtra")!==undefined) s.handlerExtra = g("#fHandlerExtra");
-  if(b("#fSec")!==undefined) s.securityHeaders = b("#fSec");
-  if(b("#fBlock")!==undefined) s.blockSensitive = b("#fBlock");
-  if(b("#fWww")!==undefined) s.wwwRedirect = b("#fWww");
-  if(b("#fEncode")!==undefined) s.encode = b("#fEncode");
-  if(b("#fLog")!==undefined) s.accessLog = b("#fLog");
-  if(b("#fHsts")!==undefined) s.hsts = b("#fHsts");
-  if(b("#fBrowse")!==undefined) s.browse = b("#fBrowse");
-  const pwEl = $("#fAuthPw");
-  if(pwEl) pendingPw = pwEl.value;
+function grab(){
+  const s=ed,g=i=>{const e=$(i);return e?e.value:undefined},b=i=>{const e=$(i);return e?e.checked:undefined};
+  const d=g("#fD");if(d!==undefined)s.domains=d.split(/[\n,;]+/).map(x=>x.trim()).filter(Boolean);
+  const m={"#fR":"root","#fU":"upstream","#fW":"redirectTo","#fWC":"redirectCode","#fB":"respondBody",
+    "#fL":"label","#fI":"indexFiles","#fM":"maxBody","#fAU":"basicAuthUser","#fTL":"tlsMode",
+    "#fTC":"tlsCert","#fTK":"tlsKey","#fHX":"handlerExtra","#fX":"extra"};
+  for(const k in m){const v=g(k);if(v!==undefined)s[m[k]]=v.trim?v.trim():v;}
+  if(g("#fS")!==undefined)s.respondStatus=parseInt(g("#fS"),10)||200;
+  const cm={"#cS":"securityHeaders","#cB":"blockSensitive","#cW":"wwwRedirect","#cE":"encode",
+    "#cL":"accessLog","#cH":"hsts","#cV":"browse"};
+  for(const k in cm){const v=b(k);if(v!==undefined)s[cm[k]]=v;}
+  const p=$("#fAP");if(p)pw=p.value;
 }
-
-async function saveSite(){
-  collectSheet();
-  const pw = pendingPw;
-  if(editing.basicAuthUser && pw){
-    const h = await api("/api/hash", { password: pw }, "Passwort wird verschl{ue}sselt...");
-    if(!h.ok){ toast(h.message,"bad"); return; }
-    editing.basicAuthHash = h.hash;
-  }
-  if(!editing.basicAuthUser) editing.basicAuthHash = "";
-  if(editing.basicAuthUser && !editing.basicAuthHash){
-    toast("F{ue}r den Zugriffsschutz fehlt noch ein Passwort.","bad"); return;
-  }
-  const r = await api("/api/site/save", editing, "Wird gespeichert...");
-  if(!r.ok){ toast(r.message,"bad"); return; }
-  setCfg(r);
-  closeModal();
-  toast(r.message,"ok");
-  await refresh();
-  render();
+async function save(){
+  grab();
+  if(ed.basicAuthUser&&pw){
+    const h=await api("/api/hash",{password:pw},"Passwort...");
+    if(!h.ok){toast(h.message,"bad");return;} ed.basicAuthHash=h.hash;}
+  if(!ed.basicAuthUser)ed.basicAuthHash="";
+  if(ed.basicAuthUser&&!ed.basicAuthHash){toast("Passwort fehlt.","bad");return;}
+  const r=await api("/api/site/save",ed,"Speichern...");
+  if(!r.ok){toast(r.message,"bad");return;}
+  if(r.config)C=r.config;
+  close2();toast(r.message,"ok");await refresh();draw();
 }
-
-function closeModal(){ $("#modal").classList.add("hidden"); $("#modal").innerHTML=""; editing=null; }
+function close2(){$("#md").classList.add("hide");$("#md").innerHTML="";ed=null;pw="";}
 
 /* ---------- Einrichtung ---------- */
-function renderSetup(el){
-  const s = ST.status, c = ST.config;
-  if(!s) return;
-  const line = (title, desc, ok, btn, act, arg) => `
-    <div class="find"><div class="ic ${ok?"ok":"warn"}">${ok?"+":"!"}</div>
-      <div class="tx"><b>${title}</b><span>${desc}</span></div>
-      ${btn?`<button class="btn sm" data-act="${act}" data-arg="${arg}">${btn}</button>`:""}</div>`;
-
-  el.innerHTML = `
-    <h2 class="page">Einrichtung</h2>
-    <p class="lead">Alles, was fr{ue}her von Hand aus der Anleitung kopiert werden musste.</p>
-
-    <div class="card">
-      <h3>Bausteine</h3>
-      <p class="sub">Jeder Schritt l{ae}sst sich einzeln ausf{ue}hren und beliebig wiederholen.</p>
-      ${line("Verzeichnisse", "Ordner f{ue}r Webseiten, Protokolle, Zertifikate und Sicherungen unter "+esc(s.root)+".",
-             true, "Pr{ue}fen", "setup", "dirs")}
-      ${line("Caddy "+(s.caddyInstalled?esc(s.caddyVersion):""), s.caddyInstalled
-             ? "Installiert. Updates bringen Sicherheitskorrekturen - vor dem Tausch wird die alte Datei gesichert."
-             : "Noch nicht installiert.",
-             s.caddyInstalled, s.caddyInstalled?"Auf Updates pr{ue}fen":"Installieren", "setup",
-             s.caddyInstalled?"caddy-update":"caddy")}
-      ${line("Automatischer Start", s.taskServer
-             ? "Caddy startet beim Hochfahren, ein Watchdog pr{ue}ft alle drei Minuten nach."
-             : "Ohne diesen Schritt bleibt der Server nach einem Neustart aus.",
-             !!(s.taskServer && s.taskWatchdog), "Einrichten", "setup", "tasks")}
-      ${line("Firewall", s.firewallRules > 0
-             ? s.firewallRules+" Freigabe(n) f{ue}r Port 80 und 443 vorhanden."
-             : (s.firewallRules < 0 ? "Der Zustand lie{ss} sich nicht abfragen."
-                                    : "Ohne Freigabe f{ue}r Port 80 und 443 kommt von au{ss}en niemand an."),
-             s.firewallRules > 0, "Freigaben anlegen", "setup", "firewall")}
-      ${line("PHP", s.phpInstalled
-             ? (c.php.enabled? "Installiert und aktiv mit "+c.php.poolSize+" FastCGI-Prozessen."
-                             : "Installiert, aber abgeschaltet.")
-             : "Nicht installiert. Wird nur f{ue}r PHP-Seiten gebraucht.",
-             s.phpInstalled && c.php.enabled,
-             (s.phpInstalled && c.php.enabled)?"Aktualisieren":"Installieren und aktivieren", "setup", "php")}
-    </div>
-
-    <div class="card">
-      <h3>Rundum-Einrichtung</h3>
-      <p class="sub">F{ue}hrt alle Schritte nacheinander aus und startet den Server anschlie{ss}end.
-         Eine bereits vorhandene Caddyfile wird dabei eingelesen, nicht {ue}berschrieben.</p>
-      <label class="chk"><input type="checkbox" id="setupPhp"${c.php.enabled?" checked":""}>
-        <span><span class="cl">PHP mit einrichten</span></span></label>
-      <div class="row"><button class="btn primary" data-act="setup-all">Alles einrichten</button></div>
-    </div>
-
-    <div class="card">
-      <h3>Zur{ue}ckbauen</h3>
-      <p class="sub">Entfernt Autostart und Watchdog. Dateien, Zertifikate und die Caddyfile bleiben erhalten,
-         der Webserver l{ae}uft bis zum n{ae}chsten Neustart weiter.</p>
-      <div class="row">
-        <button class="btn danger" data-act="setup" data-arg="uninstall">Automatik entfernen</button>
-        ${c.php.enabled?`<button class="btn" data-act="setup" data-arg="php-off">PHP abschalten</button>`:""}
-      </div>
-    </div>`;
+function ln(t,ok,btn,a,x,sub){return `<div class="row"><div class="ic ${ok?"ok":"warn"}">${ok?"+":"!"}</div>
+  <div class="t">${t}${sub?`<em>${sub}</em>`:""}</div>
+  ${btn?`<button class="b s" data-a="${a}" data-x="${x}">${btn}</button>`:""}</div>`;}
+function vSet(e){
+  const s=S;
+  e.innerHTML=`<h2>Einrichtung</h2><div class="box">
+    ${ln("Verzeichnisse",true,"Pr{ue}fen","su","dirs",s.root)}
+    ${ln("Caddy "+(s.caddyInstalled?s.caddyVersion:""),s.caddyInstalled,
+        s.caddyInstalled?"Updates":"Installieren","su",s.caddyInstalled?"caddy-update":"caddy")}
+    ${ln("Autostart und Watchdog",!!(s.taskServer&&s.taskWatchdog),"Einrichten","su","tasks")}
+    ${ln("Firewall Port 80/443",s.firewallRules>0,"Freigeben","su","firewall",
+        s.firewallRules>0?s.firewallRules+" Regeln":"")}
+    ${ln("Dateirechte",s.aclOk===true,"Absichern","fx","harden-acl",
+        s.aclWeak&&s.aclWeak.length?"schreibbar f{ue}r: "+E(A(s.aclWeak).join(", ")):"")}
+    ${ln("PHP",!!(s.phpInstalled&&C.php.enabled),
+        (s.phpInstalled&&C.php.enabled)?"Aktualisieren":"Installieren","su","php",
+        s.phpInstalled?(C.php.enabled?C.php.poolSize+" Prozesse":"abgeschaltet"):"")}
+  </div>
+  <div class="box"><label class="ck"><input type="checkbox" id="sp"${C.php.enabled?" checked":""}>PHP mit einrichten</label>
+    <div class="bar"><button class="b pri" data-a="su" data-x="all">Alles einrichten</button></div></div>
+  <div class="box"><div class="bar">
+    <button class="b dn" data-a="su" data-x="uninstall">Automatik entfernen</button>
+    ${C.php.enabled?`<button class="b" data-a="su" data-x="php-off">PHP abschalten</button>`:""}
+  </div></div>`;
 }
 
 /* ---------- Sicherheit ---------- */
-async function renderSecurity(el){
-  el.innerHTML = `<h2 class="page">Sicherheit</h2><p class="lead">Wird gepr{ue}ft...</p>`;
-  const r = await api("/api/security");
-  if(!r.ok){ el.innerHTML = "<p class='lead'>Pr{ue}fung fehlgeschlagen.</p>"; return; }
-  const f = arr(r.findings);
-  const bad = f.filter(x=>x.level==="bad").length;
-  const warn = f.filter(x=>x.level==="warn").length;
-  setSecBadge(f);
-
-  const order = { bad:0, warn:1, ok:2 };
-  f.sort((a,b)=>order[a.level]-order[b.level]);
-
-  el.innerHTML = `
-    <h2 class="page">Sicherheit</h2>
-    <p class="lead">${bad? bad+" dringende und "+warn+" empfohlene Punkte." : (warn? warn+" empfohlene Punkte." : "Alles in Ordnung.")}</p>
-    ${bad===0&&warn===0? `<div class="okbox">Keine Auff{ae}lligkeiten gefunden.</div>`:""}
-    <div class="card">
-      ${f.map(x=>`<div class="find">
-        <div class="ic ${x.level}">${x.level==="ok"?"+":(x.level==="warn"?"!":"x")}</div>
-        <div class="tx"><b>${esc(x.title)}</b><span>${esc(x.detail)}</span></div>
-        ${x.fix?`<button class="btn sm" data-act="fix" data-arg="${esc(x.fix)}">${esc(x.fixLabel||"Beheben")}</button>`:""}
-      </div>`).join("")}
-    </div>
-    <div class="card">
-      <h3>Wie diese Oberfl{ae}che gesch{ue}tzt ist</h3>
-      <p class="sub">Damit klar ist, was hier eigentlich offen steht.</p>
-      <div class="kv"><span class="k">Erreichbar nur {ue}ber</span><span class="v">127.0.0.1 (nicht aus dem Netz)</span></div>
-      <div class="kv"><span class="k">Zugang</span><span class="v">Einmaltoken, bei jedem Start neu</span></div>
-      <div class="kv"><span class="k">Schutz vor fremden Seiten</span><span class="v">CSRF-Header, Origin- und Host-Pr{ue}fung</span></div>
-      <div class="kv"><span class="k">Automatisches Ende</span><span class="v">${ST.config.manager.idleMinutes} Minuten ohne Nutzung</span></div>
-    </div>`;
+async function vSec(e){
+  e.innerHTML=`<h2>Sicherheit</h2><div class="box mut">wird gepr{ue}ft...</div>`;
+  const r=await api("/api/security");
+  const f=A(r.findings);badge(f);secLoaded=true;
+  const o={bad:0,warn:1,ok:2};f.sort((a,b)=>o[a.level]-o[b.level]);
+  e.innerHTML=`<h2>Sicherheit</h2><div class="box">${f.map(x=>`<div class="row">
+    <div class="ic ${x.level}">${x.level==="ok"?"+":x.level==="warn"?"!":"x"}</div>
+    <div class="t">${E(x.title)}<em>${E(x.detail)}</em></div>
+    ${x.fix?`<button class="b s" data-a="fx" data-x="${E(x.fix)}">${E(x.fixLabel||"Beheben")}</button>`:""}
+    </div>`).join("")}</div>
+    <div class="box"><div class="kv"><b>Oberfl{ae}che</b><span>127.0.0.1, ohne Anmeldung</span></div>
+    <div class="kv"><b>Schutz vor fremden Seiten</b><span>Kopfzeile + Herkunft + Host</span></div>
+    <div class="kv"><b>Beendet sich nach</b><span>${C.manager.idleMinutes} min</span></div></div>`;
 }
+function badge(f){const n=A(f).filter(x=>x.level!=="ok").length,b=$("#sb");
+  b.textContent=n;b.classList.toggle("hide",n===0);}
 
-function showOffline(){
-  if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
-  document.body.innerHTML = "<div class='byebye'><div><b>Die Oberfl{ae}che ist nicht mehr erreichbar.</b>"+
-    "<br><br>Vermutlich wurde sie nach l{ae}ngerer Unt{ae}tigkeit automatisch beendet, oder das "+
-    "Konsolenfenster wurde geschlossen.<br><br>Der Webserver l{ae}uft davon unber{ue}hrt weiter. "+
-    "Zum Weiterarbeiten einfach <b>caddy-manager.bat</b> erneut starten.</div></div>";
+/* ---------- Logs ---------- */
+async function vLog(e){
+  const r=await api("/api/logs");const fs=A(r.files);
+  e.innerHTML=`<h2>Logs</h2><div class="bar">
+    <select id="lp">${fs.map(f=>`<option value="${E(f.name)}">${E(f.name)} (${f.sizeKb} KB)</option>`).join("")}</select>
+    <button class="b" data-a="ls">Anzeigen</button></div><pre id="lo">-</pre>`;
+  if(fs.length){const p=fs.find(x=>x.name==="caddy.log")||fs[0];$("#lp").value=p.name;showLog();}
 }
-
-function setSecBadge(findings){
-  const list = arr(findings);
-  const bad = list.filter(x=>x.level==="bad").length;
-  const n = bad + list.filter(x=>x.level==="warn").length;
-  const badge = $("#secBadge");
-  badge.textContent = n;
-  badge.classList.toggle("hidden", n===0);
-  badge.style.background = bad ? "var(--bad)" : "var(--warn)";
-}
-
-/* ---------- Protokolle ---------- */
-async function renderLogs(el){
-  el.innerHTML = `<h2 class="page">Protokolle</h2><p class="lead">Wird geladen...</p>`;
-  const r = await api("/api/logs");
-  const files = arr(r.files);
-  el.innerHTML = `
-    <h2 class="page">Protokolle</h2>
-    <p class="lead">Caddy dreht die Dateien automatisch, sobald sie zu gro{ss} werden.</p>
-    <div class="card">
-      <div class="row">
-        <select id="logPick">${files.map(f=>`<option value="${esc(f.name)}">${esc(f.name)} (${f.sizeKb} KB, ${esc(f.modified)})</option>`).join("")}</select>
-        <button class="btn" data-act="logshow">Anzeigen</button>
-      </div>
-    </div>
-    <div class="card"><pre class="out" id="logOut">Datei ausw{ae}hlen und "Anzeigen" dr{ue}cken.</pre></div>`;
-  if(files.length){
-    const pick = $("#logPick");
-    const pref = files.find(f=>f.name==="caddy.log") || files.find(f=>f.name==="manager.log");
-    if(pref) pick.value = pref.name;
-    showLog();
-  }
-}
-
 async function showLog(){
-  const pick = $("#logPick"); if(!pick) return;
-  const r = await api("/api/log?name="+encodeURIComponent(pick.value)+"&lines=400");
-  const out = $("#logOut");
-  let text = r.text || "(leer)";
-  if(pick.value.endsWith(".log") && text.trim().startsWith("{")){
-    text = text.split("\n").map(l=>{
-      try{
-        const j = JSON.parse(l);
-        if(j.request){
-          const d = j.ts? new Date(j.ts*1000).toLocaleString("de-DE") : "";
-          return d+"  "+(j.status||"")+"  "+(j.request.method||"")+"  "+
-                 (j.request.host||"")+(j.request.uri||"")+"  "+(j.request.remote_ip||"");
-        }
-        const d = j.ts? new Date(j.ts*1000).toLocaleString("de-DE") : "";
-        return d+"  ["+(j.level||"")+"] "+(j.logger?j.logger+": ":"")+(j.msg||l);
-      }catch(e){ return l; }
-    }).join("\n");
-  }
-  out.textContent = text;
-  out.scrollTop = out.scrollHeight;
+  const p=$("#lp");if(!p)return;
+  const r=await api("/api/log?name="+encodeURIComponent(p.value)+"&lines=400");
+  let t=r.text||"(leer)";
+  if(t.trim().startsWith("{"))t=t.split("\n").map(l=>{try{const j=JSON.parse(l);
+    const d=j.ts?new Date(j.ts*1000).toLocaleString("de-DE"):"";
+    if(j.request)return d+"  "+(j.status||"")+"  "+(j.request.method||"")+"  "+(j.request.host||"")+(j.request.uri||"");
+    return d+"  ["+(j.level||"")+"] "+(j.msg||l);}catch(e){return l;}}).join("\n");
+  $("#lo").textContent=t;$("#lo").scrollTop=$("#lo").scrollHeight;
+}
+
+/* ---------- Caddyfile ---------- */
+async function vCf(e){
+  const [lv,bk]=await Promise.all([api("/api/caddyfile"),api("/api/backups")]);
+  e.innerHTML=`<h2>Caddyfile</h2>
+   <div class="nt">${C.mode==="managed"
+     ?`Wird aus der Domainliste erzeugt. {Ae}nderungen hier gehen beim n{ae}chsten {Ue}bernehmen verloren.
+        <button class="lk" data-a="md" data-x="manual">Auf manuell umschalten</button>`
+     :`Manueller Modus.
+        <button class="lk" data-a="md" data-x="managed">Zur{ue}ck auf verwaltet</button>`}</div>
+   <div class="box"><textarea id="cx" rows="18">${E(lv.text||"")}</textarea>
+   <div class="bar"><button class="b" data-a="cv">Pr{ue}fen</button>
+     <button class="b" data-a="cfm">Formatieren</button>
+     <button class="b pri" data-a="cs">Speichern und {ue}bernehmen</button></div>
+   <pre id="co" class="hide"></pre></div>
+   <div class="box"><h2>Sicherungen</h2>${A(bk.backups).length?A(bk.backups).map(b=>
+     `<div class="kv"><b>${E(b.modified)}</b><span><button class="b s" data-a="rs" data-x="${E(b.name)}">Zur{ue}ck</button></span></div>`).join("")
+     :`<div class="mut">keine</div>`}</div>
+   <div class="box"><h2>Passworthash</h2><div class="bar">
+     <input type="password" id="hp" placeholder="Passwort"><button class="b" data-a="hs">Erzeugen</button></div>
+     <pre id="ho" class="hide"></pre></div>`;
 }
 
 /* ---------- Einstellungen ---------- */
-function renderSettings(el){
-  const c = ST.config;
-  el.innerHTML = `
-    <h2 class="page">Einstellungen</h2>
-    <p class="lead">Gilt f{ue}r alle Domains gemeinsam.</p>
-    <div class="card">
-      <h3>Zertifikate</h3>
-      <label class="f"><span><b>E-Mail-Adresse</b> f{ue}r Let's Encrypt</span>
-        <input type="text" id="sEmail" value="${esc(c.global.email)}" placeholder="admin@beispiel.de">
-        <div class="hint">Dorthin gehen Warnungen, wenn eine Verl{ae}ngerung scheitert. Sehr empfohlen.</div></label>
+function vCfg(e){
+  e.innerHTML=`<h2>Einstellungen</h2>
+  <div class="box">
+    <label class="f"><span>E-Mail f{ue}r Let's Encrypt</span><input type="text" id="gE" value="${E(C.global.email)}"></label>
+    <div class="g2">
+      <label class="f"><span>Protokollstufe</span><select id="gL">
+        ${["ERROR","WARN","INFO","DEBUG"].map(l=>`<option${C.global.logLevel===l?" selected":""}>${l}</option>`).join("")}
+      </select></label>
+      <label class="f"><span>Gr{oe}sse je Datei</span><input type="text" id="gR" value="${E(C.global.rollSize)}"></label>
+      <label class="f"><span>Dateien aufbewahren</span><input type="number" id="gK" value="${C.global.rollKeep}" min="1" max="100"></label>
+      <label class="f"><span>Beenden nach (min, 0 = nie)</span><input type="number" id="gI" value="${C.manager.idleMinutes}" min="0" max="1440"></label>
     </div>
-    <div class="card">
-      <h3>PHP</h3>
-      <label class="chk"><input type="checkbox" id="sPhp"${c.php.enabled?" checked":""}>
-        <span><span class="cl">PHP verwenden</span>
-        <span class="cd">Muss an sein, damit Seiten vom Typ "PHP" funktionieren.</span></span></label>
-      <label class="f"><span>Anzahl paralleler PHP-Prozesse</span>
-        <input type="number" id="sPool" value="${c.php.poolSize}" min="1" max="16">
-        <div class="hint">Jeder Prozess bearbeitet eine Anfrage gleichzeitig. Vier ist ein guter Anfang.
-             Nach dem {Ae}ndern die Einrichtung f{ue}r PHP erneut ausf{ue}hren.</div></label>
-      <label class="chk"><input type="checkbox" id="sRisky"${c.php.disableRiskyFunctions?" checked":""}>
-        <span><span class="cl">Gef{ae}hrliche PHP-Funktionen sperren</span>
-        <span class="cd">exec, shell_exec, system und {ae}hnliche. Erh{oe}ht die Sicherheit deutlich, kann aber
-        einzelne Anwendungen st{oe}ren. Danach php.ini neu schreiben lassen.</span></span></label>
-    </div>
-    <div class="card">
-      <h3>Protokollierung</h3>
-      <label class="f"><span>Ausf{ue}hrlichkeit</span>
-        <select id="sLevel">
-          ${["ERROR","WARN","INFO","DEBUG"].map(l=>`<option value="${l}"${c.global.logLevel===l?" selected":""}>${l}</option>`).join("")}
-        </select></label>
-      <label class="f"><span>Gr{oe}sse pro Protokolldatei</span>
-        <input type="text" id="sRoll" value="${esc(c.global.rollSize)}" placeholder="10MiB"></label>
-      <label class="f"><span>Anzahl aufbewahrter Dateien</span>
-        <input type="number" id="sKeep" value="${c.global.rollKeep}" min="1" max="100"></label>
-    </div>
-    <div class="card">
-      <h3>Diese Oberfl{ae}che</h3>
-      <label class="f"><span>Automatisch beenden nach (Minuten ohne Nutzung)</span>
-        <input type="number" id="sIdle" value="${c.manager.idleMinutes}" min="0" max="1440">
-        <div class="hint">0 schaltet die Abschaltung aus. Je k{ue}rzer, desto kleiner das Zeitfenster,
-             in dem die Verwaltung offen steht.</div></label>
-      <label class="chk"><input type="checkbox" id="sBrowser"${c.manager.openBrowser?" checked":""}>
-        <span><span class="cl">Browser beim Start automatisch {oe}ffnen</span></span></label>
-    </div>
-    <div class="card">
-      <h3>Zus{ae}tzliche globale Caddyfile-Zeilen</h3>
-      <p class="sub">Landen unver{ae}ndert im globalen Optionsblock. F{ue}r Sonderf{ae}lle.</p>
-      <textarea id="sExtra" rows="4">${esc(c.global.extra)}</textarea>
-    </div>
-    <div class="card">
-      <h3>Bausteine und Importe</h3>
-      <p class="sub">Wiederverwendbare Bl{oe}cke in der Form <code>(name) { ... }</code> und
-         <code>import</code>-Zeilen. Sie stehen in der erzeugten Datei vor allen Domains und
-         lassen sich in einer Domain unter "Zus{ae}tzliche Caddyfile-Zeilen" mit
-         <code>import name</code> einbinden.</p>
-      <textarea id="sSnippets" rows="6" placeholder="(gemeinsam) {&#10;    encode gzip zstd&#10;}">${esc(c.global.snippets||"")}</textarea>
-    </div>
-    <div class="row"><button class="btn primary" data-act="savesettings">Einstellungen speichern</button></div>`;
-}
-
-/* ---------- Experte ---------- */
-async function renderExpert(el){
-  const c = ST.config;
-  el.innerHTML = `<h2 class="page">Experte</h2><p class="lead">Wird geladen...</p>`;
-  const [live, backups] = await Promise.all([api("/api/caddyfile"), api("/api/backups")]);
-  el.innerHTML = `
-    <h2 class="page">Experte</h2>
-    <p class="lead">Direktzugriff auf die Caddyfile. Vor jedem Schreiben wird gepr{ue}ft und gesichert.</p>
-
-    ${c.mode==="managed" ? `<div class="warnbox">
-      <b>Verwalteter Modus.</b> Die Caddyfile wird aus der Domainliste erzeugt; {Ae}nderungen hier werden beim
-      n{ae}chsten "{Ue}bernehmen" {ue}berschrieben. Zum dauerhaften Bearbeiten von Hand in den manuellen Modus wechseln.
-      <div class="row"><button class="btn sm" data-act="mode" data-arg="manual">Auf manuellen Modus umschalten</button></div>
-      </div>` : `<div class="okbox">
-      <b>Manueller Modus.</b> Die Datei wird nicht mehr erzeugt. Zur{ue}ck im verwalteten Modus wird die
-      aktuelle Datei eingelesen und in die Domainliste {ue}bernommen.
-      <div class="row"><button class="btn sm" data-act="mode" data-arg="managed">Zur{ue}ck zum verwalteten Modus</button></div>
-      </div>`}
-
-    <div class="card">
-      <h3>Caddyfile</h3>
-      <textarea id="cfText" rows="20">${esc(live.text||"")}</textarea>
-      <div class="row">
-        <button class="btn" data-act="cfvalidate">Pr{ue}fen</button>
-        <button class="btn" data-act="cfformat">Formatieren</button>
-        <button class="btn primary" data-act="cfsave">Pr{ue}fen, sichern und {ue}bernehmen</button>
-        <span class="spacer"></span>
-        <button class="btn" data-act="preview">Erzeugte Fassung ansehen</button>
-      </div>
-      <pre class="out hidden" id="cfOut"></pre>
-    </div>
-
-    <div class="card">
-      <h3>Sicherungen</h3>
-      <p class="sub">Vor jeder {Ae}nderung wird die laufende Datei weggeschrieben. Die letzten 30 bleiben liegen.</p>
-      ${arr(backups.backups).length ? arr(backups.backups).map(b=>`<div class="kv">
-          <span class="k">${esc(b.modified)}<span class="hint"> {bull} ${b.sizeKb} KB</span></span>
-          <span class="v"><button class="btn sm" data-act="restore" data-arg="${esc(b.name)}">Wiederherstellen</button></span>
-        </div>`).join("") : "<p class='sub'>Noch keine Sicherungen vorhanden.</p>"}
-    </div>
-
-    <div class="card">
-      <h3>Passworthash erzeugen</h3>
-      <p class="sub">F{ue}r <code>basic_auth</code> in eigenen Bl{oe}cken.</p>
-      <div class="row">
-        <input type="password" id="hashPw" placeholder="Passwort">
-        <button class="btn" data-act="mkhash">Hash erzeugen</button>
-      </div>
-      <pre class="out hidden" id="hashOut"></pre>
-    </div>`;
+    <label class="ck"><input type="checkbox" id="gB"${C.manager.openBrowser?" checked":""}>Browser beim Start {oe}ffnen</label>
+    <label class="ck" title="Nur einschalten, wenn ein Proxy oder Loadbalancer davorsteht. Sonst kann jeder im lokalen Netz die Client-Adresse f{ae}lschen."><input type="checkbox" id="gT"${C.global.trustedProxies?" checked":""}>Hinter einem Proxy (X-Forwarded-For vertrauen)</label>
+  </div>
+  <div class="box"><h2>PHP</h2><div class="g2">
+    <label class="ck"><input type="checkbox" id="pE"${C.php.enabled?" checked":""}>PHP verwenden</label>
+    <label class="ck" title="exec, shell_exec, system und {ae}hnliche sperren"><input type="checkbox" id="pR"${C.php.disableRiskyFunctions?" checked":""}>Riskante Funktionen sperren</label>
+    <label class="f"><span>Parallele Prozesse</span><input type="number" id="pP" value="${C.php.poolSize}" min="1" max="16"></label>
+  </div></div>
+  <div class="box"><h2>Dateirechte</h2>
+    <label class="f"><span>Konto darf ${E(S.root||"")}\\www bearbeiten</span>
+      <input type="text" id="ac" placeholder="DOMAENE\\benutzer"></label>
+    <button class="b s" data-a="gw">Freigeben</button></div>
+  <div class="box"><h2>Caddyfile-Zusatz</h2>
+    <label class="f"><span>Globale Zeilen</span><textarea id="gX" rows="3">${E(C.global.extra)}</textarea></label>
+    <label class="f"><span>Bausteine und Importe</span><textarea id="gS" rows="4">${E(C.global.snippets||"")}</textarea></label></div>
+  <div class="bar"><button class="b pri" data-a="gs">Speichern</button></div>`;
 }
 
 /* ---------- Aktionen ---------- */
 async function refresh(){
-  const r = await api("/api/state");
-  if(r && r.ok){ ST.status = r.status; ST.config = r.config; paintStatus(); }
+  const r=await api("/api/state");
+  if(r&&r.ok){S=r.status;C=r.config;head();}
   return r;
 }
-
-async function doApply(){
-  const r = await api("/api/apply", {}, "Konfiguration wird gepr{ue}ft und {ue}bernommen...");
-  if(r.ok){ toast(r.message,"ok"); }
-  else { toast((r.message||"")+(r.validation?"\n\n"+r.validation:""),"bad","Nicht {ue}bernommen"); }
-  await refresh(); render();
+async function apply(){
+  const r=await api("/api/apply",{},"{Ue}bernehmen...");
+  toast(r.ok?r.message:(r.message||"")+(r.validation?"\n\n"+r.validation:""),r.ok?"ok":"bad");
+  await refresh();draw();
+}
+async function preview(){
+  const r=await api("/api/preview");
+  $("#md").classList.remove("hide");
+  $("#md").innerHTML=`<div class="sh" id="pv"><div class="hd"><h3>Erzeugte Caddyfile</h3>
+    <button class="x" data-a="cl">&times;</button></div><div class="bd"><pre>${E(r.text||"")}</pre></div>
+    <div class="ft"><button class="b pri" data-a="ap">{Ue}bernehmen</button>
+    <button class="b" data-a="cl">Schliessen</button></div></div>`;
+}
+async function dns(id){
+  const r=await api("/api/dns",id?{id}:{},"DNS...");
+  if(!r.ok){toast(r.message,"bad");return;}
+  $("#md").classList.remove("hide");
+  $("#md").innerHTML=`<div class="sh"><div class="hd"><h3>DNS</h3><button class="x" data-a="cl">&times;</button></div>
+    <div class="bd"><div class="kv"><b>Diese Adresse</b><span>${E(r.publicIp||"unbekannt")}</span></div>
+    ${A(r.results).map(x=>`<div class="row"><div class="ic ${x.status==="ok"?"ok":x.status==="bad"?"bad":"warn"}">${x.status==="ok"?"+":x.status==="bad"?"x":"!"}</div>
+      <div class="t">${E(x.domain)}<em>${E(x.message)}${A(x.addresses).length?" ("+E(A(x.addresses).join(", "))+")":""}</em></div></div>`).join("")}
+    </div><div class="ft"><button class="b" data-a="cl">Schliessen</button></div></div>`;
+}
+async function setup(x){
+  const L={all:"Vollst{ae}ndige Einrichtung, das dauert...",caddy:"Caddy wird geladen...",
+    "caddy-update":"Update wird gesucht...",php:"PHP wird eingerichtet...",tasks:"Aufgaben...",
+    firewall:"Firewall...",dirs:"Verzeichnisse...",uninstall:"Entfernen...","php-off":"PHP aus..."};
+  const b={step:x};
+  if(x==="all"){const p=$("#sp");b.php=p?p.checked:false;}
+  const r=await api("/api/setup",b,L[x]||"...");
+  toast(A(r.notes).length?A(r.notes).join("\n"):(r.message||""),r.ok?"ok":"bad");
+  await refresh();draw();
 }
 
-async function showPreview(){
-  const r = await api("/api/preview");
-  $("#modal").classList.remove("hidden");
-  $("#modal").innerHTML = `<div class="sheet" id="prevSheet">
-    <header><h3>Erzeugte Caddyfile</h3><button class="x" data-act="close">&times;</button></header>
-    <div class="body"><pre class="out">${esc(r.text||"")}</pre></div>
-    <footer><button class="btn primary" data-act="apply">{Ue}bernehmen</button>
-      <button class="btn" data-act="close">Schlie{ss}en</button></footer></div>`;
-}
-
-async function showDns(id){
-  const r = await api("/api/dns", id? { id } : {}, "DNS wird abgefragt...");
-  if(!r.ok){ toast(r.message||"Pr{ue}fung fehlgeschlagen","bad"); return; }
-  const rows = arr(r.results).map(x=>`<div class="find">
-     <div class="ic ${x.status==="ok"?"ok":(x.status==="bad"?"bad":"warn")}">${x.status==="ok"?"+":(x.status==="bad"?"x":"!")}</div>
-     <div class="tx"><b>${esc(x.domain)}</b><span>${esc(x.message)}${arr(x.addresses).length?" ("+esc(arr(x.addresses).join(", "))+")":""}</span></div>
-     </div>`).join("");
-  $("#modal").classList.remove("hidden");
-  $("#modal").innerHTML = `<div class="sheet">
-    <header><h3>DNS-Pr{ue}fung</h3><button class="x" data-act="close">&times;</button></header>
-    <div class="body">
-      <p class="sub">Diese Abfrage hat die {oe}ffentliche Adresse dieses Servers bei einem externen Dienst erfragt.
-         Ergebnis: <code>${esc(r.publicIp||"unbekannt")}</code></p>
-      ${rows||"<p class='sub'>Nichts zu pr{ue}fen.</p>"}
-      <p class="hint">Zeigt eine Domain woanders hin, kann Let's Encrypt kein Zertifikat ausstellen.
-         Der A-Eintrag beim Domainanbieter muss auf die oben genannte Adresse zeigen.</p>
-    </div>
-    <footer><button class="btn" data-act="close">Schlie{ss}en</button></footer></div>`;
-}
-
-async function runSetup(step){
-  const labels = { "all":"Vollst{ae}ndige Einrichtung l{ae}uft. Das kann einige Minuten dauern...",
-                   "caddy":"Caddy wird heruntergeladen...", "caddy-update":"Es wird nach Updates gesucht...",
-                   "php":"PHP wird heruntergeladen und eingerichtet. Das dauert etwas...",
-                   "tasks":"Geplante Aufgaben werden angelegt...", "firewall":"Firewallregeln werden gesetzt...",
-                   "dirs":"Verzeichnisse werden gepr{ue}ft...", "uninstall":"Automatik wird entfernt...",
-                   "php-off":"PHP wird abgeschaltet..." };
-  const body = { step };
-  if(step==="all"){ const p=$("#setupPhp"); body.php = p? p.checked : false; }
-  const r = await api("/api/setup", body, labels[step]||"Wird ausgef{ue}hrt...");
-  const detail = arr(r.notes).length? arr(r.notes).join("\n") : (r.message||"");
-  toast(detail, r.ok?"ok":"bad", r.ok? (r.message||"Fertig") : "Fehlgeschlagen");
-  await refresh(); render();
-}
-
-/* ---------- Ereignisse ---------- */
-document.addEventListener("click", async (e)=>{
-  const nav = e.target.closest(".navitem");
-  if(nav){ go(nav.dataset.view); return; }
-  const t = e.target.closest("[data-act]");
-  if(!t) {
-    if(e.target.id==="modal") closeModal();
-    return;
-  }
-  const act = t.dataset.act, arg = t.dataset.arg;
-
-  if(act==="close"){ closeModal(); return; }
-  if(act==="apply"){ closeModal(); await doApply(); return; }
-  if(act==="preview"){ await showPreview(); return; }
-  if(act==="newsite"){ openSite(null); return; }
-  if(act==="edit"){ openSite(arg); return; }
-  if(act==="dns"){ await showDns(arg); return; }
-  if(act==="dnsall"){ await showDns(null); return; }
-  if(act==="savesite"){ await saveSite(); return; }
-  if(act==="settype"){ collectSheet(); editing.type = arg; drawSheet(!editing.id); return; }
-  if(act==="clearauth"){ editing.basicAuthUser=""; editing.basicAuthHash=""; collectSheet(); drawSheet(!editing.id);
-                         toast("Zugriffsschutz entfernt. Noch speichern.","ok"); return; }
-  if(act==="mkdir"){
-    collectSheet();
-    let p = editing.root;
-    if(!p && editing.domains.length){ p = (ST.status.root||"C:\\caddy")+"\\www\\"+editing.domains[0].replace(/^https?:\/\//,"").split(":")[0]; }
-    const r = await api("/api/folder", { path:p }, "Ordner wird angelegt...");
-    toast(r.message, r.ok?"ok":"bad");
-    if(r.ok){ editing.root = p; drawSheet(!editing.id); }
-    return;
-  }
-  if(act==="toggle"){
-    const r = await api("/api/site/toggle", { id:arg });
-    setCfg(r); await refresh(); render(); return;
-  }
-  if(act==="del"){
-    const s = arr(ST.config.sites).find(x=>x.id===arg);
-    if(!confirm("Eintrag \""+(s?s.domains[0]:"")+"\" wirklich l{oe}schen?\n\nDie Dateien im Ordner bleiben erhalten.")) return;
-    const r = await api("/api/site/delete", { id:arg }, "Wird entfernt...");
-    setCfg(r); toast(r.message, r.ok?"ok":"bad"); await refresh(); render(); return;
-  }
-  if(act==="service"){
-    const r = await api("/api/service", { action:arg }, "Wird ausgef{ue}hrt...");
-    toast(r.message, r.ok?"ok":"bad"); await refresh(); render(); return;
-  }
-  if(act==="setup"){ await runSetup(arg); return; }
-  if(act==="setup-all"){ await runSetup("all"); return; }
-  if(act==="fix"){
-    const r = await api("/api/fix", { id:arg }, "Wird umgesetzt...");
-    toast(r.message, r.ok?"ok":"bad"); await refresh(); render(); return;
-  }
-  if(act==="import"){
-    if(!confirm("Die bestehende Caddyfile einlesen?\n\nDie aktuelle Domainliste im Manager wird dabei ersetzt.")) return;
-    const r = await api("/api/import", {}, "Caddyfile wird eingelesen...");
-    setCfg(r);
-    toast((r.message||"")+(arr(r.skipped).length?"\n\nNicht erkannt: "+arr(r.skipped).join(", "):""), r.ok?"ok":"bad");
-    await refresh(); render(); return;
-  }
-  if(act==="mode"){
-    if(arg==="manual" && !confirm("In den manuellen Modus wechseln?\n\nDie Caddyfile wird dann nicht mehr aus der Domainliste erzeugt.")) return;
-    const r = await api("/api/mode", { mode:arg }, "Wird umgestellt...");
-    setCfg(r); toast(r.message, r.ok?"ok":"bad"); await refresh(); render(); return;
-  }
-  if(act==="savesettings"){
-    const r = await api("/api/settings", {
-      email: $("#sEmail").value.trim(),
-      logLevel: $("#sLevel").value,
-      rollSize: $("#sRoll").value.trim(),
-      rollKeep: $("#sKeep").value,
-      globalExtra: $("#sExtra").value,
-      snippets: $("#sSnippets").value,
-      phpEnabled: $("#sPhp").checked,
-      phpPoolSize: $("#sPool").value,
-      phpDisableRisky: $("#sRisky").checked,
-      idleMinutes: $("#sIdle").value,
-      openBrowser: $("#sBrowser").checked
-    }, "Wird gespeichert...");
-    setCfg(r); toast(r.message, r.ok?"ok":"bad"); await refresh(); render(); return;
-  }
-  if(act==="logshow"){ await showLog(); return; }
-  if(act==="cfvalidate"){
-    const r = await api("/api/validate", { text: $("#cfText").value }, "Wird gepr{ue}ft...");
-    const o = $("#cfOut"); o.classList.remove("hidden");
-    o.textContent = (r.message||"") + "\n\n" + (r.validation||"");
-    return;
-  }
-  if(act==="cfformat"){
-    const r = await api("/api/format", { text: $("#cfText").value }, "Wird formatiert...");
-    if(r.ok){ $("#cfText").value = r.text; toast("Formatiert.","ok"); } else { toast(r.message,"bad"); }
-    return;
-  }
-  if(act==="cfsave"){
-    const r = await api("/api/caddyfile", { text: $("#cfText").value }, "Wird gepr{ue}ft und {ue}bernommen...");
-    const o = $("#cfOut"); o.classList.remove("hidden");
-    o.textContent = (r.message||"") + (r.validation? "\n\n"+r.validation : "");
-    toast(r.message, r.ok?"ok":"bad");
-    await refresh(); return;
-  }
-  if(act==="restore"){
-    if(!confirm("Diese Sicherung wiederherstellen?\n\nDie aktuelle Caddyfile wird vorher ebenfalls gesichert.")) return;
-    const r = await api("/api/restore", { name:arg }, "Wird wiederhergestellt...");
-    toast(r.message, r.ok?"ok":"bad"); await refresh(); render(); return;
-  }
-  if(act==="mkhash"){
-    const r = await api("/api/hash", { password: $("#hashPw").value }, "Wird erzeugt...");
-    const o = $("#hashOut"); o.classList.remove("hidden");
-    o.textContent = r.ok ? r.hash : (r.message||"Fehlgeschlagen");
-    if(r.ok) $("#hashPw").value="";
-    return;
-  }
+document.addEventListener("click",async ev=>{
+  const n=ev.target.closest("#nv button");if(n){go(n.dataset.v);return;}
+  const t=ev.target.closest("[data-a]");
+  if(!t){if(ev.target.id==="md")close2();return;}
+  const a=t.dataset.a,x=t.dataset.x;
+  if(a==="cl"){close2();return;}
+  if(a==="rf"){await refresh();draw();return;}
+  if(a==="ap"){close2();await apply();return;}
+  if(a==="pv"){await preview();return;}
+  if(a==="new"){open2(null);return;}
+  if(a==="ed"){open2(x);return;}
+  if(a==="sa"){await save();return;}
+  if(a==="dns"){await dns(x);return;}
+  if(a==="dnsa"){await dns(null);return;}
+  if(a==="su"){await setup(x);return;}
+  if(a==="mk"){grab();let p=ed.root;
+    if(!p&&ed.domains.length)p=(S.root||"C:\\caddy")+"\\www\\"+ed.domains[0].replace(/^https?:\/\//,"").split(":")[0];
+    const r=await api("/api/folder",{path:p},"Ordner...");toast(r.message,r.ok?"ok":"bad");
+    if(r.ok){ed.root=p;sheet(!ed.id);}return;}
+  if(a==="tg"){const r=await api("/api/site/toggle",{id:x});if(r.config)C=r.config;await refresh();draw();return;}
+  if(a==="del"){const s=A(C.sites).find(y=>y.id===x);
+    if(!confirm("\""+(s?s.domains[0]:"")+"\" l{oe}schen? Die Dateien bleiben.")) return;
+    const r=await api("/api/site/delete",{id:x},"...");if(r.config)C=r.config;
+    toast(r.message,r.ok?"ok":"bad");await refresh();draw();return;}
+  if(a==="sv"){const r=await api("/api/service",{action:x},"...");toast(r.message,r.ok?"ok":"bad");
+    await refresh();draw();return;}
+  if(a==="fx"){const r=await api("/api/fix",{id:x},"...");toast(r.message,r.ok?"ok":"bad");
+    await refresh();if(view==="sec")vSec($("#vw"));else draw();return;}
+  if(a==="imp"){if(!confirm("Caddyfile einlesen? Die Domainliste wird ersetzt."))return;
+    const r=await api("/api/import",{},"Einlesen...");if(r.config)C=r.config;
+    toast((r.message||"")+(A(r.skipped).length?"\nNicht erkannt: "+A(r.skipped).join(", "):""),r.ok?"ok":"bad");
+    await refresh();draw();return;}
+  if(a==="md"){if(x==="manual"&&!confirm("Auf manuell umschalten?"))return;
+    const r=await api("/api/mode",{mode:x},"...");if(r.config)C=r.config;
+    toast(r.message,r.ok?"ok":"bad");await refresh();draw();return;}
+  if(a==="ls"){await showLog();return;}
+  if(a==="cv"){const r=await api("/api/validate",{text:$("#cx").value},"Pr{ue}fen...");
+    const o=$("#co");o.classList.remove("hide");o.textContent=(r.message||"")+"\n"+(r.validation||"");return;}
+  if(a==="cfm"){const r=await api("/api/format",{text:$("#cx").value},"...");
+    if(r.ok){$("#cx").value=r.text;toast("Formatiert.","ok");}else toast(r.message,"bad");return;}
+  if(a==="cs"){const r=await api("/api/caddyfile",{text:$("#cx").value},"...");
+    const o=$("#co");o.classList.remove("hide");o.textContent=(r.message||"")+(r.validation?"\n"+r.validation:"");
+    toast(r.message,r.ok?"ok":"bad");await refresh();return;}
+  if(a==="rs"){if(!confirm("Diese Sicherung wiederherstellen?"))return;
+    const r=await api("/api/restore",{name:x},"...");toast(r.message,r.ok?"ok":"bad");
+    await refresh();draw();return;}
+  if(a==="hs"){const r=await api("/api/hash",{password:$("#hp").value},"...");
+    const o=$("#ho");o.classList.remove("hide");o.textContent=r.ok?r.hash:(r.message||"");
+    if(r.ok)$("#hp").value="";return;}
+  if(a==="gw"){const r=await api("/api/acl",{account:$("#ac").value},"...");
+    toast(r.message,r.ok?"ok":"bad");return;}
+  if(a==="gs"){const r=await api("/api/settings",{email:$("#gE").value.trim(),logLevel:$("#gL").value,
+      rollSize:$("#gR").value.trim(),rollKeep:$("#gK").value,globalExtra:$("#gX").value,
+      snippets:$("#gS").value,trustedProxies:$("#gT").checked,
+      phpEnabled:$("#pE").checked,phpPoolSize:$("#pP").value,
+      phpDisableRisky:$("#pR").checked,idleMinutes:$("#gI").value,openBrowser:$("#gB").checked},"...");
+    if(r.config)C=r.config;toast(r.message,r.ok?"ok":"bad");await refresh();return;}
+  if(a==="quit"){if(!confirm("Oberfl{ae}che beenden? Der Webserver l{ae}uft weiter."))return;
+    await api("/api/quit",{});
+    document.body.innerHTML="<div class='bye'>Beendet. Der Webserver l{ae}uft weiter.</div>";return;}
 });
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&!$("#md").classList.contains("hide"))close2();});
+document.addEventListener("visibilitychange",()=>{if(!document.hidden&&!busy)refresh().then(head);});
 
-document.addEventListener("keydown", (e)=>{
-  if(e.key==="Escape" && !$("#modal").classList.contains("hidden")) closeModal();
-});
-
-$("#btnQuit").addEventListener("click", async ()=>{
-  if(!confirm("Die Oberfl{ae}che beenden?\n\nDer Webserver l{ae}uft unver{ae}ndert weiter.")) return;
-  await api("/api/quit", {});
-  document.body.innerHTML = "<div class='byebye'>Der Manager wurde beendet. Der Webserver l{ae}uft weiter. "+
-    "Dieses Fenster kann geschlossen werden.</div>";
-});
-
-/* ---------- Start ---------- */
-(async function(){
-  await refresh();
-  render();
-  api("/api/security").then(r=>{ if(r && r.ok) setSecBadge(r.findings); });
-  pollTimer = setInterval(async ()=>{
-    if(busyCount>0) return;
-    if(!$("#modal").classList.contains("hidden")) return;
-    const r = await api("/api/status");
-    if(!r || !r.ok){
-      offline++;
-      if(offline>=3) showOffline();
-      return;
-    }
-    offline = 0;
-    if(r && r.ok){
-      const before = ST.status? JSON.stringify([ST.status.caddyRunning, ST.status.phpPorts, ST.status.dirty]) : "";
-      ST.status = r.status;
-      paintStatus();
-      const after = JSON.stringify([ST.status.caddyRunning, ST.status.phpPorts, ST.status.dirty]);
-      if(before!==after && (view==="dash")) render();
-    }
-  }, 5000);
-})();
+(async()=>{await refresh();draw();})();
 </script>
 </body>
 </html>
@@ -5121,6 +4904,27 @@ try {
     exit 1
 }
 
+# --- Nur ein Manager gleichzeitig ---
+#  Zwei Fenster wuerden sich beim Speichern gegenseitig ueberschreiben, weil
+#  jedes seinen eigenen Stand im Speicher haelt.
+$LockFile = $Paths.Lock
+try {
+    if (Test-Path -LiteralPath $LockFile) {
+        $txt = ([string](Get-Content -LiteralPath $LockFile -Raw)).Trim()
+        if ($txt -match '^\d+$' -and [int]$txt -ne $PID) {
+            $other = Get-Process -Id ([int]$txt) -ErrorAction SilentlyContinue
+            if ($other -and $other.ProcessName -match '(?i)powershell|pwsh') {
+                Write-Host2 ("  Es l{ae}uft bereits ein Caddy Manager (Prozess " + $txt + ").") 'Yellow'
+                Write-Host2 '  Zwei gleichzeitig wuerden sich beim Speichern gegenseitig ueberschreiben.' 'DarkGray'
+                Write-Host2 '  Bitte das andere Fenster verwenden oder schliessen.' 'DarkGray'
+                Write-Host ''
+                exit 1
+            }
+        }
+    }
+    Write-TextFile $LockFile ([string]$PID)
+} catch { }
+
 # --- Vorhandene Zertifikate uebernehmen, damit nichts neu beantragt wird ---
 try {
     $mig = Import-CertificateStore
@@ -5156,8 +4960,10 @@ if (-not $ver.installed) {
     Write-Host ''
 }
 
-if (-not (Start-ManagerServer $Config)) {
-    exit 1
+try {
+    if (-not (Start-ManagerServer $Config)) { exit 1 }
+} finally {
+    try { Remove-Item -LiteralPath $LockFile -Force -ErrorAction SilentlyContinue } catch { }
 }
 
 Write-Host ''

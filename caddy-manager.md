@@ -2,77 +2,75 @@
 
 Eine Datei: [`caddy-manager.bat`](./caddy-manager.bat). Doppelklick, fertig.
 
-Ersetzt die Handarbeit aus der [README](./README.md) – Ordner anlegen, Caddy laden,
-Caddyfile tippen, `schtasks`-Zeilen kopieren, PHP entpacken. Das macht die Datei
-jetzt selbst, und danach braucht man sie nicht mehr: Caddy startet mit Windows und
-wird alle drei Minuten überwacht. Zum Ändern von Domains startet man sie wieder.
+Richtet Caddy vollständig ein — Programm, Autostart, Watchdog, Firewall, optional PHP —
+und öffnet während der Laufzeit eine Oberfläche auf `http://127.0.0.1:8787`.
+Danach läuft der Webserver ohne die Datei weiter.
 
-## Was passiert beim Start
+## Beim ersten Start
 
-1. Windows fragt nach Administratorrechten (nötig für Aufgabenplanung, Firewall und `C:\caddy`).
-2. Eine bereits vorhandene `C:\caddy\caddyfile` wird eingelesen und in die Domainliste übernommen –
-   samt Bausteinen `(name) { … }`, `import`-Zeilen und allem, was der Manager nicht selbst kennt.
-3. Vorhandene Zertifikate werden aus dem bisherigen Speicher nach `C:\caddy\data` übernommen.
-   Ohne diesen Schritt würde Caddy alles neu beantragen und könnte in die Mengenbegrenzung
-   von Let's Encrypt laufen.
-4. Im Konsolenfenster steht eine Adresse wie `http://127.0.0.1:8787/?t=…` – der Browser öffnet sich automatisch.
+- Eine vorhandene `C:\caddy\caddyfile` wird eingelesen: Domains, Bausteine `(name) { }`,
+  `import`-Zeilen, eigene `storage`-Zeile, alles Unbekannte bleibt wörtlich erhalten.
+- Vorhandene Zertifikate werden nach `C:\caddy\data` übernommen, statt sie neu zu beantragen.
+- Alte Aufgaben aus der Handinstallation werden erkannt und ersetzt.
 
-Fenster schließen oder Strg+C beendet nur die Oberfläche. Der Webserver läuft weiter.
+## Oberfläche
 
-## Was die Oberfläche kann
-
-| Bereich | Inhalt |
+| Reiter | Inhalt |
 | --- | --- |
-| Übersicht | Zustand von Caddy und PHP, Zertifikatslaufzeiten, Ablageorte, Start/Stopp/Neustart |
-| Domains | Seiten anlegen und ändern – statisch, PHP, Reverse Proxy, Weiterleitung, fester Text |
-| Einrichtung | Caddy, PHP, Autostart, Watchdog und Firewall einzeln oder in einem Rutsch |
-| Sicherheit | Geprüfte Checkliste, jeder Punkt mit Knopf zum Beheben |
-| Protokolle | Zugriffs- und Fehlerprotokolle, JSON wird lesbar aufbereitet |
-| Einstellungen | E-Mail für Let's Encrypt, PHP-Prozesse, Protokollumfang |
-| Experte | Caddyfile direkt bearbeiten, prüfen, formatieren, Sicherungen zurückholen |
+| Domains | statisch, PHP, Proxy, Weiterleitung, Text |
+| Einrichtung | Bausteine einzeln oder alles auf einmal |
+| Sicherheit | geprüfte Liste, jeder Punkt mit Knopf |
+| Logs | Zugriffs- und Fehlerprotokolle |
+| Caddyfile | direkt bearbeiten, prüfen, Sicherungen zurückholen |
+| Einstellungen | E-Mail, PHP, Protokolle, Dateirechte |
 
-Die Caddyfile wird aus der Domainliste erzeugt und ist byte-gleich mit dem, was
-`caddy fmt` schreiben würde. Wer sie lieber selbst pflegt, schaltet unter *Experte*
-auf den manuellen Modus um; der Weg zurück liest die Datei wieder ein.
+Die Caddyfile wird aus der Domainliste erzeugt und ist byte-gleich mit `caddy fmt`.
+Wer sie selbst pflegen will, schaltet unter *Caddyfile* auf manuellen Modus.
 
-## Sicherheit
+Es wird nichts im Hintergrund geladen: aktualisiert wird beim Öffnen, nach jeder
+Aktion und beim Zurückwechseln in den Reiter.
 
-Die Oberfläche läuft mit Administratorrechten, deshalb ist sie eng eingezäunt:
+## Zugang
 
-- Sie lauscht ausschließlich auf `127.0.0.1` – aus dem Netz nicht erreichbar, auch nicht über den Rechnernamen.
-- Jeder Start erzeugt ein neues Zufallstoken. Ohne dieses Token kein Zugang.
-- Ändernde Aufrufe brauchen zusätzlich einen CSRF-Wert aus dem Seitenquelltext, dazu Origin- und Host-Prüfung gegen DNS-Rebinding.
-- Strenge Content-Security-Policy mit Nonce, keinerlei Inhalte von außen.
-- Nach 60 Minuten ohne Nutzung beendet sich die Oberfläche von selbst (einstellbar).
-- Jede Eingabe wird geprüft, bevor sie in die Caddyfile, einen Prozessaufruf oder auf die Platte gelangt.
+Die Oberfläche hat **keine Anmeldung** — bewusst so gewählt. Wer lokal auf
+`127.0.0.1` zugreifen kann, darf alles.
 
-Für die ausgelieferten Seiten setzt der Manager standardmäßig Sicherheitskopfzeilen
-und sperrt Dateien wie `.env`, `.git`, `*.sql` oder `*.log`.
+Was trotzdem greift:
+
+- Aus dem Netz nicht erreichbar, auch nicht über den Rechnernamen (Host-Prüfung).
+- Ändernde Aufrufe brauchen eine eigene Kopfzeile und die richtige Herkunft. Ohne das
+  könnte jede Webseite, die im Browser dieses Rechners geöffnet wird, per Formular
+  auf `127.0.0.1` schreiben.
+- Nach 60 Minuten ohne Nutzung beendet sich die Oberfläche.
+
+## Dateirechte
+
+Ein Ordner direkt unter `C:\` erbt von dort „Ändern" für alle angemeldeten Benutzer.
+Damit könnte jemand ohne Administratorrechte `caddy.exe` oder `watchdog.ps1`
+austauschen — beide laufen als SYSTEM. Der Manager entzieht diese Vererbung; nur
+Administratoren und SYSTEM dürfen schreiben. Ein einzelnes Konto lässt sich unter
+*Einstellungen* für `C:\caddy\www` freigeben.
 
 ## Änderungen anwenden
 
-Beim Übernehmen wird zuerst mit `caddy validate` geprüft, dann die laufende Datei
-gesichert, dann geschrieben und ohne Unterbrechung neu geladen. Lehnt Caddy die neue
-Fassung ab, kommt automatisch der vorherige Stand zurück. Die letzten 30 Sicherungen
-lassen sich unter *Experte* mit einem Klick wiederherstellen.
+`caddy validate` → Sicherung → schreiben → unterbrechungsfrei neu laden. Lehnt Caddy ab,
+kommt der vorherige Stand zurück. Die letzten 30 Sicherungen liegen unter *Caddyfile*.
 
 ## Ablage
 
 ```
-C:\caddy\caddy.exe              Programm
-C:\caddy\caddyfile              erzeugte Konfiguration
-C:\caddy\www\<domain>\          Webseiten
-C:\caddy\logs\                  Protokolle, rotieren automatisch
-C:\caddy\data\                  Zertifikate
-C:\caddy\manager\config.json    Domainliste und Einstellungen
-C:\caddy\manager\backups\       Sicherungen
-C:\php\                         PHP, falls installiert
+C:\caddy\caddy.exe            Programm
+C:\caddy\caddyfile            erzeugte Konfiguration
+C:\caddy\www\<domain>\        Webseiten
+C:\caddy\logs\                Protokolle, rotieren automatisch
+C:\caddy\data\                Zertifikate
+C:\caddy\manager\             Domainliste, Sicherungen, Watchdog
+C:\php\                       PHP, falls installiert
 ```
 
-Geplante Aufgaben liegen unter `\CaddyManager\` (Server, Watchdog, PHP-Prozesse).
-Alte Aufgaben aus der Handinstallation erkennt und entfernt der Manager.
+Geplante Aufgaben unter `\CaddyManager\`.
 
 ## Voraussetzungen
 
-Windows 10 / Server 2016 oder neuer, Windows PowerShell 5.1 (ist enthalten),
-Administratorrechte. x64 und ARM64 werden erkannt.
+Windows 10 / Server 2016 oder neuer, Windows PowerShell 5.1, Administratorrechte.
+x64 und ARM64 werden erkannt.
