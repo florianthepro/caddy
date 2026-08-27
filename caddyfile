@@ -20,3 +20,22 @@ idr.getitsec.com {
 gitea.getitsec.com {
     reverse_proxy 127.0.0.1:3000
 }
+
+bsfisazubi.de {
+    root * C:/caddy/www/bsfisazubi.de
+    encode gzip zstd
+
+    # Datenverzeichnis liegt unter C:/caddy/www/bsfisazubi.de-data und damit
+    # ausserhalb des Webroots. Diese Regel ist die zweite Absicherung,
+    # falls das Verzeichnis doch einmal im Webroot landet.
+    @data path /data /data/*
+    respond @data 404
+
+    php_fastcgi 127.0.0.1:9000
+    file_server
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        -Server
+    }
+}

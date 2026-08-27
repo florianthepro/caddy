@@ -1,0 +1,6 @@
+# Laufzeitdaten des Azubi-Portals (Datenbank, Sitzungen, Anhaenge)
+www/*-data/
+www/**/data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
