@@ -21,8 +21,21 @@ if exist "%EXE%" "%EXE%" stop >nul 2>&1
 taskkill /F /IM caddy.exe >nul 2>&1
 taskkill /F /IM php-cgi.exe >nul 2>&1
 
-"%EXE%" version >nul 2>&1 || powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue';[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;Invoke-WebRequest -Uri 'https://caddyserver.com/api/download?os=windows&arch=%ARCH%' -OutFile 'C:\caddy\caddy.exe' -UseBasicParsing"
+set "DLURL=https://caddyserver.com/api/download?os=windows&arch=%ARCH%&p=github.com/caddy-dns/cloudflare&p=github.com/mholt/caddy-dynamicdns"
+set "MODS=%TEMP%\caddy-modules.txt"
+set "NEEDDL=1"
+"%EXE%" list-modules >"%MODS%" 2>nul
+findstr /x "dns.providers.cloudflare" "%MODS%" >nul 2>&1 && findstr /x "dynamic_dns" "%MODS%" >nul 2>&1 && set "NEEDDL=0"
+if "%NEEDDL%"=="1" powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue';[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;Invoke-WebRequest -Uri '%DLURL%' -OutFile 'C:\caddy\caddy.exe.new' -UseBasicParsing -TimeoutSec 900"
+if exist "C:\caddy\caddy.exe.new" "C:\caddy\caddy.exe.new" version >nul 2>&1 && move /y "C:\caddy\caddy.exe.new" "%EXE%" >nul
+del /q "C:\caddy\caddy.exe.new" >nul 2>&1
 "%EXE%" version >nul 2>&1 || (echo CADDY DOWNLOAD FAILED & pause & exit /b 1)
+set "DNSOK=1"
+"%EXE%" list-modules >"%MODS%" 2>nul
+findstr /x "dns.providers.cloudflare" "%MODS%" >nul 2>&1 || set "DNSOK=0"
+findstr /x "dynamic_dns" "%MODS%" >nul 2>&1 || set "DNSOK=0"
+del /q "%MODS%" >nul 2>&1
+if "%DNSOK%"=="0" echo DNS PLUGINS MISSING - DNS MANAGEMENT DISABLED
 
 "C:\php\php-cgi.exe" -v >nul 2>&1 || powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue';[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;$z=Join-Path $env:TEMP 'php-setup.zip';foreach($u in @('https://windows.php.net/downloads/releases/latest/php-8.5-nts-Win32-vs17-x64.zip','https://windows.php.net/downloads/releases/latest/php-8.4-nts-Win32-vs17-x64.zip','https://windows.php.net/downloads/releases/latest/php-8.3-nts-Win32-vs16-x64.zip')){try{Invoke-WebRequest -Uri $u -OutFile $z -UseBasicParsing;break}catch{}};if(Test-Path $z){Expand-Archive -Path $z -DestinationPath 'C:\php' -Force;Remove-Item $z -Force}"
 "C:\php\php-cgi.exe" -v >nul 2>&1 || echo PHP DOWNLOAD FAILED
@@ -75,6 +88,26 @@ if not exist "%CFG%" (
     >>"%CFG%" echo }
 )
 
+set "TOK=C:\caddy\cf_token.txt"
+set "DNSF=C:\caddy\dns.caddyfile"
+set "SETUPDNS=n"
+if "%DNSOK%"=="1" if not exist "%TOK%" echo.
+if "%DNSOK%"=="1" if not exist "%TOK%" echo CLOUDFLARE DNS MANAGEMENT - TOKEN PERMISSIONS: Zone.Zone Read + Zone.DNS Edit
+if "%DNSOK%"=="1" if not exist "%TOK%" set /p "SETUPDNS=SETUP NOW [j/N] "
+if /i "%SETUPDNS%"=="j" powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=Read-Host -Prompt 'Cloudflare API Token' -AsSecureString;$b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($s);$t=[Runtime.InteropServices.Marshal]::PtrToStringAuto($b).Trim();[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b);if($t.Length -gt 20){[IO.File]::WriteAllText('C:\caddy\cf_token.txt',$t)}"
+if exist "%TOK%" icacls "%TOK%" /inheritance:r /grant:r "*S-1-5-18:(R)" "*S-1-5-32-544:(F)" >nul 2>&1
+set "DNSON=0"
+if "%DNSOK%"=="1" if exist "%TOK%" powershell -NoProfile -ExecutionPolicy Bypass -Command "try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;$t=([IO.File]::ReadAllText('C:\caddy\cf_token.txt')).Trim();$h=@{Authorization='Bearer '+$t};$r=Invoke-RestMethod -Uri 'https://api.cloudflare.com/client/v4/user/tokens/verify' -Headers $h -TimeoutSec 30;if(-not ($r.success -and $r.result.status -eq 'active')){exit 1};$z=Invoke-RestMethod -Uri 'https://api.cloudflare.com/client/v4/zones' -Headers $h -TimeoutSec 30;if(-not $z.success){exit 1};exit 0}catch{exit 1}" && set "DNSON=1"
+if "%DNSOK%"=="1" if exist "%TOK%" if "%DNSON%"=="0" echo CLOUDFLARE TOKEN REJECTED - DNS MANAGEMENT DISABLED
+if "%DNSON%"=="1" powershell -NoProfile -ExecutionPolicy Bypass -Command "$t=([IO.File]::ReadAllText('C:\caddy\cf_token.txt')).Trim();$n=[char]10;$b=[char]9;$s='acme_dns cloudflare '+$t+$n+'dynamic_dns {'+$n+$b+'provider cloudflare '+$t+$n+$b+'dynamic_domains'+$n+$b+'versions ipv4'+$n+$b+'check_interval 5m'+$n+$b+'ip_source simple_http https://icanhazip.com'+$n+$b+'ip_source simple_http https://api.ipify.org'+$n+'}'+$n;[IO.File]::WriteAllText('C:\caddy\dns.caddyfile',$s)"
+if "%DNSON%"=="1" icacls "%DNSF%" /inheritance:r /grant:r "*S-1-5-18:(R)" "*S-1-5-32-544:(F)" >nul 2>&1
+if "%DNSON%"=="1" copy /y "%CFG%" "C:\caddy\backup\caddyfile.predns" >nul
+if "%DNSON%"=="1" powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='C:\caddy\caddyfile';$c=[IO.File]::ReadAllText($p);if($c -notmatch 'import\s+C:/caddy/dns\.caddyfile'){$n=[char]10;$i=[char]9+'import C:/caddy/dns.caddyfile';if($c -match '^\s*\{'){$c=$c -replace '^(\s*\{)',('$1'+$n+$i)}else{$c='{'+$n+$i+$n+'}'+$n+$n+$c};[IO.File]::WriteAllText($p,$c)}"
+if "%DNSON%"=="1" "%EXE%" validate --adapter caddyfile --config "%CFG%" >nul 2>&1 || copy /y "C:\caddy\backup\caddyfile.predns" "%CFG%" >nul
+if "%DNSON%"=="0" powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='C:\caddy\caddyfile';$c=[IO.File]::ReadAllText($p);$d=$c -replace '(?m)^[ \t]*import[ \t]+C:/caddy/dns\.caddyfile[ \t]*\r?\n?','';$d=$d -replace '^\{\s*\}\s*','';if($d -ne $c){[IO.File]::WriteAllText($p,$d)}"
+set "DNSSTATE=OFF"
+findstr /c:"import C:/caddy/dns.caddyfile" "%CFG%" >nul 2>&1 && set "DNSSTATE=ON"
+
 >"%WD%" echo $ErrorActionPreference = 'SilentlyContinue'
 >>"%WD%" echo $env:PHP_FCGI_MAX_REQUESTS = '0'
 >>"%WD%" echo $exe = 'C:\caddy\caddy.exe'
@@ -117,6 +150,7 @@ tasklist /FI "IMAGENAME eq caddy.exe" | find /I "caddy.exe" >nul && echo CADDY R
 tasklist /FI "IMAGENAME eq php-cgi.exe" | find /I "php-cgi.exe" >nul && echo PHP RUNNING || echo PHP NOT RUNNING
 "%EXE%" version
 "C:\php\php-cgi.exe" -v
+echo DNS MANAGEMENT %DNSSTATE%
 
 endlocal
 pause
