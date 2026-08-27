@@ -192,6 +192,60 @@ function ConvertTo-FileText {
     return ($Text.TrimEnd("`r", "`n") + [Environment]::NewLine)
 }
 
+# Liest eine Textdatei, ohne die Kodierung zu erraten. Eine Caddyfile, die mit
+# einem aelteren Editor angelegt wurde, steht oft in der ANSI-Codepage - als
+# UTF-8 gelesen wuerden daraus Fragezeichen, und beim Zurueckschreiben waeren
+# die Umlaute in Pfaden und Kommentaren dauerhaft zerstoert.
+$script:AnsiEnc = $null
+function Get-AnsiEncoding {
+    if ($script:AnsiEnc) { return $script:AnsiEnc }
+    $enc = $null
+    try {
+        $cp = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage
+        if ($cp -gt 0 -and $cp -ne 65001) { $enc = [Text.Encoding]::GetEncoding($cp) }
+    } catch { }
+    if (-not $enc) { try { $enc = [Text.Encoding]::GetEncoding(1252) } catch { } }
+    if (-not $enc) { $enc = [Text.Encoding]::Default }
+    $script:AnsiEnc = $enc
+    return $enc
+}
+
+function Read-TextFileSmart {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return '' }
+    try {
+        $b = [System.IO.File]::ReadAllBytes($Path)
+        if ($b.Length -eq 0) { return '' }
+        if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) {
+            return [Text.Encoding]::UTF8.GetString($b, 3, $b.Length - 3)
+        }
+        if ($b.Length -ge 2 -and $b[0] -eq 0xFF -and $b[1] -eq 0xFE) { return [Text.Encoding]::Unicode.GetString($b) }
+        if ($b.Length -ge 2 -and $b[0] -eq 0xFE -and $b[1] -eq 0xFF) { return [Text.Encoding]::BigEndianUnicode.GetString($b) }
+        try {
+            # Strenges UTF-8: wirft bei ungueltigen Folgen
+            $enc = New-Object System.Text.UTF8Encoding($false, $true)
+            return $enc.GetString($b)
+        } catch {
+            # Kein gueltiges UTF-8 - also die ANSI-Codepage des Systems.
+            # Encoding::Default bedeutet je nach Laufzeit etwas anderes,
+            # deshalb die Codepage ausdruecklich holen.
+            return (Get-AnsiEncoding).GetString($b)
+        }
+    } catch { return '' }
+}
+
+# Nimmt einer Datei das Schreibschutz-Merkmal, sonst schlaegt jedes Ueberschreiben fehl.
+function Clear-ReadOnly {
+    param([string]$Path)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+        $fi = Get-Item -LiteralPath $Path -Force
+        if ($fi.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+            $fi.Attributes = $fi.Attributes -bxor [System.IO.FileAttributes]::ReadOnly
+        }
+    } catch { }
+}
+
 function Write-Host2 {
     param([string]$Msg, [string]$Color = 'Gray')
     try { Write-Host (T $Msg) -ForegroundColor $Color } catch { Write-Host $Msg }
@@ -2629,6 +2683,7 @@ function Write-CaddyfileAndReload {
 
     # 3. Uebernehmen
     try {
+        Clear-ReadOnly $Paths.Config
         Copy-Item -LiteralPath $Paths.Staging -Destination $Paths.Config -Force
     } catch {
         $result.message = "Datei konnte nicht geschrieben werden: $($_.Exception.Message)"
@@ -2667,10 +2722,7 @@ function Write-CaddyfileAndReload {
 }
 
 function Get-LiveCaddyfile {
-    if (Test-Path -LiteralPath $Paths.Config) {
-        try { return (Get-Content -LiteralPath $Paths.Config -Raw -Encoding UTF8) } catch { return '' }
-    }
-    return ''
+    return (Read-TextFileSmart $Paths.Config)
 }
 
 function Test-ConfigDirty {
@@ -3287,7 +3339,7 @@ function Restore-Backup {
     if ($Name -notmatch '^caddyfile-\d{8}-\d{6}-\d{3}\.bak$') { return @{ ok = $false; message = 'Ung{ue}ltiger Name.' } }
     $full = Join-Path $Paths.Backups $Name
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { return @{ ok = $false; message = 'Sicherung nicht gefunden.' } }
-    $text = Get-Content -LiteralPath $full -Raw -Encoding UTF8
+    $text = Read-TextFileSmart $full
     $res = Write-CaddyfileAndReload -NewText $text -Reason 'restore'
     if ($res.ok) { $res.message = "Sicherung '$Name' wiederhergestellt. " + $res.message }
     return $res
