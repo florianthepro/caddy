@@ -57,9 +57,10 @@ if "%ADDINI%"=="1" (
     >>"%INI%" echo extension = pdo_mysql
     >>"%INI%" echo extension = sqlite3
     >>"%INI%" echo extension = pdo_sqlite
-    >>"%INI%" echo zend_extension = opcache
     >>"%INI%" echo opcache.enable = 1
 )
+if "%ADDINI%"=="1" if exist "C:\php\ext\php_opcache.dll" echo zend_extension = php_opcache.dll>>"%INI%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$i='C:\php\php.ini'; if ((Test-Path $i) -and -not (Test-Path 'C:\php\ext\php_opcache.dll')) { $c=Get-Content -Path $i; $n=$c -replace '^\s*zend_extension\s*=\s*(php_)?opcache(\.dll)?\s*$',';$0'; if (Compare-Object $c $n) { Copy-Item $i 'C:\caddy\backup\php.ini.bak' -Force; Set-Content -Path $i -Value $n } }"
 
 if exist "%CFG%" copy /y "%CFG%" "C:\caddy\backup\caddyfile.%TS%" >nul
 if exist "%CFG%" findstr /i /c:"404: Not Found" "%CFG%" >nul 2>&1 && move /y "%CFG%" "C:\caddy\backup\caddyfile.broken.%TS%" >nul
@@ -97,6 +98,7 @@ netsh advfirewall firewall add rule name="Caddy HTTP HTTPS" dir=in action=allow 
 
 powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -LocalPort 80,443 -EA SilentlyContinue | ForEach-Object { $p = Get-Process -Id $_.OwningProcess -EA SilentlyContinue; if ($p -and $p.ProcessName -ne 'caddy') { 'PORT ' + $_.LocalPort + ' BLOCKED BY ' + $p.ProcessName } } | Sort-Object -Unique"
 
+"%EXE%" fmt --overwrite "%CFG%" >nul 2>&1
 "%EXE%" validate --adapter caddyfile --config "%CFG%"
 if errorlevel 1 (
     echo CADDYFILE INVALID - NOT STARTED
