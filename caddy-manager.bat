@@ -2179,6 +2179,24 @@ function Write-WatchdogScript {
     Write-TextFile $Paths.Watchdog (($lines -join "`r`n") + "`r`n")
 }
 
+# Vor dem Loeschen wird die Aufgabe als XML weggeschrieben. Damit laesst sich
+# die alte Einrichtung notfalls von Hand zurueckholen:
+#   Register-ScheduledTask -TaskName "caddy start" -Xml (Get-Content datei.xml -Raw)
+function Backup-ScheduledTaskXml {
+    param([string]$Name)
+    try {
+        $xml = Export-ScheduledTask -TaskName $Name -ErrorAction Stop
+        if (-not $xml) { return $null }
+        if (-not (Test-Path -LiteralPath $Paths.Backups)) {
+            New-Item -ItemType Directory -Path $Paths.Backups -Force | Out-Null
+        }
+        $safe = ($Name -replace '[^A-Za-z0-9\.\-]', '_')
+        $file = $Paths.Backups + '\aufgabe-' + $safe + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.xml'
+        Write-TextFile $file ([string]$xml)
+        return $file
+    } catch { return $null }
+}
+
 function Remove-LegacyTasks {
     try { Clear-TaskCache } catch { }
     $removed = New-Object System.Collections.ArrayList
@@ -2186,6 +2204,8 @@ function Remove-LegacyTasks {
         try {
             $t = Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue
             if ($t) {
+                $saved = Backup-ScheduledTaskXml $n
+                if ($saved) { Write-Audit 'task.legacy.backup' $saved }
                 Stop-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue
                 Unregister-ScheduledTask -TaskName $n -Confirm:$false -ErrorAction Stop
                 [void]$removed.Add($n)
@@ -4249,7 +4269,11 @@ function Invoke-Fix {
 
         'remove-legacy' {
             $removed = Remove-LegacyTasks
-            return @{ ok = $true; message = "Entfernt: $($removed.Count) alte Aufgabe(n)." }
+            if ($removed.Count -eq 0) { return @{ ok = $true; message = 'Keine alten Aufgaben gefunden.' } }
+            return @{ ok = $true
+                      message = ("Entfernt: " + ($removed -join ', ') +
+                                 '. Eine Kopie liegt als XML unter manager\backups und laesst sich ' +
+                                 'mit Register-ScheduledTask zurueckholen.') }
         }
 
         'fix-admin' {
