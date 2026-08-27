@@ -12,6 +12,9 @@ Danach läuft der Webserver ohne die Datei weiter.
   `import`-Zeilen, eigene `storage`-Zeile, alles Unbekannte bleibt wörtlich erhalten.
 - Vorhandene Zertifikate werden nach `C:\caddy\data` übernommen, statt sie neu zu beantragen.
 - Alte Aufgaben aus der Handinstallation werden erkannt und ersetzt.
+- Läuft Caddy daneben schon als Dienst (nssm, WinSW), wird das gemeldet und lässt sich
+  unter *Sicherheit* anhalten — sonst streiten sich zwei Server um Port 80 und 443.
+  Gelöscht wird nichts, der vorherige Starttyp landet in `C:\caddy\manager\backups`.
 
 ## Oberfläche
 
