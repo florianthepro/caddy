@@ -3177,8 +3177,10 @@ function Get-SecurityFindings {
     if (@($foreign.services).Count -gt 0) {
         $txt = (@($foreign.services | ForEach-Object { $_.display + ' (' + $_.state + ')' }) -join ', ')
         [void]$f.Add((New-Finding 'bad' 'Caddy laeuft zusaetzlich als Windows-Dienst' `
-            ("Gefunden: $txt. Dienst und geplante Aufgabe starten denselben Server doppelt. " +
-             'Bitte einen der beiden Wege abschalten - der Manager fasst fremde Dienste nicht an.')))
+            ("Gefunden: $txt. Zwei Server streiten sich dann um Port 80 und 443, einer von " +
+             'beiden startet nicht. Die Schaltfl{ae}che h{ae}lt den Dienst an und stellt ihn auf ' +
+             '"Manuell" - gel{oe}scht wird nichts, der vorherige Starttyp landet in manager\backups.') `
+            'suspend-service' 'Dienst anhalten'))
     }
     $fremd = @($foreign.tasks | Where-Object { $LegacyTaskNames -notcontains ($_.name -replace '^\\', '') })
     if ($fremd.Count -gt 0) {
@@ -3507,6 +3509,64 @@ function Get-ForeignSetup {
     $script:ForeignCache = @{ services = @($services.ToArray()); tasks = @($tasks.ToArray()) }
     $script:ForeignCacheAt = Get-Date
     return $script:ForeignCache
+}
+
+function Suspend-ForeignServices {
+    # Haelt fremde Caddy-Dienste an (nssm, WinSW, sc create) und stellt sie auf
+    # Starttyp "Manuell". Der Dienst bleibt bestehen, nur das automatische
+    # Starten hoert auf - sonst streiten sich zwei Server um Port 80 und 443.
+    $foreign = Get-ForeignSetup
+    $svc = @($foreign.services)
+    if ($svc.Count -eq 0) { return @{ ok = $true; message = 'Kein fremder Caddy-Dienst gefunden.' } }
+
+    $done = New-Object System.Collections.ArrayList
+    $fail = New-Object System.Collections.ArrayList
+    $note = New-Object System.Collections.ArrayList
+    foreach ($s in $svc) {
+        $name = [string]$s.name
+        try {
+            $before = 'Auto'
+            try {
+                $ci = Get-CimInstance -ClassName Win32_Service -Filter ("Name='" + ($name -replace "'", "''") + "'") -ErrorAction Stop
+                if ($ci) { $before = [string]$ci.StartMode }
+            } catch { }
+            [void]$note.Add($name + "`t" + $before + "`t" + [string]$s.path)
+            Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $name -StartupType Manual -ErrorAction Stop
+            [void]$done.Add($name)
+        } catch {
+            [void]$fail.Add($name + ' (' + $_.Exception.Message + ')')
+        }
+    }
+
+    # Wie es vorher war, wird mitgeschrieben - sonst laesst sich das nicht
+    # zurueckdrehen, wenn der alte Dienst doch noch gebraucht wird.
+    $file = ''
+    if ($note.Count -gt 0) {
+        try {
+            if (-not (Test-Path -LiteralPath $Paths.Backups)) {
+                New-Item -ItemType Directory -Path $Paths.Backups -Force | Out-Null
+            }
+            $file = $Paths.Backups + '\dienste-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.txt'
+            $head = @('# Name / vorheriger Starttyp / Programm, durch Tabulator getrennt',
+                      '# Zurueckstellen: Set-Service -Name <Name> -StartupType <Starttyp>',
+                      '')
+            Write-TextFile $file (($head + @($note.ToArray())) -join "`r`n")
+        } catch { $file = '' }
+    }
+
+    Clear-StatusCache
+    $script:ForeignCache = $null
+    Write-Audit 'service.suspend' ('ok=' + $done.Count + ' fail=' + $fail.Count)
+
+    if ($done.Count -eq 0) {
+        return @{ ok = $false; message = ('Kein Dienst liess sich anhalten: ' + (@($fail.ToArray()) -join ', ')) }
+    }
+    $msg = 'Angehalten und auf "Manuell" gestellt: ' + (@($done.ToArray()) -join ', ') + '.'
+    if ($file) { $msg += ' Der vorherige Starttyp steht in ' + (Split-Path -Leaf $file) + '.' }
+    if ($fail.Count -gt 0) { $msg += ' Nicht geklappt hat: ' + (@($fail.ToArray()) -join ', ') + '.' }
+    $msg += ' Jetzt den Server hier starten.'
+    return @{ ok = $true; message = $msg }
 }
 
 function Get-MissingSiteRoots {
@@ -4332,6 +4392,8 @@ function Invoke-Fix {
 
         'create-roots' { return (New-MissingSiteRoots $cfg) }
 
+        'suspend-service' { return (Suspend-ForeignServices) }
+
         'harden-acl' {
             $r = Protect-AllInstallDirectories
             Clear-StatusCache
@@ -4949,7 +5011,8 @@ document.addEventListener("click",async ev=>{
       "setup-all":"Vollst{ae}ndige Einrichtung...","setup-tasks":"Aufgaben...",
       "setup-firewall":"Firewall...","setup-caddy-update":"Caddy wird aktualisiert...",
       "harden-runas":"Wird umgestellt...","create-roots":"Verzeichnisse werden angelegt...",
-      "harden-sites":"Wird angepasst...","php-ini":"php.ini wird geschrieben..."};
+      "harden-sites":"Wird angepasst...","php-ini":"php.ini wird geschrieben...",
+      "suspend-service":"Dienst wird angehalten...","remove-legacy":"Aufgaben werden entfernt..."};
     const r=await api("/api/fix",{id:x},FM[x]||"...");toast(r.message,r.ok?"ok":"bad");
     await refresh();if(view==="sec")vSec($("#vw"));else draw();return;}
   if(a==="imp"){if(!confirm("Caddyfile einlesen? Die Domainliste wird ersetzt."))return;
