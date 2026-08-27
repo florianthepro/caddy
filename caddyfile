@@ -3,9 +3,23 @@
 .\caddy.exe run --config .\Caddyfile
 ```
 ```
-example.com, *.example.com {
-    root * C:/caddy/www/{http.request.host}
+{
+    florianthepro@icloud.com
+}
+
+ftpcraft.com {
+    root * C:/caddy/www/ftpcraft.com
     encode gzip zstd
     file_server
+}
+
+buergerabstimmung.org {
+    root * C:/caddy/www/2.example.com
+    encode gzip zstd
+    file_server
+}
+
+gitea.getitsec.com {
+    reverse_proxy 127.0.0.1:3000
 }
 ```
