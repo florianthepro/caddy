@@ -31,6 +31,10 @@ Refresh # use if updatet the caddyfile
 ```
 "C:\caddy\caddy.exe" reload --config "C:\caddy\caddyfile"
 ```
+Check Watchdog
+```
+schtasks /query /tn "caddy watchdog" /v /fo list
+```
 
 ## PHP
 
