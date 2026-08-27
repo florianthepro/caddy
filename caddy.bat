@@ -16,7 +16,9 @@ for /f %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss
 
 for %%D in ("C:\caddy" "C:\caddy\www" "C:\caddy\data" "C:\caddy\logs" "C:\caddy\backup" "C:\php") do if not exist "%%~D" mkdir "%%~D"
 
-for %%T in ("caddy start" "caddy watchdog" "caddy reload" "php fastcgi" "php watchdog") do schtasks /change /tn %%T /disable >nul 2>&1
+for %%T in ("caddy agent" "caddy start" "caddy watchdog" "caddy reload" "php fastcgi" "php watchdog") do schtasks /change /tn %%T /disable >nul 2>&1
+schtasks /end /tn "caddy agent" >nul 2>&1
+powershell -NoProfile -Command "Start-Sleep -Seconds 3"
 if exist "%EXE%" "%EXE%" stop >nul 2>&1
 taskkill /F /IM caddy.exe >nul 2>&1
 taskkill /F /IM php-cgi.exe >nul 2>&1
@@ -108,23 +110,29 @@ if "%DNSON%"=="0" powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='C:
 set "DNSSTATE=OFF"
 findstr /c:"import C:/caddy/dns.caddyfile" "%CFG%" >nul 2>&1 && set "DNSSTATE=ON"
 
->"%WD%" echo $ErrorActionPreference = 'SilentlyContinue'
->>"%WD%" echo $env:PHP_FCGI_MAX_REQUESTS = '0'
->>"%WD%" echo $exe = 'C:\caddy\caddy.exe'
->>"%WD%" echo $cfg = 'C:\caddy\caddyfile'
->>"%WD%" echo $hsh = 'C:\caddy\data\caddyfile.sha256'
->>"%WD%" echo if (-not (Get-Process -Name php-cgi)) { Start-Process -FilePath 'C:\php\php-cgi.exe' -ArgumentList '-b','127.0.0.1:9000' -WorkingDirectory 'C:\php' -WindowStyle Hidden }
->>"%WD%" echo if (-not (Test-Path $cfg)) { exit }
->>"%WD%" echo $new = (Get-FileHash -Path $cfg -Algorithm SHA256).Hash
->>"%WD%" echo $old = ''
->>"%WD%" echo if (Test-Path $hsh) { $old = (Get-Content -Path $hsh -Raw).Trim() }
->>"%WD%" echo $run = Get-Process -Name caddy
->>"%WD%" echo if (-not $run) { Start-Process -FilePath $exe -ArgumentList 'run','--adapter','caddyfile','--config',$cfg -WorkingDirectory 'C:\caddy' -WindowStyle Hidden; Start-Sleep -Seconds 3; Set-Content -Path $hsh -Value $new }
->>"%WD%" echo if ($run -and ($new -ne $old)) { Start-Process -FilePath $exe -ArgumentList 'reload','--adapter','caddyfile','--config',$cfg -WorkingDirectory 'C:\caddy' -WindowStyle Hidden -Wait; Set-Content -Path $hsh -Value $new }
+if not exist "C:\caddy\panel" mkdir "C:\caddy\panel"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue';[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;$b='https://raw.githubusercontent.com/florianthepro/caddy/';foreach($f in @(,@('agent.ps1','C:\caddy\agent.ps1','Invoke-Reconcile'))+@(,@('panel/index.php','C:\caddy\panel\index.php','Caddy Panel'))){foreach($r in @('main','claude/caddy-setup-bat-php-lv4i7c')){try{$t=$f[1]+'.new';Invoke-WebRequest -Uri ($b+$r+'/'+$f[0]) -OutFile $t -UseBasicParsing -TimeoutSec 60;if(([IO.File]::ReadAllText($t)).Contains($f[2])){Move-Item $t $f[1] -Force;break}else{Remove-Item $t -Force}}catch{}}}"
+if not exist "C:\caddy\agent.ps1" (echo AGENT DOWNLOAD FAILED & pause & exit /b 1)
+del /q "%WD%" >nul 2>&1
+del /q "C:\caddy\data\caddyfile.sha256" >nul 2>&1
+
+if not exist "C:\caddy\sites.caddyfile" (
+    >"C:\caddy\sites.caddyfile" echo http://127.0.0.1:8080 {
+    >>"C:\caddy\sites.caddyfile" echo     root * C:/caddy/panel
+    >>"C:\caddy\sites.caddyfile" echo     php_fastcgi 127.0.0.1:9000
+    >>"C:\caddy\sites.caddyfile" echo     file_server
+    >>"C:\caddy\sites.caddyfile" echo }
+)
+copy /y "%CFG%" "C:\caddy\backup\caddyfile.presites" >nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='C:\caddy\caddyfile';$c=[IO.File]::ReadAllText($p);if($c -notmatch 'import\s+C:/caddy/sites\.caddyfile'){$n=[char]10;[IO.File]::WriteAllText($p,$c.TrimEnd()+$n+$n+'import C:/caddy/sites.caddyfile'+$n)}"
+"%EXE%" validate --adapter caddyfile --config "%CFG%" >nul 2>&1 || copy /y "C:\caddy\backup\caddyfile.presites" "%CFG%" >nul
+
+>"C:\caddy\panel.bat" echo @echo off
+>>"C:\caddy\panel.bat" echo start "" http://127.0.0.1:8080
 
 for %%T in ("caddy start" "caddy watchdog" "caddy reload" "php fastcgi" "php watchdog") do schtasks /delete /tn %%T /f >nul 2>&1
-schtasks /create /tn "caddy start" /sc onstart /ru SYSTEM /rl HIGHEST /tr "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\caddy\watchdog.ps1" /f >nul
-schtasks /create /tn "caddy watchdog" /sc minute /mo 5 /ru SYSTEM /rl HIGHEST /tr "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\caddy\watchdog.ps1" /f >nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$a=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\caddy\agent.ps1';$t=New-ScheduledTaskTrigger -AtStartup;$p=New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest;$g=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew;Register-ScheduledTask -TaskName 'caddy agent' -Action $a -Trigger $t -Principal $p -Settings $g -Force | Out-Null"
+schtasks /query /tn "caddy agent" >nul 2>&1 || schtasks /create /tn "caddy agent" /sc onstart /ru SYSTEM /rl HIGHEST /tr "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\caddy\agent.ps1" /f >nul
 
 netsh advfirewall firewall delete rule name="Caddy HTTP HTTPS" >nul 2>&1
 netsh advfirewall firewall add rule name="Caddy HTTP HTTPS" dir=in action=allow protocol=TCP localport=80,443 >nul
@@ -142,8 +150,8 @@ if errorlevel 1 (
 )
 
 copy /y "%CFG%" "C:\caddy\backup\caddyfile.good" >nul
-del /q "C:\caddy\data\caddyfile.sha256" >nul 2>&1
-schtasks /run /tn "caddy watchdog" >nul
+taskkill /F /IM caddy.exe >nul 2>&1
+schtasks /run /tn "caddy agent" >nul
 powershell -NoProfile -Command "Start-Sleep -Seconds 10"
 
 tasklist /FI "IMAGENAME eq caddy.exe" | find /I "caddy.exe" >nul && echo CADDY RUNNING || echo CADDY NOT RUNNING
@@ -151,6 +159,7 @@ tasklist /FI "IMAGENAME eq php-cgi.exe" | find /I "php-cgi.exe" >nul && echo PHP
 "%EXE%" version
 "C:\php\php-cgi.exe" -v
 echo DNS MANAGEMENT %DNSSTATE%
+echo PANEL http://127.0.0.1:8080 - C:\caddy\panel.bat
 
 endlocal
 pause
