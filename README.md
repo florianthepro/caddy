@@ -25,7 +25,7 @@ schtasks /create /tn "caddy start" /sc onstart /ru SYSTEM /rl HIGHEST /tr "C:\ca
 schtasks /end /tn "caddy start"
 ```
 ```
-schtasks /end /tn "caddy start"
+schtasks /run /tn "caddy start"
 ```
 
 Manuelly
