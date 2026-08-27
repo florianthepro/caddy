@@ -119,7 +119,30 @@ function T {
 # ---------------------------------------------------------------------------
 $Root = $env:CADDY_MANAGER_ROOT
 if ([string]::IsNullOrWhiteSpace($Root)) { $Root = 'C:\caddy' }
-$Root = $Root.TrimEnd('\')
+$Root = $Root.Trim().Replace('/', '\').TrimEnd('\')
+
+# Dieser Wert ist spaeter das Ziel von "icacls <Pfad> /inheritance:d /T" und
+# "/remove:g ... /T". Ein Laufwerksstamm oder C:\Windows darf hier nicht
+# durchrutschen - das wuerde reihenweise Rechte im System umschreiben. Die
+# Pruefung steht hier oben, weil $Paths gleich danach daraus gebaut wird;
+# Resolve-LocalPath ist an dieser Stelle noch nicht definiert.
+# $IsWindows gibt es erst ab PowerShell 6. Fehlt die Variable, laeuft
+# Windows PowerShell 5.1 - also Windows.
+$OnWindows = (($null -eq (Get-Variable -Name IsWindows -ErrorAction SilentlyContinue)) -or $IsWindows)
+$RootFallback = ''
+$rootUpper = $Root.ToUpper()
+if ($OnWindows -and (
+    $Root -notmatch '^[A-Za-z]:\\[^\\]' -or
+    $Root -match '(^|\\)\.\.($|\\)' -or
+    $Root -match '[*?"<>|]' -or
+    $Root.Length -gt 200 -or
+    $rootUpper -like 'C:\WINDOWS*' -or
+    $rootUpper -like 'C:\PROGRAM FILES*' -or
+    $rootUpper -eq 'C:\USERS' -or
+    $rootUpper -eq 'C:\PROGRAMDATA')) {
+    $RootFallback = $Root
+    $Root = 'C:\caddy'
+}
 
 $Paths = [ordered]@{
     Root      = $Root
@@ -134,7 +157,11 @@ $Paths = [ordered]@{
     Audit     = "$Root\manager\manager.log"
     Watchdog  = "$Root\manager\watchdog.ps1"
     Lock      = "$Root\manager\manager.pid"
-    Staging   = "$Root\manager\caddyfile.staged"
+    # Die Zwischendatei liegt bewusst neben der echten Caddyfile und nicht unter
+    # manager\. Caddy loest "import sites/a.conf" relativ zur geprueften Datei
+    # auf; ein Verzeichnis tiefer scheitert jeder Import und damit jedes
+    # Uebernehmen - auch wenn die Datei am echten Ort gueltig waere.
+    Staging   = "$Root\caddyfile.staged"
     Php       = 'C:\php'
     PhpExe    = 'C:\php\php-cgi.exe'
     PhpIni    = 'C:\php\php.ini'
@@ -470,6 +497,9 @@ function Resolve-LocalPath {
     if ($v.Length -gt 240) { return $null }
     if ($v -match '[*?"<>|]') { return $null }
     if ($v -match '(^|\\)\.\.($|\\)') { return $null }
+    # Netzwerkpfade sind zulaessig - Caddy liefert von \\server\freigabe aus,
+    # und wer seine Seiten dort liegen hat, soll sie behalten duerfen.
+    if ($v -match '^\\\\[^\\]+\\[^\\]+') { return $v.TrimEnd('\') }
     if ($v -notmatch '^[A-Za-z]:\\') { return $null }
     $v = $v.TrimEnd('\')
     if ($v -match '^[A-Za-z]:$') { return $null }
@@ -510,8 +540,18 @@ function Test-BalancedBraces {
     $inQuote = $false
     $prev = ''
     foreach ($ch in $Text.ToCharArray()) {
-        if ($ch -eq '"' -and $prev -ne '\') { $inQuote = -not $inQuote }
-        elseif (-not $inQuote) {
+        # Caddy beginnt eine Zeichenkette nur am Wortanfang. Ein " mitten im
+        # Wort ist ein gewoehnliches Zeichen. Wer jedes " umschaltet, laesst
+        # sich mit einer Zeile wie  header X-A a"b  aus dem Block schreiben:
+        # die Klammerzaehlung geht auf, obwohl der Block laengst verlassen ist.
+        if ($ch -eq '"' -and $prev -ne '\') {
+            if ($inQuote) { $inQuote = $false; $prev = [string]$ch; continue }
+            if ($prev -eq '' -or $prev -eq ' ' -or $prev -eq "`t" -or
+                $prev -eq "`n" -or $prev -eq "`r") {
+                $inQuote = $true; $prev = [string]$ch; continue
+            }
+        }
+        if (-not $inQuote) {
             if ($ch -eq '{') { $depth++ }
             elseif ($ch -eq '}') { $depth--; if ($depth -lt 0) { return $false } }
         }
@@ -1271,7 +1311,16 @@ function Split-CaddyStatements {
     $prev = ''
     for ($i = 0; $i -lt $chars.Length; $i++) {
         $ch = $chars[$i]
-        if ($ch -eq '"' -and $prev -ne '\') { $inQuote = -not $inQuote }
+        # Dieselbe Regel wie in Test-BalancedBraces: ein " beginnt nur am
+        # Wortanfang eine Zeichenkette.
+        if ($ch -eq '"' -and $prev -ne '\') {
+            if ($inQuote) {
+                $inQuote = $false
+            } elseif ($prev -eq '' -or $prev -eq ' ' -or $prev -eq "`t" -or
+                      $prev -eq "`n" -or $prev -eq "`r") {
+                $inQuote = $true
+            }
+        }
         if (-not $inQuote) {
             if ($ch -eq '{') {
                 # Ein Blockanfang steht immer am Zeilenende. Alles andere ist
@@ -1358,7 +1407,14 @@ function Read-SiteDirectives {
             'root' {
                 $p = $(if ($tk.Count -ge 3 -and $tk[1] -eq '*') { $tk[2] } elseif ($tk.Count -ge 2) { $tk[1] } else { '' })
                 $rp = Resolve-LocalPath $p
-                if ($rp) { $Site.root = $rp }
+                if ($rp) {
+                    $Site.root = $rp
+                } elseif ($p) {
+                    # Nicht verstandene Pfade - etwa relative wie ./public - duerfen
+                    # nicht stillschweigend durch www\<domain> ersetzt werden. Der
+                    # Importer meldet sie, damit der Pfad nicht unbemerkt umzieht.
+                    $Site['rootUnresolved'] = (Get-SafeString $p 120)
+                }
             }
             'encode' { $Site.encode = $true }
             'file_server' {
@@ -1377,9 +1433,15 @@ function Read-SiteDirectives {
                 # Anzahl und Startport aus der vorhandenen Zeile uebernehmen. Sonst
                 # wuerden aus einem laufenden PHP-Prozess stillschweigend vier, und
                 # drei davon liefen ins Leere, bis die Einrichtung nachgezogen hat.
+                # localhost und die blosse :port-Schreibweise sind genauso
+                # verbreitet wie 127.0.0.1 und meinen dasselbe Ziel.
                 $pports = New-Object System.Collections.ArrayList
+                $ziele = 0
                 foreach ($u in ($tk | Select-Object -Skip 1)) {
-                    if ($u -match '^127\.0\.0\.1:(\d{2,5})$') { [void]$pports.Add([int]$Matches[1]) }
+                    if ($u -match '^(127\.0\.0\.1|localhost|\[::1\])?:(\d{2,5})$') {
+                        [void]$pports.Add([int]$Matches[2])
+                        $ziele++
+                    } elseif ($u -notmatch '^\{') { $ziele++ }
                 }
                 if ($pports.Count -gt 0) {
                     $sorted = @($pports.ToArray() | Sort-Object)
@@ -1387,6 +1449,11 @@ function Read-SiteDirectives {
                         $Config.php.poolSize = $sorted.Count
                         $Config.php.basePort = $sorted[0]
                     }
+                } elseif ($ziele -gt 0 -and $Config.php.poolSize -lt 1) {
+                    # Ein Ziel war da, nur nicht in einer Form, die wir kennen -
+                    # dann lieber ein Prozess als vier, von denen drei ins Leere
+                    # zeigen.
+                    $Config.php.poolSize = 1
                 }
                 Read-HandlerOptions $d $Site
             }
@@ -1518,6 +1585,16 @@ function Import-Caddyfile {
     # Vorgabe, falls die Datei keine Angabe enthielt.
     $cfg.php.poolSize = 0
     $clean = Remove-CaddyComments $Text
+    # Eine nicht geschlossene Klammer wuerde alle folgenden Seiten verschlucken,
+    # ohne dass etwas fehlt - der Rest liegt danach im Rumpf des offenen Blocks
+    # und wird nie ausgewertet. Lieber gar nicht einlesen als die Haelfte.
+    if (-not (Test-BalancedBraces $clean)) {
+        return [pscustomobject]@{
+            config = $null; imported = 0; skipped = @()
+            error = ('Die Datei hat eine geschweifte Klammer, die nicht geschlossen wird. ' +
+                     'Sie wurde nicht eingelesen, damit keine Seiten stillschweigend ' +
+                     'verlorengehen. Bitte die Klammern pr{ue}fen.') }
+    }
     $statements = Split-CaddyStatements $clean
     $sites = New-Object System.Collections.ArrayList
     $skipped = New-Object System.Collections.ArrayList
@@ -1609,6 +1686,12 @@ function Import-Caddyfile {
         $extraLines = New-Object System.Collections.ArrayList
         Read-SiteDirectives (Split-CaddyStatements $st.body) $site $extraLines $cfg 0
 
+        if ($site.Contains('rootUnresolved')) {
+            [void]$skipped.Add($addresses[0] + ': root ' + $site['rootUnresolved'] +
+                               ' nicht verstanden, es wird ' + $Paths.Www + '\' +
+                               (Get-HostLabel $addresses[0]) + ' eingetragen')
+        }
+
         $joined = ($extraLines.ToArray() -join "`n")
         if (Test-BalancedBraces $joined) { $site.extra = $joined }
         $cleanSite = ConvertTo-CleanSite $site
@@ -1621,7 +1704,8 @@ function Import-Caddyfile {
     if ($joinedSnippets.Length -le 16000 -and (Test-BalancedBraces $joinedSnippets)) {
         $cfg.global.snippets = $joinedSnippets
     }
-    return [pscustomobject]@{ config = $cfg; imported = $sites.Count; skipped = @($skipped.ToArray()) }
+    return [pscustomobject]@{ config = $cfg; imported = $sites.Count
+                              skipped = @($skipped.ToArray()); error = '' }
 }
 
 # ===========================================================================
@@ -1688,6 +1772,11 @@ function Initialize-Directories {
             [void]$created.Add($p)
         }
     }
+    # Ein Ordner direkt unter C:\ erbt von dort "Aendern" fuer alle angemeldeten
+    # Benutzer. Dort landen caddy.exe und watchdog.ps1, beide laufen als SYSTEM -
+    # das muss abgestellt sein, bevor das erste Programm hineinkopiert wird und
+    # nicht erst, wenn jemand in der Sicherheitsansicht darauf klickt.
+    Protect-InstallDirectory $Paths.Root | Out-Null
     return @{ ok = $true; message = "Verzeichnisse bereit ($($created.Count) neu angelegt)"; created = @($created.ToArray()) }
 }
 
@@ -1792,7 +1881,7 @@ function Install-Caddy {
         return @{ ok = $true; message = "Caddy $newVer ist bereits aktuell."; version = $newVer; changed = $false }
     }
 
-    $wasRunning = [bool](Get-Process -Name caddy -ErrorAction SilentlyContinue)
+    $wasRunning = [bool](Get-CaddyProcess)
     if ($wasRunning) { Stop-CaddyServer | Out-Null }
 
     try {
@@ -1923,6 +2012,10 @@ function Install-Php {
     Stop-PhpPool | Out-Null
     try {
         if (-not (Test-Path -LiteralPath $Paths.Php)) { New-Item -ItemType Directory -Path $Paths.Php -Force | Out-Null }
+        # Vor dem Entpacken haerten: php-cgi.exe wird spaeter von einer Aufgabe
+        # als SYSTEM gestartet, der Ordner darf also nicht fuer jeden angemeldeten
+        # Benutzer beschreibbar sein.
+        Protect-InstallDirectory $Paths.Php | Out-Null
         $old = $ProgressPreference
         $ProgressPreference = 'SilentlyContinue'
         try { Expand-Archive -LiteralPath $zip -DestinationPath $Paths.Php -Force } finally { $ProgressPreference = $old }
@@ -1937,6 +2030,9 @@ function Install-Php {
     }
 
     Set-PhpIni $Config | Out-Null
+    # Nach dem Entpacken noch einmal, damit die neuen Dateien mit erfasst sind
+    Protect-InstallDirectory $Paths.Php | Out-Null
+    Clear-StatusCache
     try { [Environment]::SetEnvironmentVariable('PHP_FCGI_MAX_REQUESTS', '0', 'Machine') } catch { }
     Write-Audit 'php.install' "version=$($info.version)"
     return @{ ok = $true; message = "PHP $($info.version) eingerichtet."; version = $info.version; changed = $true }
@@ -2157,6 +2253,19 @@ function Write-WatchdogScript {
         '$ErrorActionPreference = ''SilentlyContinue''',
         ('$taskPath = ''' + $TaskFolder + ''''),
         ('$phpPorts = ' + $portList),
+        ('$caddyExe = ''' + $Paths.Exe + ''''),
+        '',
+        '# Nur der eigene caddy.exe zaehlt. Laeuft daneben ein fremder - etwa aus',
+        '# einem nssm-Dienst - wuerde eine Pruefung ueber den Prozessnamen den',
+        '# eigenen Server nie wieder starten.',
+        'function Test-OwnCaddy {',
+        '    foreach ($p in @(Get-Process -Name caddy -ErrorAction SilentlyContinue)) {',
+        '        $path = ''''',
+        '        try { $path = [string]$p.Path } catch { }',
+        '        if ($path -and $path -ieq $caddyExe) { return $true }',
+        '    }',
+        '    return $false',
+        '}',
         '',
         'function Test-PortOpen([int]$Port) {',
         '    try {',
@@ -2176,7 +2285,7 @@ function Write-WatchdogScript {
         '    } catch { }',
         '}',
         '',
-        'if (-not (Get-Process -Name caddy -ErrorAction SilentlyContinue)) {',
+        'if (-not (Test-OwnCaddy)) {',
         ('    Start-ManagedTask ''' + $TaskServer + ''''),
         '}',
         '',
@@ -2253,6 +2362,11 @@ function Install-Automation {
         }
 
         $runAs = $Config.manager.runAs
+        # Erst die Rechte, dann die Aufgaben. Alles, was hier registriert wird,
+        # laeuft als SYSTEM bzw. LOCAL SERVICE; ein noch beschreibbarer Ordner
+        # waere zwischen diesen beiden Schritten ein offenes Scheunentor.
+        Protect-InstallDirectory $Paths.Root | Out-Null
+        if (Test-Path -LiteralPath $Paths.Php) { Protect-InstallDirectory $Paths.Php | Out-Null }
         Confirm-TaskFolder
         Write-WatchdogScript $Config
 
@@ -2292,6 +2406,7 @@ function Install-Automation {
             [void]$notes.Add('Watchdog eingerichtet, aber ohne Wiederholungstakt - er greift nur beim Hochfahren')
         }
 
+        Clear-StatusCache
         Write-Audit 'tasks.install' ("runAs=$runAs php=$($Config.php.enabled)")
         return @{ ok = $true; message = 'Automatischer Betrieb eingerichtet.'; notes = @($notes.ToArray()) }
     } catch {
@@ -2434,10 +2549,27 @@ function Invoke-Icacls {
     return (Invoke-Exe -FilePath "$env:SystemRoot\System32\icacls.exe" -Arguments $Arguments -TimeoutSec $TimeoutSec)
 }
 
+function Test-DirectoryHardened {
+    # Wahr, wenn der Ordner nichts mehr von C:\ erbt und keine zu weit gefasste
+    # Gruppe mehr schreiben darf. Ein Get-Acl auf einen Ordner, sonst nichts -
+    # billig genug, um es vor jedem icacls-Lauf zu fragen.
+    param([string]$Path)
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if (-not $acl.AreAccessRulesProtected) { return $false }
+    } catch { return $false }
+    return ((Get-WeakDirectoryAccess $Path).Count -eq 0)
+}
+
 function Protect-InstallDirectory {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
         return @{ ok = $true; message = "$Path gibt es nicht - nichts zu tun."; changed = $false }
+    }
+    # icacls /T laeuft ueber den ganzen Baum. Bei einem bereits abgesicherten
+    # Ordner waere das reine Last, deshalb hier der billige Vorabtest.
+    if (Test-DirectoryHardened $Path) {
+        return @{ ok = $true; message = "$Path war bereits abgesichert."; changed = $false }
     }
     $before = Get-WeakDirectoryAccess $Path
     try {
@@ -2487,6 +2619,24 @@ function Protect-AllInstallDirectories {
 # Erlaubt einem zusaetzlichen Konto das Bearbeiten der Webseiten-Dateien, ohne
 # dass es Administrator sein muss. Der Name wird zu einer SID aufgeloest und nur
 # diese landet im Aufruf - der Eingabetext selbst nie.
+function Test-SidIsGroup {
+    # Die Zusage der Oberflaeche lautet "ein einzelnes Konto". Ohne diese Pruefung
+    # kaeme auch DOMAENE\Domaenen-Benutzer durch - und Schreibrecht auf www heisst
+    # bei aktivem PHP Codeausfuehrung unter dem PHP-Dienstkonto.
+    param([string]$Sid)
+    if ($Sid -match '^S-1-5-32-\d+$') { return $true }                 # eingebaute Gruppen
+    if ($Sid -match '^S-1-1-0$') { return $true }                      # Jeder
+    if ($Sid -match '^S-1-5-(2|3|4|6|7|9|11|13|14|15|17|33)$') { return $true }
+    # Gruppen einer Domaene: 512 Domaenen-Admins, 513 Domaenen-Benutzer usw.
+    if ($Sid -match '^S-1-5-21-[\d-]+-(512|513|514|515|516|517|518|519|520|521|522|525|526|527|553|571|572)$') {
+        return $true
+    }
+    try {
+        if (Get-LocalGroup -SID $Sid -ErrorAction Stop) { return $true }
+    } catch { }
+    return $false
+}
+
 function Grant-WwwAccess {
     param([string]$Account)
     $a = Get-SafeString $Account 104
@@ -2500,8 +2650,11 @@ function Grant-WwwAccess {
     } catch {
         return @{ ok = $false; message = "Das Konto '$a' gibt es auf diesem Rechner nicht." }
     }
-    if ($WeakSids -contains $sid) {
-        return @{ ok = $false; message = 'Das waere eine Gruppe, die jeden einschliesst. Bitte ein einzelnes Konto angeben.' }
+    if ($WeakSids -contains $sid -or (Test-SidIsGroup $sid)) {
+        return @{ ok = $false
+                  message = ("'$a' ist eine Gruppe. Schreibrecht auf die Webseiten heisst bei aktivem PHP, " +
+                             'dass jedes Mitglied Code unter dem PHP-Dienstkonto ausf{ue}hren kann. ' +
+                             'Bitte ein einzelnes Konto angeben.') }
     }
     if (-not (Test-Path -LiteralPath $Paths.Www)) {
         return @{ ok = $false; message = 'Das Webseiten-Verzeichnis gibt es noch nicht.' }
@@ -2542,7 +2695,27 @@ function Get-PortOwner {
     } catch { return $null }
 }
 
+function Get-OwnCaddyProcesses {
+    # Nur Prozesse aus unserem eigenen Verzeichnis. Ein fremder caddy.exe -
+    # etwa aus einem nssm- oder WinSW-Dienst - darf hier weder als Erfolg
+    # zaehlen noch abgeschossen werden. Der Vergleich ueber den Namen allein
+    # liess beides zu.
+    $own = New-Object System.Collections.ArrayList
+    foreach ($p in @(Get-Process -Name caddy -ErrorAction SilentlyContinue)) {
+        $path = ''
+        try { $path = [string]$p.Path } catch { }
+        if ($path -and $path -ieq $Paths.Exe) { [void]$own.Add($p) }
+    }
+    return ,@($own.ToArray())
+}
+
 function Get-CaddyProcess {
+    $own = Get-OwnCaddyProcesses
+    if ($own.Count -gt 0) { return $own[0] }
+    return $null
+}
+
+function Get-AnyCaddyProcess {
     return (Get-Process -Name caddy -ErrorAction SilentlyContinue | Select-Object -First 1)
 }
 
@@ -2605,10 +2778,10 @@ function Stop-CaddyServer {
         try { Stop-ScheduledTask -TaskPath $TaskFolder -TaskName $TaskServer -ErrorAction SilentlyContinue } catch { }
         Start-Sleep -Milliseconds 600
     }
-    $p = Get-CaddyProcess
-    if ($p) {
-        try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; Start-Sleep -Milliseconds 400 } catch { }
+    foreach ($p in (Get-OwnCaddyProcesses)) {
+        try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch { }
     }
+    Start-Sleep -Milliseconds 400
     if (Get-CaddyProcess) { return @{ ok = $false; message = 'Caddy l{ae}uft weiterhin.' } }
     return @{ ok = $true; message = 'Caddy gestoppt.' }
 }
@@ -2624,19 +2797,35 @@ function Start-PhpPool {
     if (-not $Config.php.enabled) { return @{ ok = $true; message = 'PHP ist nicht aktiviert.' } }
     if (-not (Test-Path -LiteralPath $Paths.PhpExe)) { return @{ ok = $false; message = 'PHP ist nicht installiert.' } }
     $started = 0
+    $fehler = New-Object System.Collections.ArrayList
     for ($i = 0; $i -lt $Config.php.poolSize; $i++) {
         $port = $Config.php.basePort + $i
         if (Test-PortOpen -Port $port) { continue }
         $name = Get-PhpTaskName $port
         if (Get-TaskState $name) {
-            try { Start-ScheduledTask -TaskPath $TaskFolder -TaskName $name -ErrorAction Stop; $started++; continue } catch { }
+            # Ist die Aufgabe da, laeuft der Start nur ueber sie. Ersatzweise
+            # unter dem angemeldeten Administrator zu starten waere ein stiller
+            # Rechteausbruch - genau wie in Start-CaddyServer.
+            try { Start-ScheduledTask -TaskPath $TaskFolder -TaskName $name -ErrorAction Stop; $started++ }
+            catch { [void]$fehler.Add("$name : $($_.Exception.Message)") }
+            continue
+        }
+        if ($Config.manager.runAs -ne 'SYSTEM') {
+            [void]$fehler.Add("$name : Aufgabe fehlt")
+            continue
         }
         try {
             Start-Process -FilePath $Paths.PhpExe -ArgumentList @('-b', ('127.0.0.1:' + $port)) -WindowStyle Hidden
             $started++
-        } catch { }
+        } catch { [void]$fehler.Add("$name : $($_.Exception.Message)") }
     }
     Start-Sleep -Milliseconds 900
+    if ($fehler.Count -gt 0) {
+        return @{ ok = $false
+                  message = ("PHP-Pool nur teilweise gestartet ($started). Offen: " +
+                             ((@($fehler.ToArray())) -join '; ') +
+                             '. Unter Einrichtung "Autostart" neu einrichten.') }
+    }
     return @{ ok = $true; message = "PHP-Pool gepr{ue}ft ($started gestartet)." }
 }
 
@@ -3426,16 +3615,21 @@ function New-PasswordHash {
     # Befehlszeile, die jeder lokale Benutzer auslesen kann.
     $r = Invoke-Exe -FilePath $Paths.Exe -Arguments @('hash-password') -TimeoutSec 60 -StdIn $Plain
     $hash = Find-BcryptLine (Get-ExeOutput $r)
-    if (-not $hash) {
-        # Aeltere Caddy-Ausgaben lesen nicht von der Standardeingabe
-        $r = Invoke-Exe -FilePath $Paths.Exe -Arguments @('hash-password', '--plaintext', $Plain) -TimeoutSec 60
-        $hash = Find-BcryptLine (Get-ExeOutput $r)
-    }
     if ($hash) {
         Write-Audit 'password.hash' 'Neuer Hash erzeugt'
         return @{ ok = $true; hash = $hash }
     }
-    return @{ ok = $false; message = 'Der Hash konnte nicht erzeugt werden.' }
+    # Frueher stand hier ein zweiter Versuch mit --plaintext. Der schreibt das
+    # Passwort in die Befehlszeile, wo es in der Prozessliste und im Ereignis
+    # 4688 steht - und er sprang auch bei Zeitueberschreitung oder Abbruch durch
+    # einen Virenschutz an, nicht nur bei einer alten Caddy-Fassung. Caddy liest
+    # hash-password seit Fassung 2.5 von der Standardeingabe.
+    if ($r.timedOut) {
+        return @{ ok = $false; message = 'Caddy hat beim Erzeugen des Hashs nicht geantwortet. Bitte erneut versuchen.' }
+    }
+    return @{ ok = $false
+              message = ('Der Hash konnte nicht erzeugt werden. Caddy meldet: ' +
+                         (Get-SafeString (Get-ExeOutput $r) 200)) }
 }
 
 # ===========================================================================
@@ -3956,6 +4150,7 @@ function Invoke-ApiRoute {
             $cfg.global.snippets = $snCheck
 
             $cfg.global.trustedProxies = Get-BoolField $data 'trustedProxies' $cfg.global.trustedProxies
+            $phpVorher = @($cfg.php.enabled, $cfg.php.poolSize)
             $cfg.php.enabled = Get-BoolField $data 'phpEnabled' $cfg.php.enabled
             $psz = 0
             if ([int]::TryParse((Get-StringField $data 'phpPoolSize' '4'), [ref]$psz) -and $psz -ge 1 -and $psz -le 16) {
@@ -3969,8 +4164,20 @@ function Invoke-ApiRoute {
             $cfg.manager.openBrowser = Get-BoolField $data 'openBrowser' $cfg.manager.openBrowser
 
             Save-Config $cfg
+            # Wer PHP hier einschaltet oder die Poolgroesse aendert, bekommt sonst
+            # keine Aufgaben dafuer - die Prozesse liefen dann beim naechsten
+            # Hochfahren gar nicht und beim Starten von Hand unter dem falschen Konto.
+            $hinweis = ''
+            if ($cfg.php.enabled -ne $phpVorher[0] -or $cfg.php.poolSize -ne $phpVorher[1]) {
+                if ($cfg.php.enabled -and -not (Test-Path -LiteralPath $Paths.PhpExe)) {
+                    $hinweis = ' PHP ist noch nicht installiert - unter Einrichtung nachholen.'
+                } else {
+                    $auto = Install-Automation $cfg
+                    $hinweis = $(if ($auto.ok) { ' Aufgaben angepasst.' } else { ' ' + $auto.message })
+                }
+            }
             Write-Audit 'settings.save'
-            Send-Json $Ctx @{ ok = $true; message = 'Einstellungen gespeichert.'; config = $cfg }
+            Send-Json $Ctx @{ ok = $true; message = ('Einstellungen gespeichert.' + $hinweis); config = $cfg }
             return
         }
 
@@ -4046,6 +4253,10 @@ function Invoke-ApiRoute {
             $live = Get-LiveCaddyfile
             if ($live.Trim()) {
                 $res = Import-Caddyfile $live
+                if ($res.error) {
+                    Send-Json $Ctx @{ ok = $false; message = $res.error } 400
+                    return
+                }
                 $new = $res.config
                 $new.mode = 'managed'
                 $new.manager = $cfg.manager
@@ -4073,6 +4284,10 @@ function Invoke-ApiRoute {
                 return
             }
             $res = Import-Caddyfile $live
+            if ($res.error) {
+                Send-Json $Ctx @{ ok = $false; message = $res.error } 400
+                return
+            }
             $new = $res.config
             $new.mode = 'managed'
             $new.manager = $cfg.manager
@@ -4275,13 +4490,17 @@ function Invoke-SetupStep {
             $live = Get-LiveCaddyfile
             if ($live.Trim() -and @($cfg.sites).Count -eq 0) {
                 $imp = Import-Caddyfile $live
-                $new = $imp.config
-                $new.mode = 'managed'
-                $new.manager = $cfg.manager
-                $script:Config = $new
-                $cfg = $new
-                Save-Config $cfg
-                [void]$notes.Add("$($imp.imported) Eintr{ae}ge aus der vorhandenen Caddyfile {ue}bernommen")
+                if ($imp.error) {
+                    [void]$notes.Add($imp.error)
+                } else {
+                    $new = $imp.config
+                    $new.mode = 'managed'
+                    $new.manager = $cfg.manager
+                    $script:Config = $new
+                    $cfg = $new
+                    Save-Config $cfg
+                    [void]$notes.Add("$($imp.imported) Eintr{ae}ge aus der vorhandenen Caddyfile {ue}bernommen")
+                }
             }
 
             if ($withPhp) {
@@ -4294,12 +4513,12 @@ function Invoke-SetupStep {
             $r = Set-FirewallRules
             [void]$notes.Add($r.message)
 
-            $r = Install-Automation $cfg
-            [void]$notes.Add($r.message)
-            foreach ($n in @($r.notes)) { [void]$notes.Add($n) }
-
             $acl = Protect-AllInstallDirectories
             [void]$notes.Add($acl.message)
+
+            $tasks = Install-Automation $cfg
+            [void]$notes.Add($tasks.message)
+            foreach ($n in @($tasks.notes)) { [void]$notes.Add($n) }
 
             $mig = Import-CertificateStore
             if ($mig.changed) { [void]$notes.Add($mig.message) }
@@ -4311,7 +4530,21 @@ function Invoke-SetupStep {
             $start = Start-CaddyServer
             [void]$notes.Add($start.message)
 
-            Write-Audit 'setup.all' ("php=$withPhp")
+            # Ein pauschales ok waere gelogen: ohne Aufgabe startet Caddy nicht
+            # unter dem vorgesehenen Konto, ohne gesetzte Rechte ist der Ordner
+            # offen, und eine nicht uebernommene Konfiguration bedient niemanden.
+            $probleme = New-Object System.Collections.ArrayList
+            if (-not $tasks.ok) { [void]$probleme.Add('Aufgaben') }
+            if (-not $acl.ok)   { [void]$probleme.Add('Dateirechte') }
+            if (-not $apply.ok) { [void]$probleme.Add('Konfiguration') }
+            if (-not $start.ok) { [void]$probleme.Add('Serverstart') }
+            Write-Audit 'setup.all' ("php=$withPhp offen=" + (@($probleme.ToArray()) -join '/'))
+            if ($probleme.Count -gt 0) {
+                return @{ ok = $false
+                          message = ('Einrichtung durchgelaufen, aber nicht vollst{ae}ndig. Offen: ' +
+                                     ((@($probleme.ToArray())) -join ', ') + '.')
+                          notes = @($notes.ToArray()) }
+            }
             return @{ ok = $true; message = 'Einrichtung abgeschlossen.'; notes = @($notes.ToArray()) }
         }
 
@@ -5083,6 +5316,13 @@ if (-not (Test-IsAdmin)) {
     Write-Host ''
 }
 
+if ($RootFallback) {
+    Write-Host2 ("  CADDY_MANAGER_ROOT ist auf '" + $RootFallback + "' gesetzt. Dorthin wird nicht") 'Yellow'
+    Write-Host2 '  eingerichtet - der Pfad muesste ein eigener Ordner auf einem Laufwerk sein.' 'DarkGray'
+    Write-Host2 '  Es wird C:\caddy verwendet.' 'DarkGray'
+    Write-Host ''
+}
+
 # --- Grundverzeichnisse, damit Konfiguration und Protokoll ablegbar sind ---
 try {
     Initialize-Directories | Out-Null
@@ -5128,10 +5368,14 @@ if ($firstRun) {
     if ($live.Trim()) {
         try {
             $imp = Import-Caddyfile $live
-            $Config = $imp.config
-            Write-Host2 ("  Bestehende Caddyfile gefunden: " + $imp.imported + " Eintr{ae}ge {ue}bernommen.") 'Green'
-            if (@($imp.skipped).Count -gt 0) {
-                Write-Host2 ("  Nicht eindeutig erkannt: " + ((@($imp.skipped)) -join ', ')) 'DarkYellow'
+            if ($imp.error) {
+                Write-Host2 ('  ' + $imp.error) 'DarkYellow'
+            } else {
+                $Config = $imp.config
+                Write-Host2 ("  Bestehende Caddyfile gefunden: " + $imp.imported + " Eintr{ae}ge {ue}bernommen.") 'Green'
+                if (@($imp.skipped).Count -gt 0) {
+                    Write-Host2 ("  Nicht eindeutig erkannt: " + ((@($imp.skipped)) -join ', ')) 'DarkYellow'
+                }
             }
             Write-Host ''
         } catch {
