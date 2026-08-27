@@ -62,6 +62,11 @@ Dazu `/` Suche, `n` neuer Eintrag, `Strg+K` Sprungliste mit Sofortsuche.
 
 ### Anbindung an die Schule
 
+* **Schulsuche in der Registrierung** - sucht im oeffentlichen WebUntis-Verzeichnis
+  nach Name oder Strasse und uebernimmt Server und Schulkuerzel. Aus der
+  Klassenbezeichnung (z.B. `2FS152`) leitet das Formular Ausbildungsjahr und
+  Zeitgruppe ab. Wer Zugangsdaten hinterlegt, kann die Klassenliste spaeter
+  direkt aus WebUntis abrufen (anonymer Zugriff ist dort meist gesperrt).
 * **Blockplan** - laedt das oeffentliche Archiv der BS FiSi
   ([Blockplaene](https://bsfisi.m-bildung.de/service/blockplaene)) und uebernimmt
   Blockwochen, Ferien und Schultermine fuer die eigene Zeitgruppe und

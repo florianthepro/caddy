@@ -160,7 +160,7 @@ function del(string $t, string $w, array $a = []): int { return q("DELETE FROM $
 function schema(PDO $pdo): void {
     $pdo->exec("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
     $v = (int)($pdo->query("SELECT v FROM meta WHERE k='schema'")->fetchColumn() ?: 0);
-    if ($v >= 2) { if ($v < 3) schema_v3($pdo); return; }
+    if ($v >= 2) { if ($v < 3) schema_v3($pdo); if ($v < 4) schema_v4($pdo); return; }
     $pdo->exec(<<<SQL
 CREATE TABLE users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -379,6 +379,16 @@ SQL);
     $pdo->exec("INSERT INTO meta (k,v) VALUES ('fts','" . $fts . "')
                 ON CONFLICT(k) DO UPDATE SET v='" . $fts . "'");
     $pdo->exec("INSERT INTO meta (k,v) VALUES ('schema','3') ON CONFLICT(k) DO UPDATE SET v='3'");
+    schema_v4($pdo);
+}
+/** v4: Schule aus dem WebUntis-Verzeichnis am Konto merken. */
+function schema_v4(PDO $pdo): void {
+    foreach (["ALTER TABLE users ADD COLUMN schule TEXT NOT NULL DEFAULT ''",
+              "ALTER TABLE users ADD COLUMN untis_server TEXT NOT NULL DEFAULT ''",
+              "ALTER TABLE users ADD COLUMN untis_schule TEXT NOT NULL DEFAULT ''"] as $sql) {
+        try { $pdo->exec($sql); } catch (Throwable $e) { /* schon da */ }
+    }
+    $pdo->exec("INSERT INTO meta (k,v) VALUES ('schema','4') ON CONFLICT(k) DO UPDATE SET v='4'");
 }
 function fts_trigger_sql(): array {
     $t = [];
@@ -1454,6 +1464,72 @@ function untis_hole(array $src, string $von, string $bis): array {
     return ['fehler' => '', 'termine' => $termine];
 }
 
+/** Oeffentliches WebUntis-Schulverzeichnis. Kein Konto noetig. */
+function untis_schulsuche(string $q): array {
+    $q = trim($q);
+    if (mb_strlen($q) < 3) return ['fehler' => 'Mindestens drei Zeichen.', 'schulen' => []];
+    $r = http_ruf('https://mobile.webuntis.com/ms/schoolquery2', ['timeout' => 15, 'json' =>
+        ['id' => '1', 'method' => 'searchSchool', 'params' => [['search' => mb_substr($q, 0, 80)]], 'jsonrpc' => '2.0']]);
+    if (!$r['ok']) return ['fehler' => $r['fehler'] ?: 'Verzeichnis nicht erreichbar.', 'schulen' => []];
+    $j = json_decode($r['body'], true);
+    if (!is_array($j)) return ['fehler' => 'Antwort unlesbar.', 'schulen' => []];
+    if (isset($j['error'])) {
+        $m = (string)($j['error']['message'] ?? 'Fehler');
+        return ['fehler' => $m === 'too many results' ? 'Zu viele Treffer, bitte genauer suchen.' : $m, 'schulen' => []];
+    }
+    $out = [];
+    foreach (($j['result']['schools'] ?? []) ?: [] as $x) {
+        if (empty($x['loginName']) || empty($x['server'])) continue;
+        $out[] = ['name' => trim(rtrim((string)($x['displayName'] ?? ''), '/ ')),
+            'ort' => (string)($x['address'] ?? ''),
+            'server' => (string)$x['server'], 'schule' => (string)$x['loginName']];
+    }
+    return ['fehler' => '', 'schulen' => array_slice($out, 0, 25)];
+}
+
+/** Klassenliste einer WebUntis-Quelle - braucht die hinterlegten Zugangsdaten. */
+function untis_klassen(array $src): array {
+    $server = rtrim(explode('/', preg_replace('~^https?://~', '', trim($src['server'])))[0], '/');
+    $pw = entschluesseln($src['secret']);
+    if ($server === '' || $src['schule'] === '' || $pw === null) return ['fehler' => 'Zugangsdaten unvollstaendig.', 'klassen' => []];
+    $url = 'https://' . $server . '/WebUntis/jsonrpc.do?school=' . rawurlencode($src['schule']);
+    $cookie = ''; $nr = 0;
+    $rpc = function (string $m, array $p = []) use ($url, &$cookie, &$nr) {
+        $r = http_ruf($url, ['timeout' => 20, 'cookie' => $cookie,
+            'json' => ['id' => (string)(++$nr), 'method' => $m, 'params' => $p ?: new stdClass(), 'jsonrpc' => '2.0']]);
+        if (!$r['ok']) return ['fehler' => $r['fehler'] ?: 'keine Antwort'];
+        if ($r['cookie'] !== '') $cookie = $r['cookie'];
+        $j = json_decode($r['body'], true);
+        if (!is_array($j)) return ['fehler' => 'Antwort unlesbar'];
+        if (isset($j['error'])) return ['fehler' => (string)($j['error']['message'] ?? 'Fehler')];
+        return ['result' => $j['result'] ?? null];
+    };
+    $a = $rpc('authenticate', ['user' => $src['benutzer'], 'password' => $pw, 'client' => APP_NAME]);
+    if (isset($a['fehler'])) return ['fehler' => 'Anmeldung: ' . $a['fehler'], 'klassen' => []];
+    if (empty($a['result']['sessionId'])) return ['fehler' => 'Anmeldung abgelehnt.', 'klassen' => []];
+    if (!str_contains($cookie, 'JSESSIONID')) $cookie = 'JSESSIONID=' . $a['result']['sessionId'];
+    $k = $rpc('getKlassen');
+    $rpc('logout');
+    if (isset($k['fehler'])) return ['fehler' => 'Klassen: ' . $k['fehler'], 'klassen' => []];
+    $out = [];
+    foreach (($k['result'] ?? []) ?: [] as $x) {
+        $n = trim((string)($x['name'] ?? ''));
+        if ($n !== '') $out[] = ['name' => $n, 'lang' => trim((string)($x['longName'] ?? ''))];
+    }
+    usort($out, fn($p, $r2) => strnatcasecmp($p['name'], $r2['name']));
+    return ['fehler' => '', 'klassen' => $out];
+}
+
+/** Aus einer Klassenbezeichnung wie 2FS152 Jahr und Zeitgruppe ableiten. */
+function klasse_zerlegen(string $k): array {
+    $k = trim($k);
+    $jahr = null; $zg = null;
+    if (preg_match('/^(\d)\s*[A-Za-z]{1,4}\s*\d*?(\d)$/', $k, $m)) { $jahr = (int)$m[1]; $zg = (int)$m[2]; }
+    elseif (preg_match('/^(\d)/', $k, $m)) $jahr = (int)$m[1];
+    if (preg_match('/(\d)\s*$/', $k, $m) && $zg === null) $zg = (int)$m[1];
+    return ['jahr' => $jahr, 'zeitgruppe' => $zg];
+}
+
 /** Holt eine Quelle und schreibt die Termine ins Konto. */
 function quelle_sync(array $src, array $u): array {
     $uid = (int)$u['id']; $sid = (int)$src['id'];
@@ -1996,7 +2072,7 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
 </head>
 <body>
 <?php if ($bare): ?>
-<div style="max-width:340px;margin:0 auto;padding:9vh 16px"><?= $inhalt ?></div>
+<div style="max-width:<?= !empty($o['breit']) ? '580' : '340' ?>px;margin:0 auto;padding:<?= !empty($o['breit']) ? '5' : '9' ?>vh 16px"><?= $inhalt ?></div>
 <?php else: ?>
 <div class="sc" data-nav="0"></div>
 <div class="app">
@@ -2120,6 +2196,64 @@ document.addEventListener('keydown',function(e){
  if(e.key==='n'){var a=document.querySelector('[data-new]');if(a){e.preventDefault();
   if(a.nodeName==='A')location.href=a.href;else a.focus();}}
 });
+// Schulsuche im WebUntis-Verzeichnis
+document.querySelectorAll('[data-schule]').forEach(function(box){
+ var inp=box.querySelector('input[name=schule]'), btn=box.querySelector('[data-schulsuche]'),
+     out=box.querySelector('[data-schultreffer]'), st=box.querySelector('[data-schulstatus]'),
+     hs=box.querySelector('input[name=untis_server]'), hk=box.querySelector('input[name=untis_schule]');
+ function suche(){
+  var q=(inp.value||'').trim();
+  if(q.length<3){out.innerHTML='';st.textContent='Mindestens drei Zeichen.';return;}
+  st.textContent='suche ...'; out.innerHTML='';
+  fetch(B+'?p=api&a=schule&q='+encodeURIComponent(q))
+   .then(function(r){return r.json();})
+   .then(function(j){
+     if(j.fehler){st.textContent=j.fehler;return;}
+     if(!j.schulen||!j.schulen.length){st.textContent='Nichts gefunden.';return;}
+     st.textContent=j.schulen.length+' Treffer';
+     out.innerHTML='<ul class="li" style="border:.5px solid var(--li2);border-radius:var(--r2);max-height:200px;overflow:auto">'
+      +j.schulen.map(function(x,i){return '<li data-i="'+i+'" style="cursor:pointer;padding:6px 10px">'
+       +'<span style="flex:1"><b>'+esc(x.name)+'</b><br><span class="sm mu2">'+esc(x.ort)+'</span></span></li>';}).join('')+'</ul>';
+     out.querySelectorAll('li').forEach(function(li){
+      li.addEventListener('click',function(){
+       var x=j.schulen[+li.dataset.i];
+       inp.value=x.name; hs.value=x.server; hk.value=x.schule;
+       out.innerHTML=''; st.textContent='WebUntis: '+x.schule+' · '+x.server;});});
+   }).catch(function(){st.textContent='Verzeichnis nicht erreichbar.';});}
+ if(btn)btn.addEventListener('click',suche);
+ if(inp)inp.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();suche();}});
+ if(inp)inp.addEventListener('input',function(){if(hs)hs.value='';if(hk)hk.value='';});
+});
+// Klassenbezeichnung -> Ausbildungsjahr und Zeitgruppe
+document.querySelectorAll('[data-klasse]').forEach(function(k){
+ var f=k.form; if(!f)return;
+ var j=f.querySelector('[data-kjahr]'), z=f.querySelector('[data-kzg]');
+ k.addEventListener('input',function(){
+  var v=k.value.trim(), m=v.match(/^(\d)\s*[A-Za-z]{1,4}\s*\d*?(\d)$/);
+  if(m){ if(j&&!j.dataset.hand)j.value=m[1]; if(z&&!z.dataset.hand)z.value=m[2]; }
+  else { var a=v.match(/^(\d)/), b=v.match(/(\d)\s*$/);
+   if(a&&j&&!j.dataset.hand)j.value=a[1]; if(b&&z&&!z.dataset.hand)z.value=b[1]; }});
+ [j,z].forEach(function(el){if(el)el.addEventListener('change',function(){el.dataset.hand='1';});});
+});
+// Klassen aus WebUntis holen
+document.querySelectorAll('[data-klassen]').forEach(function(btn){
+ btn.addEventListener('click',function(){
+  var ziel=document.querySelector(btn.dataset.klassen); if(!ziel)return;
+  ziel.textContent='lade ...';
+  fetch(B+'?p=api&a=klassen&id='+encodeURIComponent(btn.dataset.id))
+   .then(function(r){return r.json();})
+   .then(function(j){
+     if(j.fehler){ziel.textContent=j.fehler;return;}
+     if(!j.klassen||!j.klassen.length){ziel.textContent='Keine Klassen erhalten.';return;}
+     ziel.innerHTML='<div class="ch" style="margin-top:6px">'+j.klassen.map(function(x){
+      return '<a href="#" data-k="'+esc(x.name)+'" title="'+esc(x.lang)+'">'+esc(x.name)+'</a>';}).join('')+'</div>';
+     ziel.querySelectorAll('a').forEach(function(a){a.addEventListener('click',function(e){
+      e.preventDefault();
+      var f=document.querySelector('input[name=klasse]');
+      if(f){f.value=a.dataset.k;f.dispatchEvent(new Event('input',{bubbles:true}));
+       ziel.innerHTML='<span class="tg o">'+esc(a.dataset.k)+' uebernommen – Profil speichern</span>';}});});
+   }).catch(function(){ziel.textContent='Abruf fehlgeschlagen.';});});
+});
 document.querySelectorAll('form select[name=typ]').forEach(function(sel){
  var f=sel.form,o=f.querySelectorAll('[data-only]');
  function up(){o.forEach(function(el){el.style.display=el.dataset.only===sel.value?'':'none';});}
@@ -2217,6 +2351,36 @@ function md(string $s): string {
     }
     $flush();
     return implode("<br>\n", $out);
+}
+
+/** Schul- und Klassenfeld mit Suche im WebUntis-Verzeichnis. */
+function schul_felder(array $v = []): string {
+    $z = klasse_zerlegen((string)($v['klasse'] ?? ''));
+    ob_start(); ?>
+    <div class="f" data-schule>
+      <label for="sch">Schule</label>
+      <div class="line">
+        <input id="sch" name="schule" value="<?= h($v['schule'] ?? '') ?>" placeholder="Name oder Strasse" style="flex:1;min-width:0" autocomplete="off">
+        <button type="button" class="s" data-schulsuche style="flex:none">Suchen</button>
+      </div>
+      <input type="hidden" name="untis_server" value="<?= h($v['untis_server'] ?? '') ?>">
+      <input type="hidden" name="untis_schule" value="<?= h($v['untis_schule'] ?? '') ?>">
+      <div class="sm mu2" data-schulstatus style="margin-top:5px">
+        <?php if (!empty($v['untis_schule'])): ?>WebUntis: <?= h($v['untis_schule']) ?><?php endif; ?>
+      </div>
+      <div data-schultreffer style="margin-top:6px"></div>
+    </div>
+    <div class="fg">
+      <div class="f"><label for="kl">Klasse</label>
+        <input id="kl" name="klasse" value="<?= h($v['klasse'] ?? '') ?>" placeholder="z.B. 2FS152" data-klasse autocomplete="off"></div>
+      <div class="f"><label for="kjahr">Ausbildungsjahr</label>
+        <select id="kjahr" name="jahrgang" data-kjahr><?= optm([''=>'–','1'=>'1','2'=>'2','3'=>'3','W'=>'Verkuerzer'],
+          (string)($v['jahrgang'] ?? ($z['jahr'] ?? ''))) ?></select></div>
+      <div class="f"><label for="kzg">Zeitgruppe</label>
+        <input id="kzg" name="zeitgruppe" type="number" min="0" max="9" data-kzg
+          value="<?= h((string)($v['zeitgruppe'] ?? ($z['zeitgruppe'] ?? ''))) ?>"></div>
+    </div>
+    <?php return ob_get_clean();
 }
 
 // --- Anmelden / Konto anlegen ---------------------------------------------
@@ -2340,13 +2504,21 @@ function p_konto(): void {
         foreach (pw_problems($pw, $user, $name) as $p) $err[] = 'Passwort: ' . $p;
         if (!$err) {
             $klasse = mb_substr(post('klasse'), 0, 20);
-            $zg = 0;
-            if (preg_match('/(\d)\s*$/', $klasse, $m)) $zg = (int)$m[1];
+            $z = klasse_zerlegen($klasse);
+            $zg = post('zeitgruppe') !== '' ? (int)post('zeitgruppe') : (int)($z['zeitgruppe'] ?? 0);
+            $server = preg_match('~^[a-z0-9.-]+\.webuntis\.com$~i', post('untis_server')) ? post('untis_server') : '';
+            $uschule = preg_replace('/[^A-Za-z0-9._-]/', '', post('untis_schule'));
             $uid = ins('users', ['username' => $user, 'email' => $mail ?: null, 'pass_hash' => pw_hash($pw),
-                'name' => $name ?: $user, 'klasse' => $klasse, 'zeitgruppe' => $zg,
+                'name' => $name ?: $user, 'schule' => mb_substr(post('schule'), 0, 120),
+                'klasse' => $klasse, 'zeitgruppe' => max(0, min(9, $zg)),
+                'untis_server' => $server, 'untis_schule' => mb_substr($uschule, 0, 60),
                 'start' => post('start') ?: null, 'betrieb' => post('betrieb'),
                 'ics_token' => bin2hex(random_bytes(16)), 'pw_changed' => date('Y-m-d H:i:s')]);
             seed_user($uid);
+            if ($server !== '' && $uschule !== '') {   // Quelle vorbereiten, Passwort traegt der Nutzer nach
+                ins('sources', ['user_id' => $uid, 'name' => 'WebUntis', 'typ' => 'webuntis',
+                    'modus' => 'stundenplan', 'server' => $server, 'schule' => $uschule, 'aktiv' => 0]);
+            }
             flash('Konto angelegt.');
             redirect(url('login'));
         }
@@ -2365,11 +2537,13 @@ function p_konto(): void {
           <div class="f"><label for="us">Benutzername</label><input id="us" name="username" required autocomplete="username" value="<?= h(post('username')) ?>"></div>
           <div class="f"><label for="nm">Name</label><input id="nm" name="name" required value="<?= h(post('name')) ?>"></div>
         </div>
+        <?= schul_felder(['schule' => post('schule'), 'klasse' => post('klasse'),
+            'untis_server' => post('untis_server'), 'untis_schule' => post('untis_schule'),
+            'jahrgang' => post('jahrgang'), 'zeitgruppe' => post('zeitgruppe')]) ?>
         <div class="fg">
-          <div class="f"><label for="kl">Klasse</label><input id="kl" name="klasse" placeholder="1FS152" value="<?= h(post('klasse')) ?>"></div>
           <div class="f"><label for="st">Ausbildungsbeginn</label><input id="st" name="start" type="date" value="<?= h(post('start')) ?>"></div>
+          <div class="f"><label for="bt">Betrieb</label><input id="bt" name="betrieb" value="<?= h(post('betrieb')) ?>"></div>
         </div>
-        <div class="f"><label for="bt">Betrieb</label><input id="bt" name="betrieb" value="<?= h(post('betrieb')) ?>"></div>
         <div class="f"><label for="em">E-Mail</label><input id="em" name="email" type="email" value="<?= h(post('email')) ?>"></div>
         <div class="fg">
           <div class="f"><label for="pw">Passwort</label><input id="pw" name="pw" type="password" required autocomplete="new-password"></div>
@@ -2380,7 +2554,7 @@ function p_konto(): void {
       </form>
     </div></div>
     <?php
-    page('Konto', ob_get_clean(), ['bare' => true]);
+    page('Konto', ob_get_clean(), ['bare' => true, 'breit' => true]);
 }
 
 // --- Schnellerfassung ------------------------------------------------------
@@ -4215,8 +4389,12 @@ function p_einstellungen(): void {
         if ($a === 'profil') {
             $kl = mb_substr(post('klasse'), 0, 20);
             $zg = (int)post('zeitgruppe', '0');
-            if (!$zg && preg_match('/(\d)\s*$/', $kl, $m)) $zg = (int)$m[1];
-            upd('users', ['name' => mb_substr(post('name'), 0, 80),
+            if (!$zg) $zg = (int)(klasse_zerlegen($kl)['zeitgruppe'] ?? 0);
+            $srv = preg_match('~^[a-z0-9.-]+\.webuntis\.com$~i', post('untis_server')) ? post('untis_server') : '';
+            upd('users', ['schule' => mb_substr(post('schule'), 0, 120),
+                'untis_server' => $srv,
+                'untis_schule' => mb_substr(preg_replace('/[^A-Za-z0-9._-]/', '', post('untis_schule')), 0, 60),
+                'name' => mb_substr(post('name'), 0, 80),
                 'email' => filter_var(post('email'), FILTER_VALIDATE_EMAIL) ?: null,
                 'beruf' => mb_substr(post('beruf'), 0, 100), 'klasse' => $kl, 'zeitgruppe' => max(0, min(9, $zg)),
                 'betrieb' => mb_substr(post('betrieb'), 0, 120), 'ausbilder' => mb_substr(post('ausbilder'), 0, 80),
@@ -4323,11 +4501,10 @@ function p_einstellungen(): void {
             <div class="f"><label>Benutzername</label><input value="<?= h($u['username']) ?>" disabled></div>
             <div class="f"><label for="nm">Name</label><input id="nm" name="name" value="<?= h($u['name']) ?>"></div>
           </div>
-          <div class="fg">
-            <div class="f"><label for="em">E-Mail</label><input id="em" name="email" type="email" value="<?= h($u['email']) ?>"></div>
-            <div class="f"><label for="kl">Klasse</label><input id="kl" name="klasse" value="<?= h($u['klasse']) ?>" placeholder="1FS152"></div>
-            <div class="f"><label for="zg">Zeitgruppe</label><input id="zg" name="zeitgruppe" type="number" min="0" max="9" value="<?= (int)$u['zeitgruppe'] ?>"></div>
-          </div>
+          <div class="f"><label for="em">E-Mail</label><input id="em" name="email" type="email" value="<?= h($u['email']) ?>"></div>
+          <?= schul_felder(['schule' => $u['schule'], 'klasse' => $u['klasse'],
+              'untis_server' => $u['untis_server'], 'untis_schule' => $u['untis_schule'],
+              'zeitgruppe' => (int)$u['zeitgruppe'] ?: '']) ?>
           <div class="f"><label for="br">Beruf</label><input id="br" name="beruf" value="<?= h($u['beruf']) ?>"></div>
           <div class="fg">
             <div class="f"><label for="st">Beginn</label><input id="st" name="start" type="date" value="<?= h($u['start']) ?>"></div>
@@ -4412,8 +4589,8 @@ function p_einstellungen(): void {
             <fieldset style="border:1px solid var(--li);border-radius:var(--r2);padding:10px;margin:0 0 9px">
               <legend class="sm mu2" style="padding:0 4px">WebUntis</legend>
               <div class="fg">
-                <div class="f"><label for="qs">Server</label><input id="qs" name="server" value="<?= h($e['server'] ?? '') ?>" placeholder="mese.webuntis.com"></div>
-                <div class="f"><label for="qc">Schule</label><input id="qc" name="schule" value="<?= h($e['schule'] ?? '') ?>"></div>
+                <div class="f"><label for="qs">Server</label><input id="qs" name="server" value="<?= h($e['server'] ?? $u['untis_server']) ?>" placeholder="mese.webuntis.com"></div>
+                <div class="f"><label for="qc">Schule</label><input id="qc" name="schule" value="<?= h($e['schule'] ?? $u['untis_schule']) ?>"></div>
               </div>
               <div class="fg">
                 <div class="f"><label for="qb">Benutzer</label><input id="qb" name="benutzer" value="<?= h($e['benutzer'] ?? '') ?>" autocomplete="off"></div>
@@ -4431,12 +4608,21 @@ function p_einstellungen(): void {
           <?php if ($e): ?>
             <hr>
             <?php if ($e['meldung']): ?><div class="ms <?= $e['status'] === 'fehler' ? 'err' : 'ok' ?>"><?= h($e['meldung']) ?></div><?php endif; ?>
+            <?php if ($e['typ'] === 'webuntis' && !empty($e['secret'])): ?>
+              <button type="button" class="s" data-klassen="#kls" data-id="<?= (int)$e['id'] ?>">Klassen abrufen</button>
+              <div id="kls" class="sm mu2" style="margin-top:6px"></div>
+              <hr>
+            <?php endif; ?>
             <form method="post" data-q="Quelle und ihre importierten Termine loeschen?">
               <?= csrf_field() ?><input type="hidden" name="a" value="qdel"><input type="hidden" name="t" value="quellen">
               <input type="hidden" name="id" value="<?= (int)$e['id'] ?>">
               <button class="d s" type="submit">Loeschen</button></form>
           <?php endif; ?>
           <?php else: ?>
+            <?php if ($u['untis_schule'] !== ''): ?>
+              <div class="ms info">Aus dem Profil bekannt: <b><?= h($u['untis_schule']) ?></b> auf <?= h($u['untis_server']) ?>.
+                Eine neue WebUntis-Quelle wird damit vorbelegt.</div>
+            <?php endif; ?>
             <div class="sm mu">WebUntis, Moodle und mebis liefern jeweils eine persoenliche iCal-Adresse.
               Der Blockplan der Schule laeuft ueber <a href="<?= url('plan', ['t' => 'block']) ?>">Plan &rsaquo; Blockplan</a>.</div>
           <?php endif; ?>
@@ -4669,9 +4855,24 @@ function a_ics(): void {
 
 // --- API: Sofortsuche fuer die Palette --------------------------------------
 function a_api(): void {
-    $u = need_login();
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: private, no-store');
+    $a = get('a');
+    // Schulsuche laeuft ohne Anmeldung, weil sie in der Registrierung gebraucht wird
+    if ($a === 'schule') {
+        if (!rl('schulsuche:' . client_ip(), 40, 600)) { http_response_code(429); echo '{"fehler":"Zu viele Anfragen.","schulen":[]}'; exit; }
+        echo json_encode(untis_schulsuche(get('q')), JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    if (!me()) { http_response_code(401); echo '{"fehler":"Nicht angemeldet."}'; exit; }
+    $u = me();
+    if ($a === 'klassen') {
+        if (!rl('klassen:' . (int)$u['id'], 20, 600)) { http_response_code(429); echo '{"fehler":"Zu viele Anfragen.","klassen":[]}'; exit; }
+        $src = one("SELECT * FROM sources WHERE id = ? AND user_id = ? AND typ = 'webuntis'",
+                   [(int)get('id'), (int)$u['id']]);
+        echo json_encode($src ? untis_klassen($src) : ['fehler' => 'Quelle nicht gefunden.', 'klassen' => []], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
     if (!rl('api:' . (int)$u['id'], 240, 60)) { http_response_code(429); echo '{"treffer":[]}'; exit; }
     $q = get('q');
     $out = [];
