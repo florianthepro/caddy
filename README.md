@@ -27,7 +27,7 @@ Stop
 ```
 C:\caddy\caddy.exe stop
 ```
-Refresh
+Refresh # use if updatet the caddyfile
 ```
 "C:\caddy\caddy.exe" reload --config "C:\caddy\caddyfile"
 ```
