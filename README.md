@@ -25,5 +25,5 @@ notepad C:\caddy\caddyfile
 
 Refresh
 ```
-C:\caddy\caddy.exe reload
+"C:\caddy\caddy.exe" reload --config "C:\caddy\caddyfile"
 ```
