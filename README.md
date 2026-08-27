@@ -45,57 +45,52 @@ VS17:
 powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory 'C:\php' -Force; Invoke-WebRequest 'https://downloads.php.net/~windows/releases/archives/php-8.5.10-nts-Win32-vs17-x64.zip' -OutFile 'C:\php.zip'; Expand-Archive 'C:\php.zip' -DestinationPath 'C:\php' -Force; Copy-Item 'C:\php\php.ini-production' 'C:\php\php.ini' -Force" && schtasks /create /tn "php fastcgi" /sc onstart /ru SYSTEM /rl HIGHEST /tr "\"C:\php\php-cgi.exe\" -b 127.0.0.1:9000" /f && schtasks /run /tn "php fastcgi" && "C:\caddy\caddy.exe" reload --config "C:\caddy\caddyfile"
 ```
 
-## bsfisazubi.de - Azubi-Portal (Fachinformatiker Systemintegration)
+## bsfisazubi.de – Ausbildungsportal (Fachinformatiker Systemintegration)
 
-Eine einzige Datei: [`www/bsfisazubi.de/index.php`](./www/bsfisazubi.de/index.php).
-Kein Composer, keine CDNs, keine externen Abhaengigkeiten. Datenbank ist SQLite und
-wird beim ersten Aufruf automatisch angelegt.
+Eine Datei: [`www/bsfisazubi.de/index.php`](./www/bsfisazubi.de/index.php).
+SQLite, kein Composer, keine CDNs. Jedes Konto steht fuer sich – eigene Faecher,
+eigener Stundenplan, eigenes Berichtsheft. Keine Rollen, keine Verwaltung.
 
-### Was drin ist
+### Navigation
 
-| Bereich | Inhalt |
-| --- | --- |
-| Start | Schnellerfassung, Kennzahlen, naechste Proben, offene Aufgaben, Routinen von heute |
-| Woche & Plan | Stundenplan, Blockplan nach Zeitgruppe, Wochenagenda |
-| Proben & Termine | Klassenarbeiten, Tests, Abgaben, Lernstoff-Listen, Monatskalender, ICS-Abo |
-| Aufgaben | Hausaufgaben und betriebliche To-dos mit Frist und Prioritaet |
-| Notizen | Unterrichts- und Randnotizen mit Datum, Fach, Lernfeld, Tags, Anhaengen |
-| Wissen & Stoff | Geteilte Zusammenfassungen, How-Tos und Code-Snippets, nach Lernfeld sortiert |
-| Noten & Statistik | Noten 1-6 / 15 Punkte / IHK-Punkte, gewichtete Schnitte, Verteilung, Trend, IHK-Prognose |
-| Berichtsheft | Wochen- und Monatsnachweis, automatische Kategorisierung, Einreichen und Abzeichnen, Druckansicht |
-| Betrieb & Routinen | Wiederkehrende Aufgaben (Kaffeemaschine, Backup-Check, Ticketqueue) mit Zeitprotokoll |
-| Abwesenheiten | Krank, Urlaub, frei - fliesst automatisch ins Berichtsheft |
-| Lernfelder | LF 1-12 nach KMK-Rahmenlehrplan mit Verknuepfung zu Notizen und Terminen |
-| IHK-Pruefung | Countdown, Pruefungsbereiche mit Gewichtung, Bestehensregeln, Projektarbeit-Tracker |
-| Verwaltung | Benutzer, Klassen, Faecher, Kategorien und Erkennungsregeln, Einladungen, Sicherheitsprotokoll |
+`1` Heute · `2` Termine · `3` Aufgaben · `4` Notizen · `5` Noten ·
+`6` Berichtsheft · `7` Routinen · `8` Pruefung
+Dazu `/` Suche, `n` neuer Eintrag, `Strg+K` Sprungliste, `Esc` raus aus dem Feld.
+
+### Kern
+
+* **Heute** – Wochenstreifen, Schnellerfassung, was ansteht, offene Routinen
+* **Berichtsheft** – Wochen- oder Monatsnachweis, ordnet Taetigkeiten automatisch
+  den Berufsbildpositionen der Ausbildungsordnung zu ("Kaffeemaschine geleert"
+  → *Allgemeine Officetaetigkeiten*), fuellt sich aus Routinen, Notizen,
+  Blockplan und Abwesenheiten, druckt IHK-konform
+* **Noten** – Note 1–6, 15 Punkte oder IHK-Punkte, gewichtete Schnitte,
+  Verteilung, Verlauf je Fach
+* **Pruefung** – Countdown, Pruefungsbereiche mit Gewichtung, Bestehensregeln,
+  Projektarbeit
+* **Routinen** – wiederkehrende Aufgaben mit Zeitprotokoll
+* **Termine / Aufgaben / Notizen** – Proben mit Lernstoff, To-dos, Notizen und
+  Code-Snippets, alles nach Fach und Lernfeld filterbar
 
 ### Installation
 
-1. `index.php` nach `C:\caddy\www\bsfisazubi.de\` kopieren.
-2. In `C:\php\php.ini` aktivieren (Semikolon entfernen):
-   `extension=pdo_sqlite`, `extension=sqlite3`, `extension=mbstring`,
-   `extension=openssl`, `extension=fileinfo`
-3. Den Block `bsfisazubi.de` aus dem [caddyfile](./caddyfile) uebernehmen und neu laden:
+1. `index.php` nach `C:\caddy\www\bsfisazubi.de\` kopieren
+2. In `C:\php\php.ini` aktivieren: `extension=pdo_sqlite`, `sqlite3`,
+   `mbstring`, `openssl`, `fileinfo`
+3. Den Block `bsfisazubi.de` aus dem [caddyfile](./caddyfile) uebernehmen:
    ```
    "C:\caddy\caddy.exe" reload --config "C:\caddy\caddyfile"
    ```
-4. Seite aufrufen. Beim ersten Start fuehrt eine Ersteinrichtung durch das Anlegen
-   des Administrationskontos. Der dafuer noetige Token steht in
-   `C:\caddy\www\bsfisazubi.de-data\SETUP-TOKEN.txt`; direkt vom Server aus
-   (localhost) geht es auch ohne Token.
+4. Aufrufen. Das erste Konto legt sich ohne Code an. Jedes weitere braucht den
+   Code aus `C:\caddy\www\bsfisazubi.de-data\REGISTRIERUNG.txt`
+   (oder `REGISTRIER_CODE` oben in der Datei fest setzen).
 
-Das Datenverzeichnis `C:\caddy\www\bsfisazubi.de-data` liegt bewusst **neben**
-dem Webroot und ist damit ueber den Webserver nicht erreichbar. Genau dieses
-Verzeichnis gehoert ins Backup.
+Daten liegen in `C:\caddy\www\bsfisazubi.de-data`, also neben dem Webroot und
+damit ausserhalb der Auslieferung. Dieser Ordner gehoert ins Backup.
 
 ### Sicherheit
 
-* Registrierung ausschliesslich per Einladungscode, kein offener Signup
-* Argon2id-Passworthashes, Passwortrichtlinie, Blacklist gaengiger Woerter
-* Optionale Zwei-Faktor-Anmeldung (TOTP) mit QR-Code und Wiederherstellungscodes
-* CSRF-Token bei jeder schreibenden Aktion, Sessions serverseitig widerrufbar
-* Brute-Force-Schutz pro IP und pro Konto, Honeypot, Timing-Angleichung
-* Content-Security-Policy mit Script-Nonce, `X-Frame-Options`, `nosniff`, HSTS
-* Ausschliesslich Prepared Statements, konsequentes Output-Escaping
-* Uploads liegen als BLOB in der Datenbank, MIME-Whitelist, erzwungener Download
-* Rollen: Auszubildende, Ausbilder, Lehrkraft, Administration - inkl. Audit-Log
+Argon2id, Passwortrichtlinie, Brute-Force-Schutz pro IP und Konto, CSRF-Token,
+gehaertete Sessions mit serverseitigem Widerruf, optionale TOTP-Zwei-Faktor-
+Anmeldung mit QR-Code und Recovery-Codes, strikte CSP mit Script-Nonce,
+ausschliesslich Prepared Statements, Uploads als BLOB mit MIME-Whitelist.
