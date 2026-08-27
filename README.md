@@ -27,3 +27,8 @@ Refresh
 ```
 "C:\caddy\caddy.exe" reload --config "C:\caddy\caddyfile"
 ```
+
+## PHP
+
+https://downloads.php.net/~windows/releases/archives/php-8.5.10-nts-Win32-vs17-x64.zip
+VSXXX x64 Non Thread Safe 
