@@ -6,7 +6,7 @@ Installation
    ```
    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -Uri 'https://caddyserver.com/api/download?os=windows&arch=amd64' -OutFile 'C:\caddy\caddy.exe'"
    ```
-3. Create caddyfile `use `[example](./caddyfileexample)` as a reference`
+3. [Create your caddyfile](./caddyfileexample)
    ```
    notepad C:\caddy\caddyfile
    ```
