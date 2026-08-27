@@ -1,8 +1,3 @@
-```
-.\caddy.exe run
-.\caddy.exe run --config .\Caddyfile
-```
-```
 {
     florianthepro@icloud.com
 }
@@ -22,4 +17,3 @@ buergerabstimmung.org {
 gitea.getitsec.com {
     reverse_proxy 127.0.0.1:3000
 }
-```
