@@ -632,6 +632,7 @@ function New-SiteObject {
         tlsMode         = 'auto'
         tlsCert         = ''
         tlsKey          = ''
+        handlerExtra    = ''
         extra           = ''
     }
 }
@@ -800,6 +801,10 @@ function ConvertTo-CleanSite {
         if ($c -and $k) { $s.tlsCert = $c; $s.tlsKey = $k } else { $s.tlsMode = 'auto' }
     }
 
+    $he = Get-StringField $Raw 'handlerExtra' ''
+    if ($he.Length -gt 4000) { $he = $he.Substring(0, 4000) }
+    $s.handlerExtra = $(if (Test-BalancedBraces $he) { $he } else { '' })
+
     $extra = Get-StringField $Raw 'extra' ''
     if ($extra.Length -gt 8000) { $extra = $extra.Substring(0, 8000) }
     $s.extra = $(if (Test-BalancedBraces $extra) { $extra } else { '' })
@@ -947,12 +952,35 @@ function Build-SiteBlock {
     # Terminal-Handler. Bei aktivem Schutz sensibler Pfade werden handle-Bloecke
     # verwendet: die Reihenfolge ist dann eindeutig und unabhaengig von Caddys
     # interner Direktiven-Sortierung.
+    # Bei mehreren Zielen wird ein ausgefallenes kurzzeitig uebersprungen.
+    # Ohne diese beiden Zeilen schickt Caddy weiter Anfragen an tote Prozesse
+    # und antwortet mit 502, statt das naechste Ziel zu nehmen.
     $handlers = New-Object System.Collections.ArrayList
+    $handlerLines = New-Object System.Collections.ArrayList
+    foreach ($l in (($Site.handlerExtra -replace "`r`n", "`n").Split("`n"))) {
+        if ($l.Trim()) { [void]$handlerLines.Add("`t" + $l.Trim()) }
+    }
     if ($Site.type -eq 'php') {
-        [void]$handlers.Add('php_fastcgi ' + (Get-PhpUpstreams $Config))
+        $ups = Get-PhpUpstreams $Config
+        if ($Config.php.poolSize -gt 1) {
+            [void]$handlerLines.Insert(0, "`tfail_duration 10s")
+            [void]$handlerLines.Insert(0, "`tlb_try_duration 5s")
+        }
+        if ($handlerLines.Count -gt 0) {
+            [void]$handlers.Add('php_fastcgi ' + $ups + ' {')
+            foreach ($l in $handlerLines) { [void]$handlers.Add($l) }
+            [void]$handlers.Add('}')
+        } else {
+            [void]$handlers.Add('php_fastcgi ' + $ups)
+        }
     } elseif ($Site.type -eq 'proxy') {
+        if (($Site.upstream -split '\s+').Count -gt 1) {
+            [void]$handlerLines.Insert(0, "`tfail_duration 10s")
+            [void]$handlerLines.Insert(0, "`tlb_try_duration 5s")
+        }
+        [void]$handlerLines.Insert(0, "`theader_up X-Real-IP {remote_host}")
         [void]$handlers.Add('reverse_proxy ' + $Site.upstream + ' {')
-        [void]$handlers.Add("`theader_up X-Real-IP {remote_host}")
+        foreach ($l in $handlerLines) { [void]$handlers.Add($l) }
         [void]$handlers.Add('}')
     }
     if ($Site.type -eq 'static' -or $Site.type -eq 'php') {
@@ -1204,6 +1232,7 @@ function Read-SiteDirectives {
             'php_fastcgi' {
                 $Site.type = 'php'
                 $Config.php.enabled = $true
+                Read-HandlerOptions $d $Site
             }
             'reverse_proxy' {
                 $ups = New-Object System.Collections.ArrayList
@@ -1214,6 +1243,7 @@ function Read-SiteDirectives {
                 if ($ups.Count -gt 0) {
                     $Site.type = 'proxy'
                     $Site.upstream = ($ups.ToArray() -join ' ')
+                    Read-HandlerOptions $d $Site
                 } else {
                     [void]$ExtraLines.Add($d.head)
                 }
@@ -1287,6 +1317,33 @@ function Read-SiteDirectives {
                 }
             }
         }
+    }
+}
+
+# Eigene Optionen innerhalb von reverse_proxy / php_fastcgi bleiben erhalten.
+# Was der Manager selbst schreibt, wird dabei nicht doppelt uebernommen.
+function Read-HandlerOptions {
+    param($Statement, $Site)
+    if (-not $Statement.body) { return }
+    $keep = New-Object System.Collections.ArrayList
+    foreach ($o in (Split-CaddyStatements $Statement.body)) {
+        $t = $o.head.Trim()
+        if (-not $t) { continue }
+        if ($t -eq 'header_up X-Real-IP {remote_host}') { continue }
+        if ($t -match '^(lb_try_duration|fail_duration)\s') { continue }
+        if ($o.body) {
+            [void]$keep.Add($t + ' {')
+            foreach ($l in (($o.body -replace "`r`n", "`n").Split("`n"))) {
+                if ($l.Trim()) { [void]$keep.Add("`t" + $l.Trim()) }
+            }
+            [void]$keep.Add('}')
+        } else {
+            [void]$keep.Add($t)
+        }
+    }
+    if ($keep.Count -gt 0) {
+        $joined = ($keep.ToArray() -join "`n")
+        if (Test-BalancedBraces $joined) { $Site.handlerExtra = $joined }
     }
 }
 
@@ -4206,7 +4263,7 @@ function openSite(id){
           redirectTo:"", redirectCode:"permanent", respondBody:"OK", respondStatus:200,
           encode:true, browse:false, indexFiles:"", securityHeaders:true, hsts:false,
           blockSensitive:true, accessLog:true, wwwRedirect:true, basicAuthUser:"", basicAuthHash:"",
-          maxBody:"", tlsMode:"auto", tlsCert:"", tlsKey:"", extra:"" };
+          maxBody:"", tlsMode:"auto", tlsCert:"", tlsKey:"", handlerExtra:"", extra:"" };
   }
   editing = JSON.parse(JSON.stringify(s));
   pendingPw = "";
@@ -4324,6 +4381,10 @@ function drawSheet(isNew){
             <input type="text" id="fTlsKey" value="${esc(s.tlsKey)}"></label>
         </div>
 
+        ${(t==="proxy"||t==="php") ? `<label class="f"><span>Optionen im ${t==="proxy"?"reverse_proxy":"php_fastcgi"}-Block</span>
+          <textarea id="fHandlerExtra" rows="3" placeholder="header_up Host {upstream_hostport}">${esc(s.handlerExtra||"")}</textarea>
+          <div class="hint">Landet unver{ae}ndert innerhalb des Handler-Blocks.</div></label>`:""}
+
         <label class="f"><span>Zus{ae}tzliche Caddyfile-Zeilen</span>
           <textarea id="fExtra" rows="4" placeholder="handle_path /api/* {&#10;    reverse_proxy 127.0.0.1:1234&#10;}">${esc(s.extra)}</textarea>
           <div class="hint">F{ue}r Sonderf{ae}lle. Der Inhalt wird unver{ae}ndert in den Block {ue}bernommen und
@@ -4363,6 +4424,7 @@ function collectSheet(){
   if(g("#fTlsCert")!==undefined) s.tlsCert = g("#fTlsCert").trim();
   if(g("#fTlsKey")!==undefined) s.tlsKey = g("#fTlsKey").trim();
   if(g("#fExtra")!==undefined) s.extra = g("#fExtra");
+  if(g("#fHandlerExtra")!==undefined) s.handlerExtra = g("#fHandlerExtra");
   if(b("#fSec")!==undefined) s.securityHeaders = b("#fSec");
   if(b("#fBlock")!==undefined) s.blockSensitive = b("#fBlock");
   if(b("#fWww")!==undefined) s.wwwRedirect = b("#fWww");
