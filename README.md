@@ -15,6 +15,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -U
 notepad C:\caddy\caddyfile
 ```
 
+---
+
 ## Start&Stop
 
 Using Task Scheduler `recommendet`
