@@ -1,1 +1,11 @@
-s
+```
+.\caddy.exe run
+.\caddy.exe run --config .\Caddyfile
+```
+```
+example.com, *.example.com {
+    root * C:/caddy/www/{http.request.host}
+    encode gzip zstd
+    file_server
+}
+```
