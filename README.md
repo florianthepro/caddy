@@ -28,6 +28,8 @@ Refresh
 "C:\caddy\caddy.exe" reload --config "C:\caddy\caddyfile"
 ```
 
+---
+
 ## PHP
 
 [VSXXX x64 Non Thread Safe](https://www.php.net/downloads.php?os=windows&osvariant=windows-downloads&version=default)
