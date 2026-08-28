@@ -3227,7 +3227,11 @@ document.addEventListener('click',function(e){
  if(e.target.closest('[data-schliessen]')){close_();return;}
  var t=e.target.closest('[data-palette]');
  if(t&&pl){e.preventDefault();open_(sq&&sq.value?sq.value:'');}});
-document.addEventListener('focus',function(e){if(e.target.matches('[data-sel]'))e.target.select();},true);
+document.addEventListener('focus',function(e){
+ if(e.target.matches('[data-sel]')){e.target.select();return;}
+ // Tastatur und Maus fuehren zur selben Sofortsuche
+ if(e.target===sq&&pl&&!pl.classList.contains('on')&&!/[?&]p=suche/.test(location.search)){
+  open_(sq.value||'');sq.blur();}},true);
 var pl=document.getElementById('pl'),pq=document.getElementById('pq'),pu=document.getElementById('pu'),
     sq=document.getElementById('sq'),sel=0,cur=[];
 var tref=[],aref=[],tid=0,lauf='';
