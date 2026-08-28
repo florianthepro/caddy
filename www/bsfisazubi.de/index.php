@@ -2384,6 +2384,7 @@ function icons(): array {
         'datei'   => '<path d="M13.5 3.5H7A2 2 0 0 0 5 5.5v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13.5 3.5V9H19"/>',
         'projekt' => '<path d="M5 21V4.5"/><path d="M5 5h11.5l-2 3.5 2 3.5H5"/>',
         'schloss' => '<rect x="4" y="10.5" width="16" height="10.5" rx="2.4"/><path d="M8 10.5V7.2a4 4 0 0 1 8 0v3.3"/>',
+        'frei'    => '<circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.6M12 18.9v2.6M4.2 12H1.6M22.4 12h-2.6M6.5 6.5L4.6 4.6M19.4 19.4l-1.9-1.9M17.5 6.5l1.9-1.9M4.6 19.4l1.9-1.9"/>',
         'import'  => '<path d="M12 3.5v11"/><path d="M8 11l4 4 4-4"/><path d="M4.5 17v2a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2"/>',
         'raster'  => '<rect x="3" y="4" width="18" height="16" rx="2.4"/><path d="M3 9.5h18M9 9.5V20M15 9.5V20"/>',
         'liste'   => '<path d="M9 6.5h11M9 12h11M9 17.5h11"/><path d="M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01"/>',
@@ -2406,30 +2407,33 @@ function ic(string $name, int $groesse = 20): string {
 function ziele_index(): array {
     static $z = null;
     if ($z !== null) return $z;
+    // Symbol, Beschriftung, Bereich, Suchwoerter, Adresse, Farbe.
+    // Die Farbe haengt am Ziel, nicht am Symbol - sonst sehen Termine,
+    // Stundenplan und Blockplan identisch aus.
     return $z = [
-        ['heute',   'Heute',              '',              'start uebersicht dashboard tag heute jetzt',                        url('start')],
-        ['faecher', 'Faecher',            'Schule',        'fach faecher lernfeld lernfelder lf unterricht stoff material',     url('faecher')],
-        ['notizen', 'Notizen',            'Schule',        'notiz notizen howto snippet code stoff merken zettel',              url('notizen')],
-        ['noten',   'Noten',              'Schule',        'note noten schnitt durchschnitt zeugnis punkte bewertung',          url('noten')],
-        ['termin',  'Termine',            'Plan',          'termin termine kalender probe schulaufgabe test abgabe frist',      url('plan')],
-        ['aufgabe', 'Aufgaben',           'Plan',          'aufgabe aufgaben hausaufgabe offen erledigen',                      url('plan', ['t' => 'aufgaben'])],
-        ['raster',  'Stundenplan',        'Plan',          'stundenplan stunde raum unterricht wann wo',                        url('plan', ['t' => 'stundenplan'])],
-        ['plan',    'Blockplan',          'Plan',          'block blockplan blockwoche schulwoche ferien schulblock',           url('plan', ['t' => 'block'])],
-        ['bericht', 'Berichtsheft',       'Betrieb',       'berichtsheft nachweis ausbildungsnachweis wochenbericht bericht ihk woche monat', url('berichtsheft')],
-        ['bericht', 'Alle Nachweise',     'Betrieb',       'alle nachweise berichte heft',                                      url('berichtsheft', ['t' => 'alle'])],
-        ['pruefung','Ausbildungsplan',    'Betrieb',       'ausbildungsplan berufsbildposition fiausbv fortschritt abgedeckt',  url('berichtsheft', ['t' => 'plan'])],
-        ['routine', 'Routinen',           'Betrieb',       'routine routinen wiederkehrend kaffeemaschine taeglich woechentlich', url('berichtsheft', ['t' => 'routinen'])],
-        ['einsatz', 'Einsaetze',          'Betrieb',       'einsatz einsaetze abteilung durchlauf versetzung wechsel',          url('einsaetze')],
-        ['einsatz', 'Fehlzeiten & Urlaub','Betrieb',       'urlaub resturlaub fehlzeit fehlzeiten krank krankheit frei abwesend dienstreise schulung entschuldigung', url('einsaetze', ['t' => 'zeiten'])],
-        ['kontakt', 'Kontakte',           'Betrieb',       'kontakt kontakte ansprechpartner ausbilder ausbilderin lehrer telefon mail ihk nummer', url('kontakte')],
-        ['pruefung','Pruefung',           'Abschluss',     'pruefung abschlusspruefung ap1 ap2 teil punkte prognose bestehen',  url('pruefung')],
-        ['projekt', 'Abschlussprojekt',   'Abschluss',     'projekt abschlussprojekt antrag genehmigung doku dokumentation praesentation frist stunden', url('pruefung', ['t' => 'projekt'])],
-        ['liste',   'Lernfelder',         'Abschluss',     'lernfeld lernfelder lf lehrplan rahmenlehrplan',                    url('pruefung', ['t' => 'lf'])],
-        ['kontakt', 'Profil',             'Einstellungen', 'profil einstellungen konto klasse schule betrieb beruf beginn',     url('einstellungen')],
-        ['import',  'Quellen',            'Einstellungen', 'quelle quellen import webuntis ical kalender ferien feiertage blockplan abonnement sync', url('einstellungen', ['t' => 'quellen'])],
-        ['schloss', 'Sicherheit',         'Einstellungen', 'sicherheit passwort kennwort zwei-faktor 2fa totp sitzung anmeldung', url('einstellungen', ['t' => 'sicherheit'])],
-        ['datei',   'Daten & Export',     'Einstellungen', 'daten export backup sicherung csv json kalenderadresse konto loeschen', url('einstellungen', ['t' => 'daten'])],
-        ['teilen',  'Geteilte Links',     'Einstellungen', 'geteilt teilen link freigabe share oeffentlich',                    url('geteilt')],
+        ['heute',   'Heute',              '',              'start uebersicht dashboard tag heute jetzt',                        url('start'),                                  '#ff3b30'],
+        ['faecher', 'Faecher',            'Schule',        'fach faecher lernfeld lernfelder lf unterricht stoff material',     url('faecher'),                                '#0071e3'],
+        ['notizen', 'Notizen',            'Schule',        'notiz notizen howto snippet code stoff merken zettel',              url('notizen'),                                '#ff9500'],
+        ['noten',   'Noten',              'Schule',        'note noten schnitt durchschnitt zeugnis punkte bewertung',          url('noten'),                                  '#34c759'],
+        ['termin',  'Termine',            'Plan',          'termin termine kalender probe schulaufgabe test abgabe frist',      url('plan'),                                   '#5856d6'],
+        ['aufgabe', 'Aufgaben',           'Plan',          'aufgabe aufgaben hausaufgabe offen erledigen',                      url('plan', ['t' => 'aufgaben']),              '#30b0c7'],
+        ['raster',  'Stundenplan',        'Plan',          'stundenplan stunde raum unterricht wann wo',                        url('plan', ['t' => 'stundenplan']),           '#7d5fff'],
+        ['plan',    'Blockplan',          'Plan',          'block blockplan blockwoche schulwoche ferien schulblock',           url('plan', ['t' => 'block']),                 '#0f5fa8'],
+        ['bericht', 'Berichtsheft',       'Betrieb',       'berichtsheft nachweis ausbildungsnachweis wochenbericht bericht ihk woche monat', url('berichtsheft'),               '#af52de'],
+        ['liste',   'Alle Nachweise',     'Betrieb',       'alle nachweise berichte heft',                                      url('berichtsheft', ['t' => 'alle']),          '#c77dff'],
+        ['pruefung','Ausbildungsplan',    'Betrieb',       'ausbildungsplan berufsbildposition fiausbv fortschritt abgedeckt',  url('berichtsheft', ['t' => 'plan']),          '#8b5cf6'],
+        ['routine', 'Routinen',           'Betrieb',       'routine routinen wiederkehrend kaffeemaschine taeglich woechentlich', url('berichtsheft', ['t' => 'routinen']),    '#ff9500'],
+        ['einsatz', 'Einsaetze',          'Betrieb',       'einsatz einsaetze abteilung durchlauf versetzung wechsel',          url('einsaetze'),                              '#a2845e'],
+        ['frei',    'Fehlzeiten & Urlaub','Betrieb',       'urlaub resturlaub fehlzeit fehlzeiten krank krankheit frei abwesend dienstreise schulung entschuldigung', url('einsaetze', ['t' => 'zeiten']), '#00b894'],
+        ['kontakt', 'Kontakte',           'Betrieb',       'kontakt kontakte ansprechpartner ausbilder ausbilderin lehrer telefon mail ihk nummer', url('kontakte'),           '#00c7be'],
+        ['pruefung','Pruefung',           'Abschluss',     'pruefung abschlusspruefung ap1 ap2 teil punkte prognose bestehen',  url('pruefung'),                               '#ff2d55'],
+        ['projekt', 'Abschlussprojekt',   'Abschluss',     'projekt abschlussprojekt antrag genehmigung doku dokumentation praesentation frist stunden', url('pruefung', ['t' => 'projekt']), '#e11d48'],
+        ['liste',   'Lernfelder',         'Abschluss',     'lernfeld lernfelder lf lehrplan rahmenlehrplan',                    url('pruefung', ['t' => 'lf']),                '#0071e3'],
+        ['kontakt', 'Profil',             'Einstellungen', 'profil einstellungen konto klasse schule betrieb beruf beginn',     url('einstellungen'),                          '#8e8e93'],
+        ['import',  'Quellen',            'Einstellungen', 'quelle quellen import webuntis ical kalender ferien feiertage blockplan abonnement sync', url('einstellungen', ['t' => 'quellen']), '#5ac8fa'],
+        ['schloss', 'Sicherheit',         'Einstellungen', 'sicherheit passwort kennwort zwei-faktor 2fa totp sitzung anmeldung', url('einstellungen', ['t' => 'sicherheit']), '#636366'],
+        ['datei',   'Daten & Export',     'Einstellungen', 'daten export backup sicherung csv json kalenderadresse konto loeschen', url('einstellungen', ['t' => 'daten']),    '#8e8e93'],
+        ['teilen',  'Geteilte Links',     'Einstellungen', 'geteilt teilen link freigabe share oeffentlich',                    url('geteilt'),                                '#0071e3'],
     ];
 }
 /** Wie gut passt ein Ziel zur Eingabe? 0 heisst: gar nicht. */
@@ -2454,7 +2458,8 @@ function ziele_suchen(string $q, int $limit = 6): array {
     $t = [];
     foreach (ziele_index() as $z) {
         $r = ziel_rang($z, $q);
-        if ($r > 0) $t[] = ['rang' => $r, 'icon' => $z[0], 'label' => $z[1], 'bereich' => $z[2], 'url' => $z[4]];
+        if ($r > 0) $t[] = ['rang' => $r, 'icon' => $z[0], 'label' => $z[1], 'bereich' => $z[2],
+                            'url' => $z[4], 'farbe' => $z[5] ?? '#8e8e93'];
     }
     usort($t, fn($a, $b) => [$b['rang'], mb_strlen($a['label'])] <=> [$a['rang'], mb_strlen($b['label'])]);
     return array_slice($t, 0, $limit);
@@ -2497,21 +2502,92 @@ function tab_aktiv(string $p): string {
         default   => 'mehr',
     };
 }
+/** Aktueller Wert je Ziel - die Zielliste ist zugleich die Antwortliste. */
+function ziel_werte(array $u): array {
+    $uid = (int)$u['id'];
+    $w = [];
+    $n = fn(string $sql, array $a = []) => (int)val($sql, $a, 0);
+
+    $anz = $n("SELECT COUNT(*) FROM subjects WHERE user_id = ? AND archiv = 0", [$uid]);
+    if ($anz) $w['Faecher'] = $anz . '';
+    $anz = $n("SELECT COUNT(*) FROM notes WHERE user_id = ?", [$uid]);
+    if ($anz) $w['Notizen'] = $anz . '';
+
+    $g = noten_stats($uid);
+    if ($g['schnitt'] !== null) $w['Noten'] = num((float)$g['schnitt'], 2);
+
+    $e = one("SELECT datum, titel FROM events WHERE user_id = ? AND typ <> 'unterricht'
+              AND datum >= date('now','localtime') ORDER BY datum LIMIT 1", [$uid]);
+    if ($e) $w['Termine'] = dt($e['datum'], 'd.m.');
+    $anz = $n("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'offen'", [$uid]);
+    if ($anz) $w['Aufgaben'] = $anz . ' offen';
+
+    $b = one("SELECT von, bis FROM blocks WHERE user_id = ? AND art = 'schule'
+              AND bis >= date('now','localtime') ORDER BY von LIMIT 1", [$uid]);
+    if ($b) $w['Blockplan'] = ($b['von'] <= today() ? 'bis ' . dt($b['bis'], 'd.m.') : 'ab ' . dt($b['von'], 'd.m.'));
+
+    $art = $u['bh_art']; $rep = report_get($uid, $art, periode_of(today(), $art));
+    $sum = report_sum((int)$rep['id']);
+    $w['Berichtsheft'] = $rep['status'] === 'fertig' ? 'fertig' : num((float)$sum['std'], 1) . ' h';
+    $anz = $n("SELECT COUNT(*) FROM reports WHERE user_id = ?", [$uid]);
+    if ($anz) $w['Alle Nachweise'] = $anz . '';
+    $belegt = $n("SELECT COUNT(DISTINCT e.category_id) FROM report_entries e
+                  JOIN categories c ON c.id = e.category_id
+                  WHERE e.user_id = ? AND c.abschnitt <> 'X'", [$uid]);
+    $ges = $n("SELECT COUNT(*) FROM categories WHERE abschnitt <> 'X'");
+    if ($ges) $w['Ausbildungsplan'] = $belegt . ' von ' . $ges;
+    $anz = $n("SELECT COUNT(*) FROM routines WHERE user_id = ? AND aktiv = 1", [$uid]);
+    if ($anz) $w['Routinen'] = $anz . '';
+
+    $ab = einsatz_am($uid, today()) ?: (string)$u['abteilung'];
+    if ($ab !== '') $w['Einsaetze'] = mb_substr($ab, 0, 22);
+    $jahr = date('Y'); $genommen = 0;
+    foreach (all("SELECT von, bis FROM absences WHERE user_id = ? AND art = 'urlaub' AND von LIKE ?",
+                 [$uid, $jahr . '%']) as $r) $genommen += werktage($r['von'], $r['bis']);
+    $ansp = (float)$u['urlaub_tage'];
+    if ($ansp > 0) $w['Fehlzeiten & Urlaub'] = num(max(0, $ansp - $genommen), 0) . ' T frei';
+    $anz = $n("SELECT COUNT(*) FROM kontakte WHERE user_id = ?", [$uid]);
+    if ($anz) $w['Kontakte'] = $anz . '';
+
+    $cd = fn(?string $d) => $d ? (int)ceil((strtotime($d) - strtotime(today())) / 86400) : null;
+    $t1 = $cd($u['ap1']); $t2 = $cd($u['ap2']);
+    if ($t2 !== null && $t2 > 0) $w['Pruefung'] = 'in ' . $t2 . ' T';
+    elseif ($t1 !== null && $t1 > 0) $w['Pruefung'] = 'Teil 1 in ' . $t1 . ' T';
+    $pj = one("SELECT * FROM projekt WHERE user_id = ? ORDER BY id LIMIT 1", [$uid]);
+    if ($pj) {
+        $naechst = null;
+        foreach (array_keys(projekt_termine()) as $k) {
+            if ($pj[$k] && $pj[$k] >= today() && ($naechst === null || $pj[$k] < $naechst)) $naechst = $pj[$k];
+        }
+        $w['Abschlussprojekt'] = $naechst ? dt($naechst, 'd.m.') : (string)$pj['status'];
+    }
+    $anz = $n("SELECT COUNT(*) FROM shares WHERE user_id = ?", [$uid]);
+    if ($anz) $w['Geteilte Links'] = $anz . '';
+    $anz = $n("SELECT COUNT(*) FROM sources WHERE user_id = ? AND aktiv = 1", [$uid]);
+    if ($anz) $w['Quellen'] = $anz . '';
+    if ((int)$u['totp_enabled'] === 1) $w['Sicherheit'] = 'Zwei-Faktor an';
+    $w['Profil'] = klasse_name($u) ?: (string)$u['username'];
+    return $w;
+}
 /** Alles auf einen Blick, nach Bereichen gruppiert - der Weg zu jedem Ziel. */
 function p_mehr(): void {
     $u = need_login();
+    $werte = ziel_werte($u);
     $gruppen = [];
-    foreach (ziele_index() as [$sym, $label, $bereich, , $adresse]) {
-        $gruppen[$bereich ?: 'Start'][] = [$sym, $label, $adresse];
+    foreach (ziele_index() as [$sym, $label, $bereich, , $adresse, $farbe]) {
+        $gruppen[$bereich ?: 'Start'][] = [$sym, $label, $adresse, $farbe];
     }
     ob_start(); ?>
     <?php foreach ($gruppen as $bereich => $eintraege): ?>
       <div class="c"><?php if ($bereich !== 'Start'): ?><div class="hd"><h2><?= h($bereich) ?></h2></div><?php endif; ?>
         <ul class="li rows">
-          <?php foreach ($eintraege as [$sym, $label, $adresse]): ?>
+          <?php foreach ($eintraege as [$sym, $label, $adresse, $farbe]): ?>
             <li><a href="<?= h($adresse) ?>">
-              <span class="tile t-<?= h($sym) ?>"><?= ic($sym, 17) ?></span>
+              <span class="tile" style="background:<?= h($farbe) ?>"><?= ic($sym, 17) ?></span>
               <span class="tx"><b><?= h($label) ?></b></span>
+              <?php if (!empty($werte[$label])): ?>
+                <span class="sm mu" style="flex:none"><?= h($werte[$label]) ?></span>
+              <?php endif; ?>
               <?= ic('weiter', 17) ?></a></li>
           <?php endforeach; ?>
         </ul>
@@ -2781,7 +2857,7 @@ font-weight:500;color:var(--fg2);line-height:19px;white-space:nowrap}
 .t-termin{background:#5856d6}.t-aufgabe{background:#30b0c7}.t-routine{background:#ff9500}
 .t-projekt{background:#ff2d55}.t-datei{background:#8e8e93}.t-zahnrad{background:#8e8e93}
 .t-teilen{background:#0071e3}.t-suche{background:#8e8e93}
-.t-schloss{background:#8e8e93}.t-import{background:#5ac8fa}.t-raster{background:#5856d6}
+.t-schloss{background:#636366}.t-frei{background:#00b894}.t-import{background:#5ac8fa}.t-raster{background:#5856d6}
 .t-liste{background:#0071e3}
 /* Listenzeilen mit Symbol, Text, Chevron */
 .li.rows li{padding:0}
@@ -2952,7 +3028,7 @@ var B=<?= json_encode(base_path()) ?>;
 var N=<?= json_encode(array_map(fn($x) => ['t' => $x[1], 'u' => url($x[0])], nav()), JSON_UNESCAPED_UNICODE) ?>;
 // Derselbe Zielindex wie auf dem Server, damit Palette und Suchseite gleich ranken
 var Z=<?= json_encode(array_map(fn($z) => ['t' => $z[1], 'g' => $z[2] ?: 'Start',
-        'w' => $z[3], 'u' => $z[4], 'i' => $z[0]], ziele_index()), JSON_UNESCAPED_UNICODE) ?>;
+        'w' => $z[3], 'u' => $z[4], 'i' => $z[0], 'c' => $z[5] ?? '#8e8e93'], ziele_index()), JSON_UNESCAPED_UNICODE) ?>;
 var SYM=<?= json_encode(icons(), JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>;
 var EX=<?= json_encode($u ? array_map(fn($z) => ['n' => $z['name'], 'u' => $z['url']],
         all("SELECT name, url FROM ziele WHERE user_id = ? ORDER BY sort, id", [(int)$u['id']])) : [], JSON_UNESCAPED_UNICODE) ?>;
@@ -2988,6 +3064,10 @@ function rang(x,q){var l=x.t.toLowerCase();
  for(var j=0;j<k.length;j++){if(k[j]===q)return 65;if(k[j]&&k[j].indexOf(q)===0)return 55;}
  if(q.length>=4)for(var m=0;m<k.length;m++)if(k[m]&&k[m].indexOf(q)>=0)return 35;
  return 0;}
+function kachel(x){
+ var n=x.i||'suche';
+ var stil=x.c?' style="background:'+esc(x.c)+'"':'';
+ return '<span class="tile t-'+esc(n)+'"'+stil+'>'+sym(n,16)+'</span>';}
 function sym(n,g){var d=SYM[n]||SYM.notizen;
  return '<svg class="ic" width="'+g+'" height="'+g+'" viewBox="0 0 24 24" fill="none" stroke="currentColor"'
   +' stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+d+'</svg>';}
@@ -3006,7 +3086,7 @@ function draw(){var q=(pq.value||'').toLowerCase().trim();
   if(gr!==letzt){html+='<li class="gr" style="pointer-events:none">'+esc(gr)+'</li>';letzt=gr;}
   var kl=(i===sel?'on ':'')+(x.l?'aw':'');
   html+='<li'+(kl.trim()?' class="'+kl.trim()+'"':'')+' data-u="'+esc(x.u)+'">'
-      +(x.i?'<span class="tile t-'+esc(x.i)+'">'+sym(x.i,16)+'</span>':'<span class="tile t-suche">'+sym('suche',16)+'</span>')
+      +kachel(x)
       +(x.l?'<span class="col"><span class="mu2 sm">'+esc(x.l)+'</span><b>'+esc(x.t)+'</b></span>':'<b>'+esc(x.t)+'</b>')
       +(x.s?'<span class="mu2 sm" style="margin-left:auto">'+esc(x.s)+'</span>':'')+'</li>';});
  pu.innerHTML=html;
@@ -5727,7 +5807,7 @@ function p_suche(): void {
         <ul class="li rows">
           <?php foreach ($ziele as $z): ?>
             <li><a href="<?= h($z['url']) ?>">
-              <span class="tile t-<?= h($z['icon']) ?>"><?= ic($z['icon'], 17) ?></span>
+              <span class="tile" style="background:<?= h($z['farbe']) ?>"><?= ic($z['icon'], 17) ?></span>
               <span class="tx"><b><?= h($z['label']) ?></b>
                 <?= $z['bereich'] ? '<span class="sm mu2">' . h($z['bereich']) . '</span>' : '' ?></span>
               <?= ic('weiter', 17) ?></a></li>
