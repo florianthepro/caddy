@@ -3909,24 +3909,24 @@ function p_start(): void {
         <div class="hd"><h2>Anstehend</h2><span class="sp"></span>
           <a class="bt s g" href="<?= url('plan') ?>">Plan</a></div>
         <?php if (!$an): ?><?= em('Nichts offen.') ?><?php else: ?>
-        <div class="tw"><table><tbody>
+        <ul class="li rows">
           <?php foreach ($an as $x):
-            $tage = $x['d'] === '9999-12-31' ? null : (int)floor((strtotime($x['d']) - strtotime(today())) / 86400); ?>
-            <tr>
-              <td style="width:78px;white-space:nowrap" class="sm">
-                <?php if ($tage === null): ?><span class="mu2">–</span>
-                <?php elseif ($tage < 0): ?><span class="tg e"><?= abs($tage) ?> T ueber</span>
-                <?php elseif ($tage === 0): ?><span class="tg a">heute</span>
-                <?php elseif ($tage === 1): ?><span class="tg">morgen</span>
-                <?php else: ?><span class="mo"><?= h(dt($x['d'], 'D d.m.')) ?></span><?php endif; ?>
-              </td>
-              <td style="width:62px"><span class="tg<?= $x['k'] === 'aufgabe' ? '' : ' a' ?>"><?= h($x['typ']) ?></span></td>
-              <td><a href="<?= h($x['u']) ?>"><?= h($x['t']) ?></a>
-                <?= $x['f'] ? ' <span class="sm mu2">' . h($x['f']) . '</span>' : '' ?>
-                <?= $x['z'] ? ' <span class="sm mu2 mo">' . h(substr($x['z'], 0, 5)) . '</span>' : '' ?></td>
-            </tr>
+            $tage = $x['d'] === '9999-12-31' ? null : (int)floor((strtotime($x['d']) - strtotime(today())) / 86400);
+            $wann = $tage === null ? 'ohne Termin'
+                  : ($tage < 0 ? abs($tage) . ' Tage ueberfaellig'
+                  : ($tage === 0 ? 'heute' : ($tage === 1 ? 'morgen' : dt($x['d'], 'D d.m.'))));
+            $neben = array_filter([$x['typ'], $wann, $x['f'] ?: '', $x['z'] ? substr($x['z'], 0, 5) : '']); ?>
+            <li><a href="<?= h($x['u']) ?>">
+              <span class="tile t-<?= $x['k'] === 'aufgabe' ? 'aufgabe' : 'termin' ?>">
+                <?= ic($x['k'] === 'aufgabe' ? 'aufgabe' : 'termin', 17) ?></span>
+              <span class="tx"><b><?= h($x['t']) ?></b>
+                <span class="sm mu2"><?= h(implode(' · ', $neben)) ?></span></span>
+              <?php if ($tage !== null && $tage <= 1): ?>
+                <span class="tg <?= $tage < 0 ? 'e' : 'a' ?>"><?= h($wann) ?></span>
+              <?php endif; ?>
+              <?= ic('weiter', 17) ?></a></li>
           <?php endforeach; ?>
-        </tbody></table></div>
+        </ul>
         <?php endif; ?>
       </div>
       <div>
@@ -4423,25 +4423,35 @@ function p_notizen(): void {
           </form>
         </div>
         <?php if (!$rows): ?><?= em('Nichts gefunden.') ?><?php else: ?>
-        <div class="tw"><table><tbody>
-          <?php foreach ($rows as $n): ?>
-            <tr>
-              <td class="mo sm" style="width:78px;white-space:nowrap"><?= h(dt($n['datum'], 'd.m.y')) ?></td>
-              <td style="width:64px"><span class="tg<?= $n['kind'] === 'snippet' ? ' a' : '' ?>"><?= h($n['kind']) ?></span></td>
-              <td><?= $n['pinned'] ? '<span class="tg w">fix</span> ' : '' ?>
-                <a href="<?= url('notizen', ['id' => $n['id']]) ?>"><?= h($n['titel'] ?: mb_substr($n['body'], 0, 70)) ?></a></td>
-              <td class="sm mu2" style="width:104px"><?= h($n['short'] ?: '') ?>
-                <?= $n['lf_no'] ? '<span class="tg">LF' . (int)$n['lf_no'] . '</span>' : '' ?></td>
-            </tr>
+        <ul class="li rows">
+          <?php foreach ($rows as $n):
+            $neben = array_filter([$n['kind'], dt($n['datum'], 'd.m.y'), $n['short'] ?: '',
+                                   $n['lf_no'] ? 'LF' . (int)$n['lf_no'] : '']); ?>
+            <li><a href="<?= url('notizen', ['id' => $n['id']]) ?>">
+              <span class="tile t-notizen"><?= ic('notizen', 17) ?></span>
+              <span class="tx"><b><?= $n['pinned'] ? '<span class="tg w">fix</span> ' : '' ?><?= h($n['titel'] ?: mb_substr($n['body'], 0, 70)) ?></b>
+                <span class="sm mu2"><?= h(implode(' · ', $neben)) ?></span></span>
+              <?= ic('weiter', 17) ?></a></li>
           <?php endforeach; ?>
-        </tbody></table></div>
+        </ul>
         <?php endif; ?>
       </div>
       <div>
         <?php if ($edit !== null): $neu = empty($edit['id']); ?>
-        <div class="c"><div class="hd"><h2><?= $neu ? 'Neue Notiz' : 'Notiz' ?></h2>
-          <?php if (!$neu && ($edit['kind'] ?? '') === 'snippet'): ?><span class="sp"></span>
-            <button class="s" data-copy="snip" type="button">Code kopieren</button><?php endif; ?></div><div class="bo">
+        <?php if (!$neu && trim((string)$edit['body']) !== ''): ?>
+          <div class="c"><div class="hd"><h2><?= h($edit['titel'] ?: 'Notiz') ?></h2><span class="sp"></span>
+            <?php if (($edit['kind'] ?? '') === 'snippet'): ?>
+              <button class="s" data-copy="snip" type="button">Code kopieren</button><?php endif; ?>
+            <a class="bt s g" href="<?= url('notizen') ?>">Schliessen</a></div><div class="bo">
+            <div class="sm mu2" style="margin-bottom:9px">
+              <?= h(dt($edit['datum'])) ?> · <?= h($edit['kind']) ?>
+              <?= $edit['lf_no'] ? ' · LF' . (int)$edit['lf_no'] : '' ?>
+              <?= $edit['tags'] ? ' · ' . h($edit['tags']) : '' ?></div>
+            <?php if (($edit['kind'] ?? '') === 'snippet'): ?><pre id="snip"><?= h($edit['body']) ?></pre>
+            <?php else: ?><div><?= md($edit['body']) ?></div><?php endif; ?>
+          </div></div>
+        <?php endif; ?>
+        <div class="c"><div class="hd"><h2><?= $neu ? 'Neue Notiz' : 'Bearbeiten' ?></h2></div><div class="bo">
           <form method="post" enctype="multipart/form-data">
             <?= csrf_field() ?><input type="hidden" name="a" value="save">
             <input type="hidden" name="id" value="<?= (int)($edit['id'] ?? 0) ?>">
@@ -4465,11 +4475,6 @@ function p_notizen(): void {
             <div class="rw"><button class="p" type="submit">Speichern</button>
               <a class="bt g" href="<?= url('notizen') ?>">Schliessen</a></div>
           </form>
-          <?php if (!$neu && ($edit['kind'] ?? '') === 'snippet'): ?>
-            <hr><pre id="snip"><?= h($edit['body']) ?></pre>
-          <?php elseif (!$neu && trim((string)$edit['body']) !== ''): ?>
-            <hr><div class="sm"><?= md($edit['body']) ?></div>
-          <?php endif; ?>
           <?php if ($files): ?>
             <hr><ul class="li">
               <?php foreach ($files as $f): ?>
