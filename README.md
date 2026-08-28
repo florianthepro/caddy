@@ -78,17 +78,28 @@ Ausbildungsjahr aus dem Vertragsbeginn.
 
 ### Navigation
 
-Am Rechner eine Seitenleiste in drei Bloecken, jedes Ziel mit eigenem Symbol
-und eigener Farbe: `1` Heute · Schule `2` Faecher `3` Notizen `4` Noten
-`5` Plan · Betrieb `6` Berichtsheft `7` Einsaetze `8` Kontakte · Abschluss
-`9` Pruefung. Dazu `/` Suche, `n` neuer Eintrag, `Strg+K` Sprungliste.
+Eine Kopfleiste mit zwei Reihen - auf dem Handy genauso wie am Rechner. Oben
+sechs Gruppen, darunter ihre Unterpunkte:
 
-Auf dem Handy eine feste Leiste unten im Daumenbereich - Heute, Faecher,
-Suchen, Nachweis, Mehr - mit `env(safe-area-inset-bottom)`. Keine Schublade:
-die war reines JavaScript, ohne das es gar keine Navigation gab. *Mehr* listet
-jedes Ziel als Zeile mit Symbol, Wert und Chevron und ist damit zugleich die
-Antwortliste: Noten `2,13`, Berichtsheft `3,5 h`, Fehlzeiten `18 T frei`,
-Einsaetze `IT-Betrieb`.
+| Gruppe | Unterpunkte |
+|---|---|
+| Heute | – |
+| Schule | Faecher · Notizen · Noten |
+| Plan | Termine · Aufgaben · Stundenplan · Blockplan |
+| Betrieb | Berichtsheft · Einsaetze · Kontakte |
+| Abschluss | Pruefung · Projekt · Lernfelder |
+| Mehr | Alles · Profil · Quellen · Sicherheit · Daten |
+
+Keine Seitenleiste, keine Schublade, keine untere Leiste: dieselbe Struktur auf
+jedem Geraet, damit man an einer Stelle lernt, wo etwas liegt. Auf schmalen
+Schirmen scrollen beide Reihen waagerecht mit weicher Kante, die offene Gruppe
+rueckt von selbst ins Bild, und die Suchpille wird zum Knopf. Tasten `1`–`9`
+springen auf die ersten neun Unterpunkte, `/` in die Suche, `Strg+K` in die
+Sprungliste.
+
+*Mehr → Alles* listet jedes Ziel als Zeile mit Symbol, Wert und Chevron und ist
+damit zugleich die Antwortliste: Noten `2,13`, Berichtsheft `3,5 h`,
+Fehlzeiten `18 T frei`, Einsaetze `IT-Betrieb`.
 
 ### Suche
 
