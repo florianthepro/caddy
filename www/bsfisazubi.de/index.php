@@ -2502,6 +2502,127 @@ function tab_aktiv(string $p): string {
         default   => 'mehr',
     };
 }
+/**
+ * Die eine Frage, die die Uhr gerade stellt. Streng nach Zeitnaehe geordnet;
+ * jede Karte fuehrt auf die Seite, auf der man es selbst nachsieht.
+ * @return array{icon:string,farbe:string,titel:string,kontext:string,url:string}|null
+ */
+function jetzt_karte(array $u): ?array {
+    $uid = (int)$u['id'];
+    $heute = today();
+    $jetzt = date('H:i');
+
+    // Laeuft gerade Unterricht? Braucht Uhrzeiten aus einer Quelle.
+    $e = one("SELECT e.*, s.short, s.name AS fach FROM events e LEFT JOIN subjects s ON s.id = e.subject_id
+              WHERE e.user_id = ? AND e.typ = 'unterricht' AND e.datum = ?
+              AND e.zeit_von <> '' AND e.zeit_von <= ? AND (e.zeit_bis = '' OR e.zeit_bis >= ?)
+              ORDER BY e.zeit_von LIMIT 1", [$uid, $heute, $jetzt, $jetzt]);
+    if ($e) {
+        $folgt = one("SELECT e.*, s.short FROM events e LEFT JOIN subjects s ON s.id = e.subject_id
+                      WHERE e.user_id = ? AND e.typ = 'unterricht' AND e.datum = ? AND e.zeit_von > ?
+                      ORDER BY e.zeit_von LIMIT 1", [$uid, $heute, $e['zeit_von']]);
+        return ['icon' => 'raster', 'farbe' => '#7d5fff',
+            'titel' => trim(($e['short'] ?: $e['titel']) . ($e['raum'] ? ' · Raum ' . $e['raum'] : '')),
+            'kontext' => 'bis ' . substr((string)$e['zeit_bis'], 0, 5)
+                       . ($folgt ? ', danach ' . ($folgt['short'] ?: $folgt['titel']) : ''),
+            'url' => url('plan', ['t' => 'stundenplan'])];
+    }
+
+    // Termin heute
+    $e = one("SELECT e.*, s.short FROM events e LEFT JOIN subjects s ON s.id = e.subject_id
+              WHERE e.user_id = ? AND e.typ <> 'unterricht' AND e.datum = ?
+              ORDER BY e.zeit_von LIMIT 1", [$uid, $heute]);
+    if ($e) {
+        return ['icon' => 'termin', 'farbe' => '#5856d6', 'titel' => $e['titel'] . ' heute',
+            'kontext' => trim(typ_label($e['typ']) . ($e['zeit_von'] ? ' · ' . substr((string)$e['zeit_von'], 0, 5) : '')
+                         . ($e['short'] ? ' · ' . $e['short'] : '')),
+            'url' => url('plan', ['id' => (int)$e['id']])];
+    }
+
+    // Ueberfaellige Aufgabe
+    $t = one("SELECT * FROM tasks WHERE user_id = ? AND status = 'offen'
+              AND faellig IS NOT NULL AND faellig < ? ORDER BY faellig LIMIT 1", [$uid, $heute]);
+    if ($t) {
+        $tage = (int)floor((strtotime($heute) - strtotime($t['faellig'])) / 86400);
+        return ['icon' => 'aufgabe', 'farbe' => '#ff3b30', 'titel' => $t['titel'],
+            'kontext' => $tage . ' ' . ($tage === 1 ? 'Tag' : 'Tage') . ' ueberfaellig',
+            'url' => url('plan', ['t' => 'aufgaben', 'id' => (int)$t['id']])];
+    }
+
+    // Termin morgen
+    $morgen = date('Y-m-d', strtotime('+1 day'));
+    $e = one("SELECT e.*, s.short FROM events e LEFT JOIN subjects s ON s.id = e.subject_id
+              WHERE e.user_id = ? AND e.typ <> 'unterricht' AND e.datum = ?
+              ORDER BY e.zeit_von LIMIT 1", [$uid, $morgen]);
+    if ($e) {
+        return ['icon' => 'termin', 'farbe' => '#ff9500', 'titel' => $e['titel'] . ' morgen',
+            'kontext' => trim(typ_label($e['typ']) . ($e['stoff'] ? ' · ' . mb_substr(str_replace("\n", ', ', $e['stoff']), 0, 60) : '')),
+            'url' => url('plan', ['id' => (int)$e['id']])];
+    }
+
+    // Projektfrist in Sicht
+    $pj = one("SELECT * FROM projekt WHERE user_id = ? ORDER BY id LIMIT 1", [$uid]);
+    if ($pj) {
+        // Als Frist gelesen braucht es die Handlung, nicht den Zustand
+        $tun = ['antrag' => 'Antrag einreichen', 'genehmigt' => 'Genehmigung erwartet',
+                'von' => 'Projekt beginnt', 'bis' => 'Projekt abschliessen',
+                'doku' => 'Dokumentation abgeben', 'praesentation' => 'Praesentation'];
+        foreach (projekt_termine() as $k => $lbl) {
+            if (!$pj[$k] || $pj[$k] < $heute) continue;
+            $tage = (int)ceil((strtotime($pj[$k]) - strtotime($heute)) / 86400);
+            if ($tage > 14) break;
+            return ['icon' => 'projekt', 'farbe' => '#e11d48',
+                'titel' => ($tun[$k] ?? $lbl) . ' in ' . $tage . ' ' . ($tage === 1 ? 'Tag' : 'Tagen'),
+                'kontext' => $pj['titel'] ?: 'Abschlussprojekt',
+                'url' => url('pruefung', ['t' => 'projekt'])];
+        }
+    }
+
+    // Gegen Ende der Woche: steht der Nachweis?
+    $wtag = (int)date('N');
+    $art = $u['bh_art']; $per = periode_of($heute, $art);
+    $rep = report_get($uid, $art, $per);
+    if ($wtag >= 4 && $rep['status'] !== 'fertig') {
+        $sum = report_sum((int)$rep['id']);
+        $leer = 0;
+        $d = new DateTimeImmutable($rep['von']); $ende = new DateTimeImmutable(min($rep['bis'], $heute));
+        while ($d <= $ende) {
+            if ((int)$d->format('N') <= 5 && empty($sum['tag'][$d->format('Y-m-d')])) $leer++;
+            $d = $d->modify('+1 day');
+        }
+        return ['icon' => 'bericht', 'farbe' => '#af52de',
+            'titel' => 'Nachweis ' . periode_label($per, $art) . ' offen',
+            'kontext' => num((float)$sum['std'], 1) . ' h erfasst'
+                       . ($leer ? ' · ' . $leer . ' ' . ($leer === 1 ? 'Tag' : 'Tage') . ' ohne Eintrag' : ''),
+            'url' => url('berichtsheft')];
+    }
+
+    // Laufender Block oder Ferien
+    $b = one("SELECT * FROM blocks WHERE user_id = ? AND ? BETWEEN von AND bis
+              ORDER BY (art = 'schule') DESC LIMIT 1", [$uid, $heute]);
+    if ($b) {
+        $rest = (int)ceil((strtotime($b['bis']) - strtotime($heute)) / 86400);
+        return ['icon' => $b['art'] === 'schule' ? 'plan' : 'frei',
+            'farbe' => $b['art'] === 'schule' ? '#0f5fa8' : '#00b894',
+            'titel' => ($b['label'] ?: ucfirst((string)$b['art'])) . ' bis ' . dt($b['bis'], 'd.m.'),
+            'kontext' => $rest > 0 ? 'noch ' . $rest . ' ' . ($rest === 1 ? 'Tag' : 'Tage') : 'letzter Tag',
+            'url' => url('plan', ['t' => 'block'])];
+    }
+
+    // Sonst: der naechste Termin, wenn er in Sicht ist
+    $e = one("SELECT e.*, s.short FROM events e LEFT JOIN subjects s ON s.id = e.subject_id
+              WHERE e.user_id = ? AND e.typ <> 'unterricht' AND e.datum > ?
+              ORDER BY e.datum, e.zeit_von LIMIT 1", [$uid, $heute]);
+    if ($e) {
+        $tage = (int)ceil((strtotime($e['datum']) - strtotime($heute)) / 86400);
+        if ($tage <= 21) {
+            return ['icon' => 'termin', 'farbe' => '#5856d6',
+                'titel' => $e['titel'], 'kontext' => 'in ' . $tage . ' Tagen · ' . dt($e['datum'], 'D d.m.'),
+                'url' => url('plan', ['id' => (int)$e['id']])];
+        }
+    }
+    return null;
+}
 /** Aktueller Wert je Ziel - die Zielliste ist zugleich die Antwortliste. */
 function ziel_werte(array $u): array {
     $uid = (int)$u['id'];
@@ -2725,6 +2846,12 @@ font-size:13.5px;min-width:0;flex:1}
 .sf1 input:focus{outline:none}
 .sf1 kbd{font:11px var(--mo);color:var(--fg3);background:transparent;padding:0}
 .ct{padding:18px;max-width:1220px;width:100%}
+.jetzt{display:flex;align-items:center;gap:13px;padding:14px 15px;color:var(--fg)}
+.jetzt:hover{text-decoration:none}
+.jetzt .tile{width:38px;height:38px;border-radius:9px}
+.jetzt .tx{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.jetzt .tx b{font-size:19px;font-weight:640;letter-spacing:-.02em;line-height:1.22}
+.jetzt>.ic{color:var(--fg3)}
 .ph{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:2px 0 16px}
 .ph .pt{min-width:0}
 .ph .pt{max-width:100%}
@@ -3942,7 +4069,16 @@ function p_start(): void {
     foreach (all("SELECT datum FROM events WHERE user_id = ? AND typ <> 'unterricht' AND datum BETWEEN ? AND date(?,'+6 day')", [$uid, $mo, $mo]) as $r) $marks[$r['datum']]['e'] = true;
     foreach (all("SELECT faellig FROM tasks WHERE user_id = ? AND status='offen' AND faellig BETWEEN ? AND date(?,'+6 day')", [$uid, $mo, $mo]) as $r) $marks[$r['faellig']]['t'] = true;
 
+    $jetzt = jetzt_karte($u);
     ob_start(); ?>
+    <?php if ($jetzt): ?>
+      <a class="c jetzt" href="<?= h($jetzt['url']) ?>">
+        <span class="tile" style="background:<?= h($jetzt['farbe']) ?>"><?= ic($jetzt['icon'], 21) ?></span>
+        <span class="tx"><b><?= h($jetzt['titel']) ?></b>
+          <span class="sm mu"><?= h($jetzt['kontext']) ?></span></span>
+        <?= ic('weiter', 18) ?>
+      </a>
+    <?php endif; ?>
     <div class="c"><div class="bo" style="padding:9px 12px">
       <div class="rw" style="gap:3px;flex-wrap:nowrap">
         <?php $d = new DateTimeImmutable($mo); for ($i = 0; $i < 7; $i++):
