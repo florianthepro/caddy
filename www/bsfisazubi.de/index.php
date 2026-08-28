@@ -4560,35 +4560,35 @@ function p_noten(): void {
           <div class="hd"><h2>Noten</h2><span class="sp"></span>
             <a class="bt s g" href="<?= url('export', ['w' => 'noten']) ?>">CSV</a></div>
           <?php if (!$g['rows']): ?><?= em('Keine Noten.') ?><?php else: ?>
-          <div class="tw"><table><thead><tr><th>Datum</th><th>Fach</th><th>Art</th><th>Titel</th><th class="n">Note</th><th class="n">Gew</th></tr></thead><tbody>
-            <?php foreach (array_reverse($g['rows']) as $r): $n = to_note((float)$r['wert'], $r['skala']); ?>
-              <tr>
-                <td class="mo sm" style="white-space:nowrap"><?= h(dt($r['datum'], 'd.m.y')) ?></td>
-                <td class="sm"><?= h($r['short'] ?: ($r['fach'] ?: '–')) ?></td>
-                <td><span class="tg"><?= h($r['art']) ?></span></td>
-                <td><a href="<?= url('noten', ['id' => $r['id']]) ?>"><?= h($r['titel'] ?: '–') ?></a></td>
-                <td class="n"><?= npill($n) ?><?= $r['skala'] !== 'note' ? ' <span class="mu2 sm">' . num((float)$r['wert'], 0) . '</span>' : '' ?></td>
-                <td class="n"><?= num((float)$r['gewicht'], 1) ?></td>
-              </tr>
+          <ul class="li rows">
+            <?php foreach (array_reverse($g['rows']) as $r): $n = to_note((float)$r['wert'], $r['skala']);
+              $neben = array_filter([$r['short'] ?: ($r['fach'] ?: ''), $r['art'], dt($r['datum'], 'd.m.y'),
+                                     (float)$r['gewicht'] != 1.0 ? 'Gewicht ' . num((float)$r['gewicht'], 1) : '']); ?>
+              <li><a href="<?= url('noten', ['id' => $r['id']]) ?>">
+                <span class="tile t-noten"><?= ic('noten', 17) ?></span>
+                <span class="tx"><b><?= h($r['titel'] ?: ($r['art'] ?: 'Note')) ?></b>
+                  <span class="sm mu2"><?= h(implode(' · ', $neben)) ?></span></span>
+                <?= npill($n) ?></a></li>
             <?php endforeach; ?>
-          </tbody></table></div>
+          </ul>
           <?php endif; ?>
         </div>
         <?php if ($g['faecher']): ?>
         <div class="c">
           <div class="hd"><h2>Faecher</h2></div>
-          <div class="tw"><table><thead><tr><th>Fach</th><th class="n">Schnitt</th><th class="n">Anz</th><th>Verlauf</th><th>Tendenz</th></tr></thead><tbody>
-            <?php foreach ($g['faecher'] as $f): if ($f['schnitt'] === null) continue; ?>
-              <tr><td><?= h($f['name']) ?></td>
-                <td class="n"><?= npill($f['schnitt']) ?></td>
-                <td class="n"><?= (int)$f['anzahl'] ?></td>
-                <td style="width:100px"><?= spark($f['n']) ?></td>
-                <td class="sm"><?php if ($f['trend'] === null): ?><span class="mu2">–</span>
-                  <?php elseif ($f['trend'] > 0.15): ?><span style="color:var(--ok)">besser</span>
-                  <?php elseif ($f['trend'] < -0.15): ?><span style="color:var(--er)">schlechter</span>
-                  <?php else: ?><span class="mu">stabil</span><?php endif; ?></td></tr>
+          <ul class="li rows">
+            <?php foreach ($g['faecher'] as $f): if ($f['schnitt'] === null) continue;
+              $tend = $f['trend'] === null ? '' : ($f['trend'] > 0.15 ? 'wird besser'
+                    : ($f['trend'] < -0.15 ? 'wird schlechter' : 'stabil')); ?>
+              <li>
+                <span class="tile" style="background:<?= h($f['color']) ?>"><?= ic('faecher', 17) ?></span>
+                <span class="tx"><b><?= h($f['name']) ?></b>
+                  <span class="sm mu2"><?= (int)$f['anzahl'] ?> <?= (int)$f['anzahl'] === 1 ? 'Note' : 'Noten' ?><?= $tend ? ' · ' . h($tend) : '' ?></span></span>
+                <?= count($f['n']) >= 2 ? spark($f['n'], 74, 20) : '' ?>
+                <?= npill($f['schnitt']) ?>
+              </li>
             <?php endforeach; ?>
-          </tbody></table></div>
+          </ul>
         </div>
         <?php endif; ?>
       </div>
