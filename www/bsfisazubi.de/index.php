@@ -605,11 +605,13 @@ function seed_global(PDO $pdo): void {
 
 /** Legt fuer ein neues Konto Faecher und die ueblichen Routinen an. */
 function seed_user(int $uid): void {
-    $farben = ['#2563eb','#0d9488','#7c3aed','#ea580c','#0891b2','#dc2626'];
+    // Zwoelf Lernfelder, zwoelf Farben - sonst ist ein Fach an der Farbe nicht erkennbar
+    $farben = ['#0071e3','#00a09a','#7c3aed','#ea580c','#0891b2','#dc2626',
+               '#2d7a2d','#b8860b','#c026d3','#0f5fa8','#a2560b','#5856d6'];
     foreach (all("SELECT * FROM lernfelder ORDER BY nr") as $i => $l) {
         ins('subjects', ['user_id' => $uid, 'name' => $l['code'] . ' ' . $l['titel'],
             'short' => $l['code'], 'lf_no' => (int)$l['nr'], 'sort' => (int)$l['nr'] * 10,
-            'color' => $farben[$i % 6]]);
+            'color' => $farben[$i % count($farben)]]);
     }
     foreach (['Deutsch', 'Englisch', 'Politik und Gesellschaft', 'Religion / Ethik', 'Sport'] as $i => $n) {
         ins('subjects', ['user_id' => $uid, 'name' => $n, 'short' => mb_substr($n, 0, 2),
@@ -1976,6 +1978,30 @@ function such_ausdruck(array $worte): string {
     }
     return implode(' ', $t);
 }
+/**
+ * Rangzahl eines Treffers: wie gut passt der Titel, wie frisch ist er.
+ * Grosse Zahl heisst weiter oben.
+ */
+function treffer_rang(array $t, array $worte): float {
+    $titel = mb_strtolower((string)$t['titel']);
+    $r = 0.0;
+    foreach ($worte as $w) {
+        $w = mb_strtolower($w);
+        if ($w === '') continue;
+        if ($titel === $w)                    $r += 60;
+        elseif (str_starts_with($titel, $w))  $r += 40;
+        elseif (preg_match('/\b' . preg_quote($w, '/') . '/u', $titel)) $r += 30;
+        elseif (str_contains($titel, $w))     $r += 18;
+        else                                  $r += 4;   // nur im Text gefunden
+    }
+    // Frische: was in den letzten zwei Jahren liegt, steigt sanft
+    $d = (string)($t['datum'] ?? '');
+    if (isodate($d)) {
+        $tage = (strtotime(today()) - strtotime($d)) / 86400;
+        $r += max(0, 22 - abs($tage) / 34);
+    }
+    return $r;
+}
 function suche(int $uid, string $q, int $limit = 40): array {
     [$worte, $f] = such_zerlegen($q);
     $ausdruck = such_ausdruck($worte);
@@ -1985,9 +2011,9 @@ function suche(int $uid, string $q, int $limit = 40): array {
             // FTS5-Spalten haben keine Affinitaet: PDO bindet Zahlen als Text,
             // deshalb muss die Kontonummer ausdruecklich als Integer verglichen werden.
             $rows = all("SELECT art, ref, datum, titel,
-                         snippet(such, 5, '[', ']', '…', 14) AS aus, bm25(such) AS rang
+                         snippet(such, 5, '', '', '…', 14) AS aus, bm25(such) AS rang
                          FROM such WHERE such MATCH ? AND uid = CAST(? AS INTEGER)
-                         ORDER BY rang LIMIT " . (int)($limit * 2),
+                         ORDER BY rang LIMIT " . (int)($limit * 3),
                         [$ausdruck, $uid]);
         } catch (Throwable $e) { $rows = []; }
         foreach ($rows as $r) $treffer[] = ['art' => $r['art'], 'ref' => (int)$r['ref'],
@@ -2004,22 +2030,25 @@ function suche(int $uid, string $q, int $limit = 40): array {
             }
         }
     }
-    // Ansprechpartner und Einsaetze liegen nicht im Volltextindex
-    if ($worte && !$f['lf'] && !$f['fach']) {
-        $l = '%' . implode('%', $worte) . '%';
-        foreach (all("SELECT id, name, rolle, bereich, mail, telefon FROM kontakte
-                      WHERE user_id = ? AND (name LIKE ? OR rolle LIKE ? OR notiz LIKE ? OR mail LIKE ?)
-                      LIMIT 8", [$uid, $l, $l, $l, $l]) as $r) {
-            $treffer[] = ['art' => 'kontakt', 'ref' => (int)$r['id'], 'datum' => '',
-                'titel' => $r['name'], 'aus' => trim($r['rolle'] . ' · ' . $r['bereich'] . ' · ' . $r['mail'], ' ·')];
-        }
-        foreach (all("SELECT id, abteilung, von, bis, schwerpunkt FROM einsaetze
-                      WHERE user_id = ? AND (abteilung LIKE ? OR schwerpunkt LIKE ? OR notiz LIKE ?)
-                      LIMIT 8", [$uid, $l, $l, $l]) as $r) {
-            $treffer[] = ['art' => 'einsatz', 'ref' => (int)$r['id'], 'datum' => $r['von'],
-                'titel' => $r['abteilung'], 'aus' => (string)$r['schwerpunkt']];
+    // Was nicht im Volltextindex liegt, wird direkt gesucht
+    // Ein Filter ohne Suchwort listet, was der Filter meint
+    if (!$worte && ($f['lf'] !== null || $f['typ'] || $f['fach'])) {
+        $treffer = such_filterliste($uid, $f);
+    }
+    // Unter drei Zeichen nur Wortanfaenge, sonst trifft "ur" auf "durchfuehren"
+    if ($worte && mb_strlen(implode('', $worte)) >= 3) {
+        $treffer = array_merge($treffer, such_direkt($uid, $worte));
+    }
+    // Deutsche Komposita: findet die Praefixsuche zu wenig, wird auch im Wort gesucht
+    if ($worte && count($treffer) < 5 && mb_strlen(implode('', $worte)) >= 4) {
+        $vorhanden = [];
+        foreach ($treffer as $t) $vorhanden[$t['art'] . ':' . $t['ref']] = true;
+        foreach (such_infix($uid, $worte) as $t) {
+            if (!isset($vorhanden[$t['art'] . ':' . $t['ref']])) $treffer[] = $t;
         }
     }
+    // Eigene Rangfolge: Titeltreffer vor Texttreffer, frisch vor alt
+    usort($treffer, fn($a, $b) => treffer_rang($b, $worte) <=> treffer_rang($a, $worte));
     // Filter nachziehen
     if ($f['typ']) $treffer = array_values(array_filter($treffer, fn($t) => $t['art'] === $f['typ']));
     if ($f['lf'] !== null) {
@@ -2032,8 +2061,7 @@ function suche(int $uid, string $q, int $limit = 40): array {
         $treffer = array_values(array_filter($treffer, fn($t) => isset($ok[$t['art'] . ':' . $t['ref']])));
     }
     if ($f['fach']) {
-        $fid = (int)val("SELECT id FROM subjects WHERE user_id = ? AND (short = ? COLLATE NOCASE OR name LIKE ?)
-                         LIMIT 1", [$uid, $f['fach'], '%' . $f['fach'] . '%'], 0);
+        $fid = fach_finden($uid, $f['fach']);
         if ($fid) {
             $ok = [];
             foreach (['notiz' => 'notes', 'termin' => 'events', 'aufgabe' => 'tasks'] as $art => $tab) {
@@ -2046,39 +2074,353 @@ function suche(int $uid, string $q, int $limit = 40): array {
     }
     return array_slice($treffer, 0, $limit);
 }
+/**
+ * Faecher, Lernfelder, Noten, Projekt, Abwesenheiten, Bloecke, Dateien und
+ * Berufsbildpositionen haben keinen Volltextindex - die kommen von hier.
+ */
+function such_direkt(int $uid, array $worte): array {
+    $l = '%' . implode('%', $worte) . '%';
+    $t = [];
+    foreach (all("SELECT id, name, short, lehrer, lf_no FROM subjects
+                  WHERE user_id = ? AND archiv = 0 AND (name LIKE ? OR short LIKE ? OR lehrer LIKE ?)
+                  ORDER BY sort, name LIMIT 8", [$uid, $l, $l, $l]) as $r) {
+        $t[] = ['art' => 'fach', 'ref' => (int)$r['id'], 'datum' => '', 'titel' => $r['name'],
+                'aus' => trim(($r['short'] ?: '') . ' ' . ($r['lehrer'] ?: ''))];
+    }
+    foreach (all("SELECT nr, code, titel, jahr FROM lernfelder
+                  WHERE code LIKE ? OR titel LIKE ? ORDER BY nr LIMIT 8", [$l, $l]) as $r) {
+        $t[] = ['art' => 'lernfeld', 'ref' => (int)$r['nr'], 'datum' => '',
+                'titel' => $r['code'] . ' ' . $r['titel'], 'aus' => (int)$r['jahr'] . '. Ausbildungsjahr'];
+    }
+    foreach (all("SELECT g.id, g.titel, g.datum, g.wert, g.skala, g.art, COALESCE(s.name, g.fach_text) AS fach
+                  FROM grades g LEFT JOIN subjects s ON s.id = g.subject_id
+                  WHERE g.user_id = ? AND (g.titel LIKE ? OR g.bemerkung LIKE ? OR g.fach_text LIKE ? OR s.name LIKE ?)
+                  ORDER BY g.datum DESC LIMIT 8", [$uid, $l, $l, $l, $l]) as $r) {
+        $n = to_note((float)$r['wert'], $r['skala']);
+        $t[] = ['art' => 'note', 'ref' => (int)$r['id'], 'datum' => $r['datum'],
+                'titel' => ($r['titel'] ?: $r['art']) . ' · ' . ($r['fach'] ?: 'ohne Fach'),
+                'aus' => $n !== null ? 'Note ' . num($n, 1) : ''];
+    }
+    foreach (all("SELECT id, titel, status, doku, praesentation FROM projekt
+                  WHERE user_id = ? AND (titel LIKE ? OR beschreibung LIKE ? OR notiz LIKE ?)
+                  LIMIT 3", [$uid, $l, $l, $l]) as $r) {
+        $t[] = ['art' => 'projekt', 'ref' => (int)$r['id'], 'datum' => $r['doku'] ?: $r['praesentation'],
+                'titel' => $r['titel'] ?: 'Abschlussprojekt', 'aus' => (string)$r['status']];
+    }
+    foreach (all("SELECT id, name, rolle, bereich, mail, telefon FROM kontakte
+                  WHERE user_id = ? AND (name LIKE ? OR rolle LIKE ? OR notiz LIKE ? OR mail LIKE ?)
+                  LIMIT 8", [$uid, $l, $l, $l, $l]) as $r) {
+        $t[] = ['art' => 'kontakt', 'ref' => (int)$r['id'], 'datum' => '', 'titel' => $r['name'],
+                'aus' => trim($r['rolle'] . ' · ' . $r['bereich'] . ' · ' . $r['mail'], ' ·')];
+    }
+    foreach (all("SELECT id, abteilung, von, schwerpunkt FROM einsaetze
+                  WHERE user_id = ? AND (abteilung LIKE ? OR schwerpunkt LIKE ? OR ansprech LIKE ? OR notiz LIKE ?)
+                  LIMIT 8", [$uid, $l, $l, $l, $l]) as $r) {
+        $t[] = ['art' => 'einsatz', 'ref' => (int)$r['id'], 'datum' => $r['von'],
+                'titel' => $r['abteilung'], 'aus' => (string)$r['schwerpunkt']];
+    }
+    foreach (all("SELECT id, von, bis, art, grund FROM absences
+                  WHERE user_id = ? AND (art LIKE ? OR grund LIKE ?)
+                  ORDER BY von DESC LIMIT 6", [$uid, $l, $l]) as $r) {
+        $t[] = ['art' => 'abwesend', 'ref' => (int)$r['id'], 'datum' => $r['von'],
+                'titel' => ucfirst($r['art']) . ($r['grund'] ? ': ' . $r['grund'] : ''),
+                'aus' => dt($r['von'], 'd.m.y') . ($r['bis'] !== $r['von'] ? ' bis ' . dt($r['bis'], 'd.m.y') : '')];
+    }
+    foreach (all("SELECT id, von, bis, art, label FROM blocks
+                  WHERE user_id = ? AND (label LIKE ? OR art LIKE ?)
+                  AND bis >= date('now','localtime','-90 day')
+                  ORDER BY von LIMIT 6", [$uid, $l, $l]) as $r) {
+        $t[] = ['art' => 'block', 'ref' => (int)$r['id'], 'datum' => $r['von'],
+                'titel' => $r['label'] ?: ucfirst($r['art']),
+                'aus' => dt($r['von'], 'd.m.y') . ' bis ' . dt($r['bis'], 'd.m.y')];
+    }
+    foreach (all("SELECT id, name, abschnitt, pos_no FROM categories
+                  WHERE name LIKE ? OR pos_no LIKE ? ORDER BY sort LIMIT 6", [$l, $l]) as $r) {
+        $t[] = ['art' => 'position', 'ref' => (int)$r['id'], 'datum' => '',
+                'titel' => trim($r['pos_no'] . ' ' . $r['name']), 'aus' => 'Berufsbildposition'];
+    }
+    foreach (all("SELECT id, name, groesse FROM files WHERE user_id = ? AND name LIKE ? LIMIT 6", [$uid, $l]) as $r) {
+        $t[] = ['art' => 'datei', 'ref' => (int)$r['id'], 'datum' => '', 'titel' => $r['name'],
+                'aus' => num((float)$r['groesse'] / 1024, 0) . ' kB'];
+    }
+    return $t;
+}
+/** Fach ueber Kuerzel oder Name finden; "LF3" soll auch "LF 3" treffen. */
+function fach_finden(int $uid, string $q): int {
+    $eng = mb_strtolower(preg_replace('/\s+/', '', $q));
+    foreach (all("SELECT id, name, short FROM subjects WHERE user_id = ?", [$uid]) as $r) {
+        foreach ([$r['short'], $r['name']] as $kandidat) {
+            $k = mb_strtolower(preg_replace('/\s+/', '', (string)$kandidat));
+            if ($k !== '' && ($k === $eng || str_starts_with($k, $eng))) return (int)$r['id'];
+        }
+    }
+    return (int)val("SELECT id FROM subjects WHERE user_id = ? AND name LIKE ? LIMIT 1",
+                    [$uid, '%' . $q . '%'], 0);
+}
+/** lf:9, typ:notiz oder fach:LF9 ohne Suchwort - dann ist der Filter die Frage. */
+function such_filterliste(int $uid, array $f): array {
+    $t = [];
+    $fid = null;
+    if ($f['fach']) {
+        $fid = fach_finden($uid, $f['fach']);
+        if (!$fid) return [];
+    }
+    // hat_lf: nur notes und events fuehren eine Lernfeldnummer
+    foreach ([['notiz', 'notes', 'datum', 'titel', 'body', true],
+              ['termin', 'events', 'datum', 'titel', 'beschreibung', true],
+              ['aufgabe', 'tasks', "COALESCE(faellig,'')", 'titel', 'beschreibung', false]] as [$art, $tab, $d, $ti, $tx, $hat_lf]) {
+        if ($f['typ'] && $f['typ'] !== $art) continue;
+        if ($f['lf'] !== null && !$hat_lf) continue;
+        $w = ['user_id = ?']; $a = [$uid];
+        if ($f['lf'] !== null) { $w[] = 'lf_no = ?';      $a[] = $f['lf']; }
+        if ($fid)              { $w[] = 'subject_id = ?'; $a[] = $fid; }
+        foreach (all("SELECT id, $d AS datum, $ti AS titel, $tx AS text FROM $tab
+                      WHERE " . implode(' AND ', $w) . " ORDER BY $d DESC LIMIT 30", $a) as $r) {
+            $t[] = ['art' => $art, 'ref' => (int)$r['id'], 'datum' => $r['datum'],
+                    'titel' => mb_substr((string)$r['titel'], 0, 120),
+                    'aus' => mb_substr((string)$r['text'], 0, 120)];
+        }
+    }
+    if ((!$f['typ'] || $f['typ'] === 'bericht') && !$fid) {
+        $w = ['user_id = ?']; $a = [$uid];
+        if ($f['lf'] !== null) { $w[] = 'lf_no = ?'; $a[] = $f['lf']; }
+        foreach (all("SELECT id, datum, text FROM report_entries
+                      WHERE " . implode(' AND ', $w) . " ORDER BY datum DESC LIMIT 30", $a) as $r) {
+            $t[] = ['art' => 'bericht', 'ref' => (int)$r['id'], 'datum' => $r['datum'],
+                    'titel' => mb_substr((string)$r['text'], 0, 120), 'aus' => ''];
+        }
+    }
+    if ((!$f['typ'] || $f['typ'] === 'routine') && $f['lf'] === null && !$fid) {
+        foreach (all("SELECT id, name FROM routines WHERE user_id = ? AND aktiv = 1
+                      ORDER BY sort, name LIMIT 30", [$uid]) as $r) {
+            $t[] = ['art' => 'routine', 'ref' => (int)$r['id'], 'datum' => '',
+                    'titel' => $r['name'], 'aus' => ''];
+        }
+    }
+    return $t;
+}
+/** Suche mitten im Wort - noetig, weil Deutsch zusammensetzt ("Kaffeemaschine"). */
+function such_infix(int $uid, array $worte): array {
+    $l = '%' . implode('%', $worte) . '%';
+    $t = [];
+    foreach ([['notiz', 'notes', 'datum', 'titel', 'body'],
+              ['termin', 'events', 'datum', 'titel', 'beschreibung'],
+              ['aufgabe', 'tasks', "COALESCE(faellig,'')", 'titel', 'beschreibung'],
+              ['bericht', 'report_entries', 'datum', 'text', 'text'],
+              ['routine', 'routines', "''", 'name', 'name']] as [$art, $tab, $d, $ti, $tx]) {
+        foreach (all("SELECT id, $d AS datum, $ti AS titel, $tx AS text FROM $tab
+                      WHERE user_id = ? AND ($ti LIKE ? OR $tx LIKE ?)
+                      ORDER BY $d DESC LIMIT 6", [$uid, $l, $l]) as $r) {
+            $t[] = ['art' => $art, 'ref' => (int)$r['id'], 'datum' => $r['datum'],
+                    'titel' => mb_substr((string)$r['titel'], 0, 120),
+                    'aus' => mb_substr((string)$r['text'], 0, 120)];
+        }
+    }
+    return $t;
+}
 function such_ziel(string $art, int $ref, string $datum, array $u): string {
     return match ($art) {
         'notiz'   => url('notizen', ['id' => $ref]),
-        'termin'  => url('termine', ['id' => $ref]),
-        'aufgabe' => url('aufgaben', ['id' => $ref]),
+        'termin'  => url('plan', ['id' => $ref]),
+        'aufgabe' => url('plan', ['t' => 'aufgaben', 'id' => $ref]),
         'bericht' => url('berichtsheft', ['periode' => periode_of($datum ?: today(), $u['bh_art']), 'art' => $u['bh_art']]),
-        'kontakt' => url('kontakte', ['id' => $ref]),
-        'einsatz' => url('einsaetze', ['id' => $ref]),
-        default   => url('routinen', ['id' => $ref]),
+        'kontakt'  => url('kontakte', ['id' => $ref]),
+        'einsatz'  => url('einsaetze', ['id' => $ref]),
+        'fach'     => url('faecher', ['id' => $ref]),
+        'lernfeld' => url('notizen', ['lf' => $ref]),
+        'note'     => url('noten', ['id' => $ref]),
+        'projekt'  => url('pruefung', ['t' => 'projekt']),
+        'abwesend' => url('einsaetze', ['t' => 'zeiten']),
+        'block'    => url('plan', ['t' => 'block']),
+        'position' => url('berichtsheft', ['t' => 'plan']),
+        'datei'    => url('datei', ['id' => $ref]),
+        default    => url('berichtsheft', ['t' => 'routinen', 'id' => $ref]),
     };
+}
+/** Symbolname je Trefferart. */
+function art_icon(string $a): string {
+    return ['notiz'=>'notizen','termin'=>'termin','aufgabe'=>'aufgabe','bericht'=>'bericht',
+            'routine'=>'routine','kontakt'=>'kontakt','einsatz'=>'einsatz','fach'=>'faecher',
+            'lernfeld'=>'faecher','note'=>'noten','projekt'=>'projekt','abwesend'=>'einsatz',
+            'block'=>'plan','position'=>'pruefung','datei'=>'datei'][$a] ?? 'notizen';
 }
 function art_label(string $a): string {
     return ['notiz'=>'Notiz','termin'=>'Termin','aufgabe'=>'Aufgabe','bericht'=>'Bericht','routine'=>'Routine',
-            'kontakt'=>'Ansprechpartner','einsatz'=>'Einsatz'][$a] ?? $a;
+            'kontakt'=>'Ansprechpartner','einsatz'=>'Einsatz','fach'=>'Fach','lernfeld'=>'Lernfeld',
+            'note'=>'Note','projekt'=>'Projekt','abwesend'=>'Fehlzeit','block'=>'Schulblock',
+            'position'=>'Berufsbildposition','datei'=>'Datei'][$a] ?? $a;
 }
 
 // ===========================================================================
 //  Oberflaeche
 // ===========================================================================
 
+/**
+ * Symbolsatz, 24er-Raster, nur Striche, currentColor. Inline, weil die CSP
+ * keine fremden Quellen zulaesst und ein Symbol nie nachladen soll.
+ */
+function icons(): array {
+    return [
+        'heute'   => '<rect x="3" y="3.5" width="18" height="17" rx="2.8"/><path d="M3 9.5h18M10 9.5v11"/>',
+        'faecher' => '<path d="M12 6.9C10.4 5.3 8.3 4.8 4.5 4.8v12.4c3.8 0 5.9.5 7.5 2.1 1.6-1.6 3.7-2.1 7.5-2.1V4.8c-3.8 0-5.9.5-7.5 2.1z"/><path d="M12 6.9v12.4"/>',
+        'notizen' => '<path d="M12.5 20H20"/><path d="M16.2 3.8a2.05 2.05 0 0 1 2.9 2.9L8.6 17.2l-3.9 1 1-3.9L16.2 3.8z"/>',
+        'noten'   => '<path d="M5 20v-5.5M12 20V8M19 20v-9"/><path d="M3.5 20h17"/>',
+        'plan'    => '<rect x="3" y="5" width="18" height="16" rx="2.5"/><path d="M3 10h18M8 3v4M16 3v4"/><path d="M7.5 14h2M11 14h2M14.5 14h2M7.5 17.5h2M11 17.5h2"/>',
+        'bericht' => '<path d="M9 4H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-2"/><rect x="9" y="2.5" width="6" height="3.5" rx="1"/><path d="M8.5 12.5l2 2 4-4"/>',
+        'einsatz' => '<rect x="2.5" y="7.5" width="19" height="13" rx="2"/><path d="M8.5 7.5V5.5a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v2"/><path d="M2.5 12.5h19"/>',
+        'kontakt' => '<circle cx="12" cy="8" r="3.75"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/>',
+        'pruefung'=> '<circle cx="12" cy="9" r="6"/><path d="M8.6 14.2L7.5 21.5l4.5-2.6 4.5 2.6-1.1-7.3"/>',
+        'suche'   => '<circle cx="11" cy="11" r="7"/><path d="M16.2 16.2L21 21"/>',
+        'zahnrad' => '<path d="M4 21v-6M4 11V3M12 21v-8M12 9V3M20 21v-4M20 13V3"/><path d="M1.5 15h5M9.5 9h5M17.5 13h5"/>',
+        'teilen'  => '<path d="M9.5 13.5a4.4 4.4 0 0 0 6.6.5l2.6-2.6a4.4 4.4 0 0 0-6.2-6.2l-1.5 1.5"/><path d="M14.5 10.5a4.4 4.4 0 0 0-6.6-.5l-2.6 2.6a4.4 4.4 0 0 0 6.2 6.2l1.5-1.5"/>',
+        'termin'  => '<circle cx="12" cy="12" r="8.5"/><path d="M12 6.8V12l3.4 2"/>',
+        'routine' => '<path d="M16.5 2.5L20 6l-3.5 3.5"/><path d="M3.5 11V9.5A3.5 3.5 0 0 1 7 6h13"/><path d="M7.5 21.5L4 18l3.5-3.5"/><path d="M20.5 13v1.5a3.5 3.5 0 0 1-3.5 3.5H4"/>',
+        'aufgabe' => '<rect x="3.5" y="3.5" width="17" height="17" rx="3"/><path d="M8 12.2l2.6 2.6L16 9.5"/>',
+        'datei'   => '<path d="M13.5 3.5H7A2 2 0 0 0 5 5.5v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13.5 3.5V9H19"/>',
+        'projekt' => '<path d="M5 21V4.5"/><path d="M5 5h11.5l-2 3.5 2 3.5H5"/>',
+        'schloss' => '<rect x="4" y="10.5" width="16" height="10.5" rx="2.4"/><path d="M8 10.5V7.2a4 4 0 0 1 8 0v3.3"/>',
+        'import'  => '<path d="M12 3.5v11"/><path d="M8 11l4 4 4-4"/><path d="M4.5 17v2a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2"/>',
+        'raster'  => '<rect x="3" y="4" width="18" height="16" rx="2.4"/><path d="M3 9.5h18M9 9.5V20M15 9.5V20"/>',
+        'liste'   => '<path d="M9 6.5h11M9 12h11M9 17.5h11"/><path d="M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01"/>',
+        'weiter'  => '<path d="M9 5.5L15.5 12 9 18.5"/>',
+        'zurueck' => '<path d="M15 5.5L8.5 12l6.5 6.5"/>',
+    ];
+}
+function ic(string $name, int $groesse = 20): string {
+    $pfad = icons()[$name] ?? '';
+    if ($pfad === '') return '';
+    return '<svg class="ic" width="' . $groesse . '" height="' . $groesse . '" viewBox="0 0 24 24"'
+         . ' fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"'
+         . ' stroke-linejoin="round" aria-hidden="true">' . $pfad . '</svg>';
+}
+
+/**
+ * Jedes Ziel der App mit den Woertern, unter denen jemand danach sucht.
+ * Symbol, Beschriftung, Bereich, Suchwoerter, Adresse.
+ */
+function ziele_index(): array {
+    static $z = null;
+    if ($z !== null) return $z;
+    return $z = [
+        ['heute',   'Heute',              '',              'start uebersicht dashboard tag heute jetzt',                        url('start')],
+        ['faecher', 'Faecher',            'Schule',        'fach faecher lernfeld lernfelder lf unterricht stoff material',     url('faecher')],
+        ['notizen', 'Notizen',            'Schule',        'notiz notizen howto snippet code stoff merken zettel',              url('notizen')],
+        ['noten',   'Noten',              'Schule',        'note noten schnitt durchschnitt zeugnis punkte bewertung',          url('noten')],
+        ['termin',  'Termine',            'Plan',          'termin termine kalender probe schulaufgabe test abgabe frist',      url('plan')],
+        ['aufgabe', 'Aufgaben',           'Plan',          'aufgabe aufgaben hausaufgabe offen erledigen',                      url('plan', ['t' => 'aufgaben'])],
+        ['raster',  'Stundenplan',        'Plan',          'stundenplan stunde raum unterricht wann wo',                        url('plan', ['t' => 'stundenplan'])],
+        ['plan',    'Blockplan',          'Plan',          'block blockplan blockwoche schulwoche ferien schulblock',           url('plan', ['t' => 'block'])],
+        ['bericht', 'Berichtsheft',       'Betrieb',       'berichtsheft nachweis ausbildungsnachweis wochenbericht bericht ihk woche monat', url('berichtsheft')],
+        ['bericht', 'Alle Nachweise',     'Betrieb',       'alle nachweise berichte heft',                                      url('berichtsheft', ['t' => 'alle'])],
+        ['pruefung','Ausbildungsplan',    'Betrieb',       'ausbildungsplan berufsbildposition fiausbv fortschritt abgedeckt',  url('berichtsheft', ['t' => 'plan'])],
+        ['routine', 'Routinen',           'Betrieb',       'routine routinen wiederkehrend kaffeemaschine taeglich woechentlich', url('berichtsheft', ['t' => 'routinen'])],
+        ['einsatz', 'Einsaetze',          'Betrieb',       'einsatz einsaetze abteilung durchlauf versetzung wechsel',          url('einsaetze')],
+        ['einsatz', 'Fehlzeiten & Urlaub','Betrieb',       'urlaub resturlaub fehlzeit fehlzeiten krank krankheit frei abwesend dienstreise schulung entschuldigung', url('einsaetze', ['t' => 'zeiten'])],
+        ['kontakt', 'Kontakte',           'Betrieb',       'kontakt kontakte ansprechpartner ausbilder ausbilderin lehrer telefon mail ihk nummer', url('kontakte')],
+        ['pruefung','Pruefung',           'Abschluss',     'pruefung abschlusspruefung ap1 ap2 teil punkte prognose bestehen',  url('pruefung')],
+        ['projekt', 'Abschlussprojekt',   'Abschluss',     'projekt abschlussprojekt antrag genehmigung doku dokumentation praesentation frist stunden', url('pruefung', ['t' => 'projekt'])],
+        ['liste',   'Lernfelder',         'Abschluss',     'lernfeld lernfelder lf lehrplan rahmenlehrplan',                    url('pruefung', ['t' => 'lf'])],
+        ['kontakt', 'Profil',             'Einstellungen', 'profil einstellungen konto klasse schule betrieb beruf beginn',     url('einstellungen')],
+        ['import',  'Quellen',            'Einstellungen', 'quelle quellen import webuntis ical kalender ferien feiertage blockplan abonnement sync', url('einstellungen', ['t' => 'quellen'])],
+        ['schloss', 'Sicherheit',         'Einstellungen', 'sicherheit passwort kennwort zwei-faktor 2fa totp sitzung anmeldung', url('einstellungen', ['t' => 'sicherheit'])],
+        ['datei',   'Daten & Export',     'Einstellungen', 'daten export backup sicherung csv json kalenderadresse konto loeschen', url('einstellungen', ['t' => 'daten'])],
+        ['teilen',  'Geteilte Links',     'Einstellungen', 'geteilt teilen link freigabe share oeffentlich',                    url('geteilt')],
+    ];
+}
+/** Wie gut passt ein Ziel zur Eingabe? 0 heisst: gar nicht. */
+function ziel_rang(array $z, string $q): int {
+    $l = mb_strtolower($z[1]);
+    $q = mb_strtolower(trim($q));
+    if ($q === '') return 1;
+    if ($l === $q) return 120;
+    if (str_starts_with($l, $q)) return 100;
+    foreach (preg_split('/[\s&]+/', $l) as $w) if ($w !== '' && str_starts_with($w, $q)) return 90;
+    if (str_contains($l, $q)) return 70;
+    $woerter = explode(' ', $z[3]);
+    foreach ($woerter as $w) {
+        if ($w === $q) return 65;
+        if ($w !== '' && str_starts_with($w, $q)) return 55;
+    }
+    if (mb_strlen($q) >= 4) foreach ($woerter as $w) if ($w !== '' && str_contains($w, $q)) return 35;
+    return 0;
+}
+/** Passende Ziele, bestes zuerst. */
+function ziele_suchen(string $q, int $limit = 6): array {
+    $t = [];
+    foreach (ziele_index() as $z) {
+        $r = ziel_rang($z, $q);
+        if ($r > 0) $t[] = ['rang' => $r, 'icon' => $z[0], 'label' => $z[1], 'bereich' => $z[2], 'url' => $z[4]];
+    }
+    usort($t, fn($a, $b) => [$b['rang'], mb_strlen($a['label'])] <=> [$a['rang'], mb_strlen($b['label'])]);
+    return array_slice($t, 0, $limit);
+}
+
+// ===========================================================================
+
 /** Seitenleiste in drei Bloecken: alles liegt dort, wo man es sucht. */
 function nav_gruppen(): array {
     return [
-        ['',         [['start', 'Heute']]],
-        ['Schule',   [['faecher', 'Faecher'], ['notizen', 'Notizen'], ['noten', 'Noten'], ['plan', 'Plan']]],
-        ['Betrieb',  [['berichtsheft', 'Berichtsheft'], ['einsaetze', 'Einsaetze'], ['kontakte', 'Kontakte']]],
-        ['Abschluss',[['pruefung', 'Pruefung']]],
+        ['',         [['start', 'Heute', 'heute']]],
+        ['Schule',   [['faecher', 'Faecher', 'faecher'], ['notizen', 'Notizen', 'notizen'],
+                      ['noten', 'Noten', 'noten'], ['plan', 'Plan', 'plan']]],
+        ['Betrieb',  [['berichtsheft', 'Berichtsheft', 'bericht'], ['einsaetze', 'Einsaetze', 'einsatz'],
+                      ['kontakte', 'Kontakte', 'kontakt']]],
+        ['Abschluss',[['pruefung', 'Pruefung', 'pruefung']]],
     ];
 }
 function nav(): array {
     $o = [];
     foreach (nav_gruppen() as [, $items]) foreach ($items as $it) $o[] = $it;
     return $o;
+}
+/** Untere Leiste auf dem Handy: vier Ziele plus alles Weitere. */
+function tabs(): array {
+    return [
+        ['heute',   'Heute',    'heute',   url('start')],
+        ['faecher', 'Faecher',  'faecher', url('faecher')],
+        ['suche',   'Suchen',   'suche',   url('suche')],
+        ['bericht', 'Nachweis', 'bericht', url('berichtsheft')],
+        ['mehr',    'Mehr',     'zahnrad', url('mehr')],
+    ];
+}
+function tab_aktiv(string $p): string {
+    return match ($p) {
+        'start'   => 'heute',
+        'faecher' => 'faecher',
+        'suche'   => 'suche',
+        'berichtsheft' => 'bericht',
+        default   => 'mehr',
+    };
+}
+/** Alles auf einen Blick, nach Bereichen gruppiert - der Weg zu jedem Ziel. */
+function p_mehr(): void {
+    $u = need_login();
+    $gruppen = [];
+    foreach (ziele_index() as [$sym, $label, $bereich, , $adresse]) {
+        $gruppen[$bereich ?: 'Start'][] = [$sym, $label, $adresse];
+    }
+    ob_start(); ?>
+    <?php foreach ($gruppen as $bereich => $eintraege): ?>
+      <div class="c"><?php if ($bereich !== 'Start'): ?><div class="hd"><h2><?= h($bereich) ?></h2></div><?php endif; ?>
+        <ul class="li rows">
+          <?php foreach ($eintraege as [$sym, $label, $adresse]): ?>
+            <li><a href="<?= h($adresse) ?>">
+              <span class="tile t-<?= h($sym) ?>"><?= ic($sym, 17) ?></span>
+              <span class="tx"><b><?= h($label) ?></b></span>
+              <?= ic('weiter', 17) ?></a></li>
+          <?php endforeach; ?>
+        </ul>
+      </div>
+    <?php endforeach; ?>
+    <div class="c"><div class="bo">
+      <div class="rw" style="justify-content:space-between">
+        <div><b><?= h($u['username']) ?></b><div class="sm mu2"><?= stand_text($u) ?></div></div>
+        <form method="post" action="<?= url('logout') ?>"><?= csrf_field() ?>
+          <button class="s" type="submit">Abmelden</button></form>
+      </div>
+    </div></div>
+    <?php
+    page('Mehr', ob_get_clean());
 }
 function nav_zahl(string $key): string {
     $u = me(); if (!$u) return '';
@@ -2105,7 +2447,7 @@ function page(string $titel, string $inhalt, array $o = []): void {
 <html lang="de" data-t="<?= h($theme) ?>">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <title><?= h($titel) ?> – <?= h(APP_NAME) ?></title>
 <link rel="icon" href="data:image/svg+xml,<?= rawurlencode('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#2563eb"/><path d="M9 9h14M9 16h10M9 23h6" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/></svg>') ?>">
@@ -2149,7 +2491,8 @@ html,body{margin:0;padding:0}
 body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text",
 "Segoe UI Variable Text","Segoe UI",Inter,system-ui,sans-serif;font-variant-numeric:tabular-nums;
 -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;letter-spacing:-.005em}
-a{color:var(--ac);text-decoration:none}a:hover{text-decoration:underline}
+a{color:var(--ac);text-decoration:none}
+@media(hover:hover){a:hover{text-decoration:underline}}
 h1,h2,h3{margin:0;font-weight:590;line-height:1.28;letter-spacing:-.015em}
 h1{font-size:15px}
 h2{font-size:12px;color:var(--fg2);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
@@ -2166,7 +2509,10 @@ hr{border:0;border-top:1px solid var(--li);margin:14px 0}
 .bd{display:flex;align-items:center;gap:8px;padding:16px 16px 12px;font-weight:600;font-size:14px}
 .bd i{width:20px;height:20px;border-radius:6px;background:linear-gradient(160deg,#0a84ff,#0055c9);display:block;flex:none}
 .nv{padding:2px 8px;display:flex;flex-direction:column;gap:1px}
-.nv a{display:flex;align-items:center;gap:8px;padding:5px 9px;border-radius:6px;color:var(--fg);font-size:13.5px}
+.nv a{display:flex;align-items:center;gap:9px;padding:6px 9px;border-radius:7px;color:var(--fg);font-size:13.5px}
+.nv a .ic{color:var(--fg2)}
+.nv a.on .ic{color:#fff}
+.nv a>span:first-of-type{flex:1;min-width:0}
 .nv a:hover{background:rgba(0,0,0,.05);text-decoration:none}
 @media(prefers-color-scheme:dark){:root:not([data-t=hell]) .nv a:hover{background:rgba(255,255,255,.06)}}
 :root[data-t=dunkel] .nv a:hover{background:rgba(255,255,255,.06)}
@@ -2182,12 +2528,18 @@ color:var(--fg3);font-weight:600}
 .sf b{display:block;color:var(--fg);font-weight:590;font-size:13px}
 .sf .lk{display:flex;gap:10px;margin-top:6px}
 .mn{min-width:0;display:flex;flex-direction:column;background:var(--bg)}
-.tb{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 82%,transparent);
+.tb{position:sticky;top:0;z-index:20;padding-top:env(safe-area-inset-top);
+height:calc(52px + env(safe-area-inset-top));
+background:color-mix(in srgb,var(--bg) 82%,transparent);
 backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);
-border-bottom:1px solid var(--li);display:flex;align-items:center;gap:10px;padding:0 18px;height:52px}
+border-bottom:1px solid var(--li);display:flex;align-items:center;gap:10px;padding-left:max(18px,env(safe-area-inset-left));padding-right:max(18px,env(safe-area-inset-right))}
 .tb .sp{flex:1}
-.tb input[type=search]{width:250px;height:28px;font-size:13px;border-radius:99px;background:var(--pa2);border-color:transparent}
-.tb [data-palette]{font:11px var(--mo);color:var(--fg3);height:24px;padding:0 7px}
+.sf1{display:flex;align-items:center;gap:7px;background:var(--pa2);border-radius:99px;
+padding:0 11px;height:30px;width:280px;max-width:100%;cursor:text;color:var(--fg3)}
+.sf1 input[type=search]{border:0;background:transparent;box-shadow:none;height:28px;padding:0;
+font-size:13.5px;min-width:0;flex:1}
+.sf1 input:focus{outline:none}
+.sf1 kbd{font:11px var(--mo);color:var(--fg3);background:transparent;padding:0}
 .ct{padding:18px;max-width:1220px;width:100%}
 .ph{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:2px 0 16px}
 .ph .pt{min-width:0}
@@ -2204,15 +2556,35 @@ border-bottom:1px solid var(--li);display:flex;align-items:center;gap:10px;paddi
 .kv dd{margin:0}
 @media(max-width:880px){
  .app{grid-template-columns:1fr}
- .sb{position:fixed;left:0;top:0;bottom:0;width:236px;z-index:60;transform:translateX(-101%);transition:transform .22s cubic-bezier(.32,.72,0,1)}
- body.nav .sb{transform:none;box-shadow:var(--sh2)}
- body.nav .sc{display:block;position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:50}
- .ct{padding:12px}.tb{padding:0 12px}.tb input[type=search]{width:120px}
- .seg a{padding:3px 8px}
+ .sb{display:none}
+ .ct{padding:12px}
+ .tb{padding-left:max(12px,env(safe-area-inset-left));padding-right:max(12px,env(safe-area-inset-right));
+  height:calc(48px + env(safe-area-inset-top))}
+ .sf1{width:100%;height:34px}
+ .sf1 kbd{display:none}
+ /* 16px verhindert, dass iOS beim Antippen in die Seite zoomt */
+ input,select,textarea,.sf1 input[type=search]{font-size:16px}
+ /* iOS-Untergrenze fuer Tippflaechen */
+ button,.bt{min-height:38px;padding:0 14px}
+ button.s,.bt.s{min-height:32px;padding:0 11px;font-size:13px}
+ input,select{height:38px}
+ .li.rows li a{padding:11px 14px;min-height:46px}
+ .seg a{padding:6px 12px}
+ td,th{padding:9px 12px}
 }
-.sc{display:none}
-@media(min-width:881px){.tb .bg{display:none}.tb .mt{display:none}}
-@media(max-width:880px){.ph h1{font-size:20px}}
+.tabs{display:none}
+@media(max-width:880px){
+ .tabs{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:60;
+  background:color-mix(in srgb,var(--pa) 88%,transparent);
+  backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);
+  border-top:1px solid var(--li);padding-bottom:env(safe-area-inset-bottom)}
+ .tabs a{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
+  padding:7px 2px 6px;min-height:49px;color:var(--fg3);font-size:10px;font-weight:500;letter-spacing:0}
+ .tabs a:hover{text-decoration:none}
+ .tabs a.on{color:var(--ac)}
+ .ct{padding-bottom:calc(62px + env(safe-area-inset-bottom))}
+}
+@media(max-width:880px){.ph h1{font-size:22px}}
 /* Bausteine */
 .c{background:var(--pa);border-radius:var(--r);box-shadow:var(--sh);margin-bottom:14px;min-width:0;max-width:100%}
 .c>.hd{display:flex;align-items:center;gap:8px;padding:11px 14px 9px;flex-wrap:wrap}
@@ -2235,15 +2607,15 @@ border-bottom:1px solid var(--li);display:flex;align-items:center;gap:10px;paddi
 button,.bt{display:inline-flex;align-items:center;justify-content:center;gap:5px;height:30px;padding:0 12px;
 font:inherit;font-size:13px;font-weight:500;background:var(--pa);color:var(--fg);border:.5px solid var(--li2);
 border-radius:var(--r2);cursor:pointer;white-space:nowrap;box-shadow:0 1px 1px rgba(0,0,0,.04);transition:background .12s}
-.bt:hover,button:hover{background:var(--pa2);text-decoration:none}
+@media(hover:hover){.bt:hover,button:hover{background:var(--pa2);text-decoration:none}}
 .bt:active,button:active{background:var(--pa3)}
 .bt.p,button.p{background:var(--ac);border-color:transparent;color:var(--acf);box-shadow:0 1px 2px rgba(0,0,0,.1)}
-.bt.p:hover,button.p:hover{filter:brightness(1.07)}
+@media(hover:hover){.bt.p:hover,button.p:hover{filter:brightness(1.07)}}
 .bt.d,button.d{color:var(--er)}
-.bt.d:hover,button.d:hover{background:var(--erb)}
+@media(hover:hover){.bt.d:hover,button.d:hover{background:var(--erb)}}
 .bt.s,button.s{height:24px;padding:0 9px;font-size:12.5px}
 .bt.g,button.g{border-color:transparent;background:transparent;box-shadow:none}
-.bt.g:hover,button.g:hover{background:var(--pa2)}
+@media(hover:hover){.bt.g:hover,button.g:hover{background:var(--pa2)}}
 button[disabled]{opacity:.4;cursor:not-allowed}
 label{display:block;font-size:12px;font-weight:500;color:var(--fg2);margin-bottom:4px}
 input,select,textarea{width:100%;height:30px;background:var(--pa);color:var(--fg);border:.5px solid var(--li2);
@@ -2258,13 +2630,13 @@ input[type=color]{padding:2px}
 /* Segmentierte Steuerung */
 .seg{display:inline-flex;background:var(--pa3);border-radius:8px;padding:2px;gap:2px;flex-wrap:wrap;max-width:100%}
 .seg a{padding:3px 11px;border-radius:6px;font-size:12.5px;color:var(--fg);font-weight:500}
-.seg a:hover{text-decoration:none}
+@media(hover:hover){.seg a:hover{text-decoration:none}}
 .seg a.on{background:var(--pa);box-shadow:0 1px 2px rgba(0,0,0,.12);font-weight:590}
 table{width:100%;border-collapse:collapse;font-size:13.5px}
 th,td{text-align:left;padding:7px 14px;border-bottom:1px solid var(--li);vertical-align:top}
 th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--fg3);font-weight:600;white-space:nowrap;border-bottom-color:var(--li)}
 tbody tr:last-child td{border-bottom:0}
-tbody tr:hover{background:var(--pa2)}
+@media(hover:hover){tbody tr:hover{background:var(--pa2)}}
 td.n,th.n{text-align:right;font-family:var(--mo);font-size:12.5px}
 .tw{overflow-x:auto;max-width:100%}
 .tg{display:inline-block;background:var(--pa3);border-radius:5px;padding:0 6px;font-size:11.5px;
@@ -2278,10 +2650,30 @@ font-weight:500;color:var(--fg2);line-height:18px;white-space:nowrap}
 .ms.warn{background:var(--wab);color:var(--wa)}
 .ms.err{background:var(--erb);color:var(--er)}
 .ms.info{background:var(--acb);color:var(--ac)}
+/* Symbole */
+.ic{flex:none;display:block}
+.tile{width:27px;height:27px;border-radius:7px;display:grid;place-items:center;color:#fff;flex:none}
+.t-heute{background:#ff3b30}.t-faecher{background:#0071e3}.t-notizen{background:#ff9500}
+.t-noten{background:#34c759}.t-plan{background:#5856d6}.t-bericht{background:#af52de}
+.t-einsatz{background:#a2845e}.t-kontakt{background:#00c7be}.t-pruefung{background:#ff2d55}
+.t-termin{background:#5856d6}.t-aufgabe{background:#30b0c7}.t-routine{background:#ff9500}
+.t-projekt{background:#ff2d55}.t-datei{background:#8e8e93}.t-zahnrad{background:#8e8e93}
+.t-teilen{background:#0071e3}.t-suche{background:#8e8e93}
+.t-schloss{background:#8e8e93}.t-import{background:#5ac8fa}.t-raster{background:#5856d6}
+.t-liste{background:#0071e3}
+/* Listenzeilen mit Symbol, Text, Chevron */
+.li.rows li{padding:0}
+.li.rows li a{display:flex;gap:11px;align-items:center;width:100%;padding:9px 14px;color:var(--fg);min-width:0}
+.li.rows li a:hover{text-decoration:none}
+.li.rows .tx{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+.li.rows .tx b{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.li.rows .tx span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.li.rows .ic{color:var(--fg3)}
+.li.rows .tile .ic{color:#fff}
 .li{list-style:none;margin:0;padding:0}
 .li li{display:flex;gap:9px;align-items:baseline;padding:7px 14px;border-bottom:1px solid var(--li)}
 .li li:last-child{border-bottom:0}
-.li li:hover{background:var(--pa2)}
+@media(hover:hover){.li li:hover{background:var(--pa2)}}
 .em{padding:22px 14px;color:var(--fg3);font-size:13px;text-align:center}
 .br{height:6px;background:var(--pa3);border-radius:99px;overflow:hidden}
 .br>i{display:block;height:100%;background:var(--ac);border-radius:99px}
@@ -2290,7 +2682,7 @@ font-weight:500;color:var(--fg2);line-height:18px;white-space:nowrap}
 font-family:var(--mo);font-size:12px;font-weight:600;color:#fff}
 .ch{display:flex;gap:6px;flex-wrap:wrap}
 .ch a{border-radius:99px;padding:3px 11px;font-size:12.5px;color:var(--fg2);background:var(--pa3)}
-.ch a:hover{text-decoration:none;filter:brightness(.97)}
+@media(hover:hover){.ch a:hover{text-decoration:none;filter:brightness(.97)}}
 .ch a.on{background:var(--ac);color:#fff;font-weight:500}
 /* Fachkacheln */
 details.add{border-top:1px solid var(--li)}
@@ -2301,7 +2693,7 @@ details.add[open]>summary::before{content:"– "}
 details.add>div{padding:0 14px 14px}
 .kg{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(178px,1fr))}
 .ka{display:block;background:var(--pa);border-radius:var(--r);box-shadow:var(--sh);padding:11px 13px;color:var(--fg)}
-.ka:hover{text-decoration:none;box-shadow:0 4px 14px rgba(0,0,0,.09),0 0 0 .5px rgba(0,0,0,.06)}
+@media(hover:hover){.ka:hover{text-decoration:none;box-shadow:0 4px 14px rgba(0,0,0,.09),0 0 0 .5px rgba(0,0,0,.06)}}
 .ka .kk{display:flex;align-items:center;gap:7px;margin-bottom:6px}
 .ka .kn{font-weight:590;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ka .kz{font-size:12px;color:var(--fg3);display:flex;gap:9px;flex-wrap:wrap}
@@ -2320,18 +2712,32 @@ details.add>div{padding:0 14px 14px}
 overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* Palette */
 .pl{position:fixed;inset:0;background:rgba(0,0,0,.28);backdrop-filter:blur(3px);z-index:100;display:none;padding-top:13vh}
+@media(max-width:880px){
+ .pl{padding:0}
+ .pl .bx{max-width:none;height:100%;border-radius:0;display:flex;flex-direction:column;
+  padding-top:env(safe-area-inset-top)}
+ .pl ul{max-height:none;flex:1;padding:6px 6px calc(14px + env(safe-area-inset-bottom))}
+ .pl li{padding:10px 12px;min-height:46px}
+}
 .pl.on{display:block}
 .pl .bx{max-width:560px;margin:0 auto;background:color-mix(in srgb,var(--pa) 94%,transparent);
 backdrop-filter:saturate(180%) blur(30px);border-radius:14px;box-shadow:var(--sh2);overflow:hidden}
-.pl input{height:46px;border:0;border-bottom:1px solid var(--li);border-radius:0;font-size:16px;padding:0 16px;box-shadow:none;background:transparent}
+.pl .pf{display:flex;align-items:center;gap:9px;padding:0 14px;border-bottom:1px solid var(--li);color:var(--fg3)}
+.pl input{height:48px;border:0;border-radius:0;font-size:16px;padding:0;box-shadow:none;background:transparent;flex:1;min-width:0}
 .pl input:focus{outline:none}
-.pl ul{list-style:none;margin:0;padding:5px;max-height:46vh;overflow:auto}
-.pl li{padding:7px 11px;border-radius:7px;cursor:pointer;font-size:13.5px;display:flex;gap:9px;align-items:center}
+.pl .pf button{display:none;flex:none}
+@media(max-width:880px){.pl .pf button{display:inline-flex}}
+.pl ul{list-style:none;margin:0;padding:5px;max-height:46vh;max-height:46dvh;overflow:auto;
+-webkit-overflow-scrolling:touch}
+.pl li{padding:7px 11px;border-radius:7px;cursor:pointer;font-size:13.5px;display:flex;gap:10px;align-items:center}
+.pl li b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pl li.on .tile{box-shadow:0 0 0 1.5px rgba(255,255,255,.5)}
+body.modal{overflow:hidden}
 .pl li.on{background:var(--ac);color:#fff}
 .pl li.on .tg,.pl li.on .mu2{background:rgba(255,255,255,.22);color:#fff}
 .pl li b{font-weight:500}
 .pl .gr{padding:7px 12px 3px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--fg3);font-weight:600}
-@media print{.sb,.tb,.np,.pl{display:none!important}.app{display:block}.ct{padding:0;max-width:none}
+@media print{.sb,.tb,.np,.pl,.tabs{display:none!important}.app{display:block}.ct{padding:0;max-width:none}
 .tw{overflow:visible}.c{box-shadow:none;margin:0 0 10px;background:none}.c>.hd{padding:0 0 4px}.c>.bo{padding:0}
 body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding:5px 8px}a{color:#000}@page{margin:16mm}}
 </style>
@@ -2340,15 +2746,14 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
 <?php if ($bare): ?>
 <div style="max-width:<?= !empty($o['weit']) ? '900' : (!empty($o['breit']) ? '580' : '340') ?>px;margin:0 auto;padding:<?= !empty($o['breit']) || !empty($o['weit']) ? '5' : '9' ?>vh 16px"><?= $inhalt ?></div>
 <?php else: ?>
-<div class="sc" data-nav="0"></div>
 <div class="app">
  <aside class="sb">
   <div class="bd"><i></i><?= h(APP_NAME) ?></div>
   <nav class="nv">
    <?php $ni = 0; foreach (nav_gruppen() as [$grp, $items]): ?>
     <?php if ($grp !== ''): ?><div class="gr"><?= h($grp) ?></div><?php endif; ?>
-    <?php foreach ($items as [$k, $lbl]): $ni++; $b = nav_zahl($k); ?>
-     <a href="<?= url($k) ?>"<?= $p === $k ? ' class="on"' : '' ?>><?= h($lbl) ?>
+    <?php foreach ($items as [$k, $lbl, $sym]): $ni++; $b = nav_zahl($k); ?>
+     <a href="<?= url($k) ?>"<?= $p === $k ? ' class="on"' : '' ?>><?= ic($sym, 18) ?><span><?= h($lbl) ?></span>
       <?= $b !== '' ? '<span class="b">' . h($b) . '</span>' : '<span class="k">' . $ni . '</span>' ?></a>
     <?php endforeach; ?>
    <?php endforeach; ?>
@@ -2368,14 +2773,14 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
  </aside>
  <div class="mn">
   <header class="tb np">
-   <button class="g s bg" data-nav="1" aria-label="Menue">&#9776;</button>
-   <h1 class="mt"><?= h($titel) ?></h1>
-   <span class="sp"></span>
-   <form method="get" action="<?= h(base_path()) ?>" style="display:flex">
+   <form method="get" action="<?= h(base_path()) ?>" class="sf1" data-palette>
     <input type="hidden" name="p" value="suche">
-    <input type="search" name="q" id="sq" placeholder="Suchen" value="<?= h(get('q')) ?>">
+    <?= ic('suche', 16) ?>
+    <input type="search" name="q" id="sq" placeholder="Suchen" value="<?= h(get('q')) ?>"
+           autocomplete="off" enterkeyhint="search"<?= $p === 'suche' && get('q') === '' ? ' autofocus' : '' ?>>
+    <kbd>&#8984;K</kbd>
    </form>
-   <button class="g s np" data-palette type="button" title="Springen">&#8984;K</button>
+   <span class="sp"></span>
    <form method="post" action="<?= url('theme') ?>"><?= csrf_field() ?>
     <input type="hidden" name="theme" value="<?= $theme === 'dunkel' ? 'hell' : ($theme === 'hell' ? 'auto' : 'dunkel') ?>">
     <button class="g s" type="submit" title="Design"><?= $theme === 'dunkel' ? '&#9788;' : ($theme === 'hell' ? '&#9789;' : '&#9681;') ?></button>
@@ -2403,34 +2808,27 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
   </div>
  </div>
 </div>
-<div class="pl" id="pl"><div class="bx"><input type="search" id="pq" placeholder="Springen oder suchen" autocomplete="off"><ul id="pu"></ul></div></div>
+<nav class="tabs np">
+ <?php foreach (tabs() as [$tk, $tl, $tsym, $turl]): ?>
+  <a href="<?= h($turl) ?>"<?= tab_aktiv($p) === $tk ? ' class="on"' : '' ?>>
+   <?= ic($tsym, 23) ?><span><?= h($tl) ?></span></a>
+ <?php endforeach; ?>
+</nav>
+<div class="pl" id="pl"><div class="bx">
+ <div class="pf"><?= ic('suche', 18) ?><input type="search" id="pq" placeholder="Springen oder suchen" autocomplete="off" enterkeyhint="go"><button class="g s" type="button" data-schliessen>Fertig</button></div>
+ <ul id="pu"></ul></div></div>
 <?php endif; ?>
 <script nonce="<?= h($n) ?>">
 (function(){
-var B=<?= json_encode(base_path()) ?>, N=<?= json_encode(array_map(fn($x) => ['t'=>$x[1],'u'=>url($x[0])], nav())) ?>;
-var Z=<?= json_encode(array_merge(
-  array_map(fn($x) => ['t'=>$x[1],'u'=>url($x[0])], nav()),
-  [['t'=>'Termine','u'=>url('plan')],
-   ['t'=>'Aufgaben','u'=>url('plan',['t'=>'aufgaben'])],
-   ['t'=>'Stundenplan','u'=>url('plan',['t'=>'stundenplan'])],
-   ['t'=>'Blockplan','u'=>url('plan',['t'=>'block'])],
-   ['t'=>'Routinen','u'=>url('berichtsheft',['t'=>'routinen'])],
-   ['t'=>'Ausbildungsplan','u'=>url('berichtsheft',['t'=>'plan'])],
-   ['t'=>'Alle Nachweise','u'=>url('berichtsheft',['t'=>'alle'])],
-   ['t'=>'Fehlzeiten und Urlaub','u'=>url('einsaetze',['t'=>'zeiten'])],
-   ['t'=>'Abteilungen','u'=>url('einsaetze')],
-   ['t'=>'Ansprechpartner','u'=>url('kontakte')],
-   ['t'=>'Abschlussprojekt','u'=>url('pruefung',['t'=>'projekt'])],
-   ['t'=>'Lernfelder','u'=>url('pruefung',['t'=>'lf'])],
-   ['t'=>'Geteilte Links','u'=>url('geteilt')],
-   ['t'=>'Einstellungen','u'=>url('einstellungen')],
-   ['t'=>'Quellen und Import','u'=>url('einstellungen',['t'=>'quellen'])],
-   ['t'=>'Zwei-Faktor','u'=>url('einstellungen',['t'=>'sicherheit'])],
-   ['t'=>'Export','u'=>url('einstellungen',['t'=>'daten'])]]), JSON_UNESCAPED_UNICODE) ?>;
+var B=<?= json_encode(base_path()) ?>;
+var N=<?= json_encode(array_map(fn($x) => ['t' => $x[1], 'u' => url($x[0])], nav()), JSON_UNESCAPED_UNICODE) ?>;
+// Derselbe Zielindex wie auf dem Server, damit Palette und Suchseite gleich ranken
+var Z=<?= json_encode(array_map(fn($z) => ['t' => $z[1], 'g' => $z[2] ?: 'Start',
+        'w' => $z[3], 'u' => $z[4], 'i' => $z[0]], ziele_index()), JSON_UNESCAPED_UNICODE) ?>;
+var SYM=<?= json_encode(icons(), JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>;
 var EX=<?= json_encode($u ? array_map(fn($z) => ['n' => $z['name'], 'u' => $z['url']],
         all("SELECT name, url FROM ziele WHERE user_id = ? ORDER BY sort, id", [(int)$u['id']])) : [], JSON_UNESCAPED_UNICODE) ?>;
 document.addEventListener('click',function(e){
- var t=e.target.closest('[data-nav]'); if(t){document.body.classList.toggle('nav',t.dataset.nav==='1');}
  var c=e.target.closest('[data-copy]');
  if(c){var el=document.getElementById(c.dataset.copy);
   if(el&&navigator.clipboard)navigator.clipboard.writeText(el.innerText).then(function(){
@@ -2441,14 +2839,34 @@ document.addEventListener('click',function(e){
 });
 document.addEventListener('submit',function(e){var m=e.target.getAttribute('data-q');if(m&&!confirm(m))e.preventDefault();});
 document.addEventListener('change',function(e){if(e.target.matches('[data-autosubmit]'))e.target.form.submit();});
-document.addEventListener('click',function(e){if(e.target.closest('[data-palette]')&&pl)open_();});
+document.addEventListener('click',function(e){
+ if(e.target.closest('[data-schliessen]')){close_();return;}
+ var t=e.target.closest('[data-palette]');
+ if(t&&pl){e.preventDefault();open_(sq&&sq.value?sq.value:'');}});
 document.addEventListener('focus',function(e){if(e.target.matches('[data-sel]'))e.target.select();},true);
-var pl=document.getElementById('pl'),pq=document.getElementById('pq'),pu=document.getElementById('pu'),sel=0,cur=[];
+var pl=document.getElementById('pl'),pq=document.getElementById('pq'),pu=document.getElementById('pu'),
+    sq=document.getElementById('sq'),sel=0,cur=[];
 var tref=[],tid=0,lauf='';
 function esc(t){return String(t).replace(/[<>&"']/g,function(c){
  return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c];});}
+function rang(x,q){var l=x.t.toLowerCase();
+ if(!q)return 1;
+ if(l===q)return 120;
+ if(l.indexOf(q)===0)return 100;
+ var w=l.split(/[\s&]+/);
+ for(var i=0;i<w.length;i++)if(w[i].indexOf(q)===0)return 90;
+ if(l.indexOf(q)>=0)return 70;
+ var k=(x.w||'').split(' ');
+ for(var j=0;j<k.length;j++){if(k[j]===q)return 65;if(k[j]&&k[j].indexOf(q)===0)return 55;}
+ if(q.length>=4)for(var m=0;m<k.length;m++)if(k[m]&&k[m].indexOf(q)>=0)return 35;
+ return 0;}
+function sym(n,g){var d=SYM[n]||SYM.notizen;
+ return '<svg class="ic" width="'+g+'" height="'+g+'" viewBox="0 0 24 24" fill="none" stroke="currentColor"'
+  +' stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+d+'</svg>';}
 function draw(){var q=(pq.value||'').toLowerCase().trim();
- var nav=Z.filter(function(x){return !q||x.t.toLowerCase().indexOf(q)>=0;});
+ var nav=Z.map(function(x){return {x:x,r:rang(x,q)};}).filter(function(o){return o.r>0;})
+   .sort(function(a,b){return b.r-a.r||a.x.t.length-b.x.t.length;})
+   .slice(0,q?6:Z.length).map(function(o){return o.x;});
  cur=nav.concat(tref);
  if(q){cur=cur.concat([{t:'Alles durchsuchen: '+pq.value,u:B+'?p=suche&q='+encodeURIComponent(pq.value),g:'Suchen'}]);
   EX.forEach(function(z){cur=cur.concat([{t:z.n+': '+pq.value,g:'Suchen',
@@ -2456,9 +2874,11 @@ function draw(){var q=(pq.value||'').toLowerCase().trim();
  if(sel>=cur.length)sel=Math.max(0,cur.length-1);
  var html='',letzt='';
  cur.forEach(function(x,i){
-  var gr=x.g||'Springen';
+  var gr=x.g==='Treffer'?'Treffer':(x.g==='Suchen'?'Suchen':'Springen');
   if(gr!==letzt){html+='<li class="gr" style="pointer-events:none">'+esc(gr)+'</li>';letzt=gr;}
-  html+='<li'+(i===sel?' class="on"':'')+' data-u="'+esc(x.u)+'"><b>'+esc(x.t)+'</b>'
+  html+='<li'+(i===sel?' class="on"':'')+' data-u="'+esc(x.u)+'">'
+      +(x.i?'<span class="tile t-'+esc(x.i)+'">'+sym(x.i,16)+'</span>':'<span class="tile t-suche">'+sym('suche',16)+'</span>')
+      +'<b>'+esc(x.t)+'</b>'
       +(x.s?'<span class="mu2 sm" style="margin-left:auto">'+esc(x.s)+'</span>':'')+'</li>';});
  pu.innerHTML=html;
  pu.querySelectorAll('li.gr').forEach(function(l){l.removeAttribute('data-u');});}
@@ -2469,12 +2889,13 @@ function hole(){var q=pq.value.trim();
   .then(function(r){return r.json();})
   .then(function(j){ if(pq.value.trim()!==q)return;
     tref=(j.treffer||[]).map(function(t){return {t:t.titel||'(ohne Titel)',u:t.u||t.url,
-      s:[t.art,t.datum].filter(Boolean).join(' · '),g:'Treffer'};});
+      s:[t.art,t.datum].filter(Boolean).join(' · '),g:'Treffer',i:t.icon||'notizen'};});
     draw();})
-  .catch(function(){});}
-function open_(){pl.classList.add('on');pq.value='';sel=0;tref=[];lauf='';draw();pq.focus();}
-function close_(){pl.classList.remove('on');}
-if(pl){pq.addEventListener('input',function(){draw();clearTimeout(tid);tid=setTimeout(hole,140);});
+  .catch(function(){lauf='';});}
+function open_(v){pl.classList.add('on');document.body.classList.add('modal');
+ pq.value=v||'';sel=0;tref=[];lauf='';draw();pq.focus();if(v)hole();}
+function close_(){pl.classList.remove('on');document.body.classList.remove('modal');}
+if(pl){pq.addEventListener('input',function(){sel=0;draw();clearTimeout(tid);tid=setTimeout(hole,120);});
  pu.addEventListener('click',function(e){var l=e.target.closest('li');if(l&&l.dataset.u)location.href=l.dataset.u;});
  pl.addEventListener('click',function(e){if(e.target===pl)close_();});}
 function typing(e){var n=e.target.nodeName;return n==='INPUT'||n==='TEXTAREA'||n==='SELECT'||e.target.isContentEditable;}
@@ -3312,7 +3733,6 @@ function p_start(): void {
     foreach (all("SELECT faellig FROM tasks WHERE user_id = ? AND status='offen' AND faellig BETWEEN ? AND date(?,'+6 day')", [$uid, $mo, $mo]) as $r) $marks[$r['faellig']]['t'] = true;
 
     ob_start(); ?>
-    <?= quick($u) ?>
     <div class="c"><div class="bo" style="padding:9px 12px">
       <div class="rw" style="gap:3px;flex-wrap:nowrap">
         <?php $d = new DateTimeImmutable($mo); for ($i = 0; $i < 7; $i++):
@@ -3325,24 +3745,33 @@ function p_start(): void {
           </a>
         <?php $d = $d->modify('+1 day'); endfor; ?>
       </div>
-      <div class="rw sm mu" style="margin-top:8px;gap:10px">
-        <span><?= h(dt(today(), 'l, j. F Y')) ?></span>
+      <div class="rw sm mu" style="margin-top:8px;gap:8px">
+        <span class="tg"><?= h(klasse_name($u) ?: 'ohne Klasse') ?></span>
+        <span class="tg"><?= (int)ausbildungsstand($u)['jahr'] ?>. Jahr</span>
         <?php if ($block): ?><span class="tg a"><?= h(ucfirst($block['art'])) ?> bis <?= h(dt($block['bis'], 'd.m.')) ?></span><?php endif; ?>
         <a href="<?= url('berichtsheft') ?>"><span class="tg <?= $rep['status'] === 'fertig' ? 'o' : 'w' ?>">Berichtsheft <?= num($sum['std'], 1) ?> h</span></a>
       </div>
     </div></div>
+    <?= quick($u) ?>
 
     <?php if ($faecher):
-      usort($faecher, function ($a, $b) use ($z) {   // Faecher mit Inhalt nach vorn
+      // Nur Faecher, in denen etwas steht - leere Kacheln sind auf dem Handy nur Weg
+      $mitInhalt = array_values(array_filter($faecher, function ($f) use ($z) {
+          $g = $z[(int)$f['id']] ?? [];
+          return !empty($g['notizen']) || !empty($g['noten']) || !empty($g['naechste']);
+      }));
+      usort($mitInhalt, function ($a, $b) use ($z) {
           $ga = $z[(int)$a['id']] ?? []; $gb = $z[(int)$b['id']] ?? [];
-          $va = (int)!empty($ga['notizen']) + (int)!empty($ga['noten']) + (int)!empty($ga['naechste']);
-          $vb = (int)!empty($gb['notizen']) + (int)!empty($gb['noten']) + (int)!empty($gb['naechste']);
+          $va = (int)!empty($ga['naechste']) * 2 + (int)!empty($ga['notizen']) + (int)!empty($ga['noten']);
+          $vb = (int)!empty($gb['naechste']) * 2 + (int)!empty($gb['notizen']) + (int)!empty($gb['noten']);
           return [$vb, (int)$a['sort']] <=> [$va, (int)$b['sort']];
-      }); ?>
-    <div class="c"><div class="hd"><h2>Faecher</h2><span class="sp"></span>
-      <a class="bt s g" href="<?= url('faecher') ?>">alle</a></div><div class="bo">
-      <?= fach_kacheln($uid, array_slice($faecher, 0, 8), $z) ?>
-    </div></div>
+      });
+      if ($mitInhalt): ?>
+      <div class="c"><div class="hd"><h2>Faecher</h2><span class="sp"></span>
+        <a class="bt s g" href="<?= url('faecher') ?>">alle <?= count($faecher) ?></a></div><div class="bo">
+        <?= fach_kacheln($uid, array_slice($mitInhalt, 0, 6), $z) ?>
+      </div></div>
+      <?php endif; ?>
     <?php endif; ?>
 
     <div class="sp2">
@@ -3403,9 +3832,8 @@ function p_start(): void {
       </div>
     </div>
     <?php
-    $unter = h(de_names(date('l, j. F Y'))) . ' · ' . stand_text($u);
-    if ($block) $unter .= ' · ' . h($block['art'] === 'schule' ? 'Blockwoche' : ucfirst((string)$block['art']));
-    page('Heute', ob_get_clean(), ['unter' => $unter]);
+    // Kurz halten: Klasse und Jahr stehen im Wochenstreifen darunter
+    page('Heute', ob_get_clean(), ['unter' => h(de_names(date('l, j. F Y')))]);
 }
 
 // --- Termine ---------------------------------------------------------------
@@ -3504,7 +3932,9 @@ function plan_block(array $u): void {
         }
         redirect(url('plan', ['t' => 'block']));
     }
-    $bl = all("SELECT * FROM blocks WHERE user_id = ? ORDER BY von DESC LIMIT 80", [$uid]);
+    // Kommende Bloecke zuerst - die Frage ist fast immer "wann als naechstes"
+    $bl = all("SELECT * FROM blocks WHERE user_id = ?
+               ORDER BY (bis < date('now','localtime')), von LIMIT 80", [$uid]);
     $archive = get('laden') !== '' ? blockplan_archive() : [];
     $jahr = lehrjahr($u, today());
     ob_start(); ?>
@@ -3513,10 +3943,12 @@ function plan_block(array $u): void {
         <span class="sm mu2"><?= count($bl) ?></span></div>
         <?php if (!$bl): ?><?= em('Noch nichts eingetragen.') ?><?php else: ?>
         <div class="tw"><table><tbody>
-          <?php foreach ($bl as $b): $jetzt = today() >= $b['von'] && today() <= $b['bis']; ?>
+          <?php $naechster = null;
+          foreach ($bl as $b2) if ($b2['art'] === 'schule' && $b2['von'] > today()) { $naechster = (int)$b2['id']; break; }
+          foreach ($bl as $b): $jetzt = today() >= $b['von'] && today() <= $b['bis']; ?>
             <tr><td style="width:14px"><span class="dot" style="background:<?= $b['art'] === 'schule' ? 'var(--ac)' : ($b['art'] === 'ferien' ? 'var(--ok)' : 'var(--wa)') ?>"></span></td>
               <td class="mo sm" style="white-space:nowrap;width:150px"><?= h(dt($b['von'], 'd.m.y')) ?><?= $b['bis'] !== $b['von'] ? ' – ' . h(dt($b['bis'], 'd.m.y')) : '' ?></td>
-              <td><?= h(ucfirst($b['art'])) ?> <span class="mu2 sm"><?= h($b['label']) ?></span><?= $jetzt ? ' <span class="tg a">jetzt</span>' : '' ?></td>
+              <td><?= h(ucfirst($b['art'])) ?> <span class="mu2 sm"><?= h($b['label']) ?></span><?= $jetzt ? ' <span class="tg a">jetzt</span>' : ((int)$b['id'] === $naechster ? ' <span class="tg o">naechste</span>' : '') ?></td>
               <td style="width:30px"><form method="post"><?= csrf_field() ?>
                 <input type="hidden" name="a" value="del"><input type="hidden" name="id" value="<?= (int)$b['id'] ?>">
                 <button class="g s d" type="submit">&times;</button></form></td></tr>
@@ -3590,9 +4022,9 @@ function plan_termine(array $u): void {
     $edit = get('id') !== '' ? one("SELECT * FROM events WHERE id = ? AND user_id = ?", [(int)get('id'), $uid]) : null;
     if (get('neu') !== '') $edit = ['id' => 0, 'datum' => isodate(get('von')) ? get('von') : today()];
 
-    $von = get('von') ?: date('Y-m-01');
+    $von = get('von') ?: today();
     $bis = get('bis') ?: date('Y-m-d', strtotime('+180 days'));
-    if (!isodate($von)) $von = date('Y-m-01');
+    if (!isodate($von)) $von = today();
     if (!isodate($bis)) $bis = date('Y-m-d', strtotime('+180 days'));
     $typ = get('typ');
     $rows = all("SELECT e.*, s.short, s.color FROM events e LEFT JOIN subjects s ON s.id = e.subject_id
@@ -5140,36 +5572,50 @@ function p_pruefung(): void {
 // --- Suche -----------------------------------------------------------------
 function p_suche(): void {
     $u = need_login(); $uid = (int)$u['id']; $qs = get('q');
+    $ziele   = mb_strlen($qs) >= 1 ? ziele_suchen($qs, 5) : [];
     $treffer = mb_strlen($qs) >= 2 ? suche($uid, $qs, 60) : [];
-    $gruppen = [];
-    foreach ($treffer as $t) $gruppen[art_label($t['art'])][] = $t;
     ob_start(); ?>
-    <div class="c"><div class="bo">
-      <form method="get" class="rw"><input type="hidden" name="p" value="suche">
-        <input name="q" value="<?= h($qs) ?>" placeholder="Suchbegriff" autofocus style="flex:1" data-new>
-        <button class="p" type="submit">Suchen</button></form>
-      <div class="rw sm mu2" style="margin-top:9px;gap:12px">
-        <span>Filter: <code>lf:9</code> <code>fach:LF9</code> <code>typ:notiz</code></span>
-        <?php if (!hat_fts()): ?><span class="tg w">Volltextindex nicht verfuegbar</span><?php endif; ?>
+    <?php if ($ziele): ?>
+      <div class="c"><div class="hd"><h2>Springen</h2></div>
+        <ul class="li rows">
+          <?php foreach ($ziele as $z): ?>
+            <li><a href="<?= h($z['url']) ?>">
+              <span class="tile t-<?= h($z['icon']) ?>"><?= ic($z['icon'], 17) ?></span>
+              <span class="tx"><b><?= h($z['label']) ?></b>
+                <?= $z['bereich'] ? '<span class="sm mu2">' . h($z['bereich']) . '</span>' : '' ?></span>
+              <?= ic('weiter', 17) ?></a></li>
+          <?php endforeach; ?>
+        </ul>
       </div>
-    </div></div>
+    <?php endif; ?>
+
     <?php if (mb_strlen($qs) >= 2): ?>
-      <?php if (!$treffer): ?><div class="c"><?= em('Nichts gefunden.') ?></div><?php endif; ?>
-      <?php foreach ($gruppen as $g => $items): ?>
-        <div class="c"><div class="hd"><h2><?= h($g) ?></h2><span class="sp"></span>
-          <span class="sm mu2"><?= count($items) ?></span></div>
-          <div class="tw"><table><tbody>
-            <?php foreach ($items as $t): ?>
-              <tr><td class="mo sm mu2" style="width:82px;white-space:nowrap"><?= h($t['datum'] ? dt($t['datum'], 'd.m.y') : '') ?></td>
-                <td><a href="<?= h(such_ziel($t['art'], $t['ref'], (string)$t['datum'], $u)) ?>"><?= h($t['titel'] ?: '(ohne Titel)') ?></a>
-                  <?php if (trim((string)$t['aus']) !== '' && trim((string)$t['aus']) !== trim((string)$t['titel'])): ?>
-                    <div class="sm mu2"><?= h(mb_substr(trim((string)$t['aus']), 0, 160)) ?></div><?php endif; ?></td></tr>
+      <?php if (!$treffer && !$ziele): ?><div class="c"><?= em('Nichts gefunden.') ?></div><?php endif; ?>
+      <?php if ($treffer): ?>
+        <div class="c"><div class="hd"><h2>Treffer</h2><span class="sp"></span>
+          <span class="sm mu2"><?= count($treffer) ?></span></div>
+          <ul class="li rows">
+            <?php foreach ($treffer as $t): $sym = art_icon($t['art']); ?>
+              <li><a href="<?= h(such_ziel($t['art'], $t['ref'], (string)$t['datum'], $u)) ?>">
+                <span class="tile t-<?= h($sym) ?>"><?= ic($sym, 17) ?></span>
+                <span class="tx"><b><?= h(mb_substr((string)($t['titel'] ?: '(ohne Titel)'), 0, 110)) ?></b>
+                  <?php
+                  $teile = [art_label($t['art'])];
+                  if ($t['datum']) $teile[] = dt($t['datum'], 'd.m.y');
+                  $aus = trim((string)$t['aus']);
+                  if ($aus !== '' && mb_stripos((string)$t['titel'], $aus) === false
+                      && !in_array($aus, $teile, true)) $teile[] = mb_substr($aus, 0, 90); ?>
+                  <span class="sm mu2"><?= h(implode(' · ', $teile)) ?></span></span>
+                <?= ic('weiter', 17) ?></a></li>
             <?php endforeach; ?>
-          </tbody></table></div></div>
-      <?php endforeach; ?>
+          </ul></div>
+      <?php endif; ?>
+      <div class="sm mu2" style="padding:0 4px">Filter: <code>lf:9</code> <code>fach:LF9</code> <code>typ:notiz</code>
+        <?php if (!hat_fts()): ?> · <span class="tg w">Volltextindex nicht verfuegbar</span><?php endif; ?></div>
     <?php endif; ?>
     <?php
-    page('Suche', ob_get_clean(), ['unter' => mb_strlen($qs) >= 2 ? count($treffer) . ' Treffer fuer &bdquo;' . h($qs) . '&ldquo;' : '']);
+    page('Suche', ob_get_clean(), ['unter' => mb_strlen($qs) >= 2
+        ? (count($ziele) + count($treffer)) . ' Treffer fuer &bdquo;' . h($qs) . '&ldquo;' : '']);
 }
 
 // --- Einstellungen ---------------------------------------------------------
@@ -5933,8 +6379,9 @@ function a_api(): void {
     $q = get('q');
     $out = [];
     if (mb_strlen($q) >= 2) {
-        foreach (suche((int)$u['id'], $q, 12) as $t) {
-            $out[] = ['art' => art_label($t['art']), 'titel' => mb_substr((string)$t['titel'], 0, 90),
+        foreach (suche((int)$u['id'], $q, 14) as $t) {
+            $out[] = ['art' => art_label($t['art']), 'icon' => art_icon($t['art']),
+                'titel' => mb_substr((string)$t['titel'], 0, 90),
                 'aus' => mb_substr(trim((string)$t['aus']), 0, 90),
                 'datum' => $t['datum'] ? dt($t['datum'], 'd.m.y') : '',
                 'url' => such_ziel($t['art'], $t['ref'], (string)$t['datum'], $u)];
@@ -5988,6 +6435,7 @@ switch ($p) {
     case 'geteilt':       p_geteilt(); break;
     case 'einsaetze':     p_einsaetze(); break;
     case 'kontakte':      p_kontakte(); break;
+    case 'mehr':          p_mehr(); break;
     default:
         http_response_code(404);
         need_login();
