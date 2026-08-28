@@ -2531,38 +2531,67 @@ function ziele_suchen(string $q, int $limit = 6): array {
 
 /** Seitenleiste in drei Bloecken: alles liegt dort, wo man es sucht. */
 function nav_gruppen(): array {
-    return [
-        ['',         [['start', 'Heute', 'heute']]],
-        ['Schule',   [['faecher', 'Faecher', 'faecher'], ['notizen', 'Notizen', 'notizen'],
-                      ['noten', 'Noten', 'noten'], ['plan', 'Plan', 'plan']]],
-        ['Betrieb',  [['berichtsheft', 'Berichtsheft', 'bericht'], ['einsaetze', 'Einsaetze', 'einsatz'],
-                      ['kontakte', 'Kontakte', 'kontakt']]],
-        ['Abschluss',[['pruefung', 'Pruefung', 'pruefung']]],
+    static $g = null;
+    if ($g !== null) return $g;
+    // [Schluessel, Beschriftung, Symbol, [[Beschriftung, Symbol, Adresse], ...]]
+    return $g = [
+        ['heute', 'Heute', 'heute', []],
+        ['schule', 'Schule', 'faecher', [
+            ['Faecher', 'faecher', url('faecher')],
+            ['Notizen', 'notizen', url('notizen')],
+            ['Noten',   'noten',   url('noten')],
+        ]],
+        ['plan', 'Plan', 'plan', [
+            ['Termine',     'termin',  url('plan')],
+            ['Aufgaben',    'aufgabe', url('plan', ['t' => 'aufgaben'])],
+            ['Stundenplan', 'raster',  url('plan', ['t' => 'stundenplan'])],
+            ['Blockplan',   'plan',    url('plan', ['t' => 'block'])],
+        ]],
+        ['betrieb', 'Betrieb', 'bericht', [
+            ['Berichtsheft', 'bericht', url('berichtsheft')],
+            ['Einsaetze',    'einsatz', url('einsaetze')],
+            ['Kontakte',     'kontakt', url('kontakte')],
+        ]],
+        ['abschluss', 'Abschluss', 'pruefung', [
+            ['Pruefung',   'pruefung', url('pruefung')],
+            ['Projekt',    'projekt',  url('pruefung', ['t' => 'projekt'])],
+            ['Lernfelder', 'liste',    url('pruefung', ['t' => 'lf'])],
+        ]],
+        ['mehr', 'Mehr', 'zahnrad', [
+            ['Alles',      'liste',   url('mehr')],
+            ['Profil',     'kontakt', url('einstellungen')],
+            ['Quellen',    'import',  url('einstellungen', ['t' => 'quellen'])],
+            ['Sicherheit', 'schloss', url('einstellungen', ['t' => 'sicherheit'])],
+            ['Daten',      'datei',   url('einstellungen', ['t' => 'daten'])],
+        ]],
     ];
 }
-function nav(): array {
-    $o = [];
-    foreach (nav_gruppen() as [, $items]) foreach ($items as $it) $o[] = $it;
-    return $o;
+/** Wohin fuehrt eine Gruppe? Auf ihren ersten Unterpunkt, sonst auf sich selbst. */
+function gruppe_url(array $g): string {
+    return $g[3] ? $g[3][0][2] : url('start');
 }
-/** Untere Leiste auf dem Handy: vier Ziele plus alles Weitere. */
-function tabs(): array {
-    return [
-        ['heute',   'Heute',    'heute',   url('start')],
-        ['faecher', 'Faecher',  'faecher', url('faecher')],
-        ['suche',   'Suchen',   'suche',   url('suche')],
-        ['bericht', 'Nachweis', 'bericht', url('berichtsheft')],
-        ['mehr',    'Mehr',     'zahnrad', url('mehr')],
-    ];
-}
-function tab_aktiv(string $p): string {
+/** Welche Gruppe ist offen? */
+function gruppe_aktiv(string $p): string {
     return match ($p) {
-        'start'   => 'heute',
-        'faecher' => 'faecher',
-        'suche'   => 'suche',
-        'berichtsheft' => 'bericht',
-        default   => 'mehr',
+        'start' => 'heute',
+        'faecher', 'notizen', 'noten' => 'schule',
+        'plan' => 'plan',
+        'berichtsheft', 'einsaetze', 'kontakte' => 'betrieb',
+        'pruefung' => 'abschluss',
+        'mehr', 'einstellungen', 'geteilt' => 'mehr',
+        default => '',
     };
+}
+/** Die aktuelle Adresse ohne alles, was nicht zur Navigation gehoert. */
+function nav_adresse(string $p): string {
+    $t = is_string($_GET['t'] ?? null) ? $_GET['t'] : '';
+    return url($p, $t !== '' ? ['t' => $t] : []);
+}
+/** Alle Unterpunkte flach - fuer Tastenkuerzel und Sprungliste. */
+function nav(): array {
+    $o = [[url('start'), 'Heute', 'heute']];
+    foreach (nav_gruppen() as $g) foreach ($g[3] as [$lbl, $sym, $adr]) $o[] = [$adr, $lbl, $sym];
+    return $o;
 }
 /**
  * Die eine Frage, die die Uhr gerade stellt. Streng nach Zeitnaehe geordnet;
@@ -2885,35 +2914,43 @@ kbd{font:11px var(--mo);background:var(--pa3);border-radius:4px;padding:1px 5px;
 hr{border:0;border-top:1px solid var(--li);margin:14px 0}
 .mu{color:var(--fg2)}.mu2{color:var(--fg3)}.sm{font-size:13px}
 /* Rahmen */
-.app{display:grid;grid-template-columns:212px 1fr;min-height:100vh}
-.sb{background:var(--sb);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow:auto}
-.bd{display:flex;align-items:center;gap:8px;padding:16px 16px 12px;font-weight:600;font-size:14px}
-.bd i{width:20px;height:20px;border-radius:6px;background:linear-gradient(160deg,#0a84ff,#0055c9);display:block;flex:none}
-.nv{padding:2px 8px;display:flex;flex-direction:column;gap:1px}
-.nv a{display:flex;align-items:center;gap:9px;padding:6px 9px;border-radius:7px;color:var(--fg);font-size:13.5px}
-.nv a .ic{color:var(--fg2)}
-.nv a.on .ic{color:#fff}
-.nv a>span:first-of-type{flex:1;min-width:0}
-.nv a:hover{background:rgba(0,0,0,.05);text-decoration:none}
-@media(prefers-color-scheme:dark){:root:not([data-t=hell]) .nv a:hover{background:rgba(255,255,255,.06)}}
-:root[data-t=dunkel] .nv a:hover{background:rgba(255,255,255,.06)}
-.nv a.on{background:var(--ac);color:#fff;font-weight:500}
-.nv .k{margin-left:auto;font:11px var(--mo);color:var(--fg3)}
-.nv a.on .k{color:rgba(255,255,255,.7)}
-.nv .b{margin-left:auto;background:var(--fg3);color:var(--pa);border-radius:9px;font-size:11px;
-font-weight:600;padding:0 5px;min-width:17px;text-align:center}
-.nv a.on .b{background:rgba(255,255,255,.28);color:#fff}
-.nv .gr{padding:12px 9px 3px;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;
-color:var(--fg3);font-weight:600}
-.sf{margin-top:auto;padding:12px 16px;font-size:12.5px;color:var(--fg3)}
-.sf b{display:block;color:var(--fg);font-weight:590;font-size:13px}
-.sf .lk{display:flex;gap:10px;margin-top:6px}
-.mn{min-width:0;display:flex;flex-direction:column;background:var(--bg)}
-.tb{position:sticky;top:0;z-index:20;padding-top:env(safe-area-inset-top);
-height:calc(52px + env(safe-area-inset-top));
-background:color-mix(in srgb,var(--bg) 82%,transparent);
+.app{display:grid;grid-template-columns:minmax(0,1fr);min-height:100vh}
+/* Kopfleiste: Gruppen oben, Unterpunkte darunter - gleich auf jedem Geraet */
+.kopf{position:sticky;top:0;z-index:30;padding-top:env(safe-area-inset-top);
+background:color-mix(in srgb,var(--bg) 84%,transparent);
 backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);
-border-bottom:1px solid var(--li);display:flex;align-items:center;gap:10px;padding-left:max(18px,env(safe-area-inset-left));padding-right:max(18px,env(safe-area-inset-right))}
+border-bottom:1px solid var(--li)}
+.bd{display:flex;align-items:center;gap:8px;font-weight:600;font-size:14.5px;color:var(--fg);
+flex:none;letter-spacing:-.015em}
+.bd i{width:21px;height:21px;border-radius:6px;background:linear-gradient(160deg,#3aa0ff,#0055c9);
+display:block;flex:none}
+@media(hover:hover){.bd:hover{text-decoration:none}}
+.gn{display:flex;gap:2px;min-width:0;overflow-x:auto;overscroll-behavior-x:contain;
+scrollbar-width:none;-ms-overflow-style:none}
+.gn::-webkit-scrollbar{display:none}
+.gn{-webkit-mask-image:linear-gradient(90deg,#000 0,#000 calc(100% - 14px),transparent 100%);
+mask-image:linear-gradient(90deg,#000 0,#000 calc(100% - 14px),transparent 100%)}
+.gn a{display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:8px;font-size:14px;
+font-weight:500;color:var(--fg2);white-space:nowrap}
+@media(hover:hover){.gn a:hover{background:var(--pa2);color:var(--fg);text-decoration:none}}
+.gn a.on{background:var(--pa);color:var(--fg);font-weight:600;box-shadow:var(--sh)}
+.gn .b{background:var(--ac);color:#fff;border-radius:9px;font-size:11px;font-weight:600;
+padding:0 5px;min-width:17px;text-align:center;line-height:17px}
+.sn{display:flex;gap:3px;padding:0 18px 8px;min-width:0;overflow-x:auto;overscroll-behavior-x:contain;
+scrollbar-width:none;-ms-overflow-style:none}
+.sn::-webkit-scrollbar{display:none}
+.sn{-webkit-mask-image:linear-gradient(90deg,#000 0,#000 calc(100% - 14px),transparent 100%);
+mask-image:linear-gradient(90deg,#000 0,#000 calc(100% - 14px),transparent 100%)}
+.sn a{display:flex;align-items:center;gap:6px;padding:5px 11px;border-radius:7px;font-size:13.5px;
+color:var(--fg2);white-space:nowrap}
+.sn a .ic{color:var(--fg3)}
+@media(hover:hover){.sn a:hover{background:var(--pa2);color:var(--fg);text-decoration:none}}
+.sn a.on{background:var(--acb);color:var(--ac);font-weight:590}
+.sn a.on .ic{color:var(--ac)}
+.tb .su{display:none}
+.mn{min-width:0;display:flex;flex-direction:column;background:var(--bg)}
+.tb{display:flex;align-items:center;gap:10px;height:52px;min-width:0;
+padding-left:max(18px,env(safe-area-inset-left));padding-right:max(18px,env(safe-area-inset-right))}
 .tb .sp{flex:1}
 .sf1{display:flex;align-items:center;gap:7px;background:var(--pa);border:.5px solid var(--li2);
 border-radius:99px;padding:0 12px;height:31px;width:290px;max-width:100%;cursor:text;color:var(--fg3);
@@ -2947,13 +2984,17 @@ font-size:13.5px;min-width:0;flex:1}
 .kv dt{color:var(--fg3);font-size:12px}
 .kv dd{margin:0}
 @media(max-width:880px){
- .app{grid-template-columns:1fr}
- .sb{display:none}
  .ct{padding:12px}
  .tb{padding-left:max(12px,env(safe-area-inset-left));padding-right:max(12px,env(safe-area-inset-right));
-  height:calc(48px + env(safe-area-inset-top))}
- .sf1{width:100%;height:34px}
- .sf1 kbd{display:none}
+  height:48px;gap:8px}
+ /* Erste Reihe traegt die Gruppen, die Suche wird ein Knopf */
+ .bd{display:none}
+ .sf1{display:none}
+ .tb .sp{display:none}
+ .tb .su{display:inline-flex;flex:none;padding:0 8px}
+ .gn{flex:1}
+ .gn a{padding:6px 10px;font-size:13.5px}
+ .sn{padding-left:max(12px,env(safe-area-inset-left));padding-right:max(12px,env(safe-area-inset-right))}
  /* 16px verhindert, dass iOS beim Antippen in die Seite zoomt */
  input,select,textarea,.sf1 input[type=search]{font-size:16px}
  /* iOS-Untergrenze fuer Tippflaechen */
@@ -2963,18 +3004,6 @@ font-size:13.5px;min-width:0;flex:1}
  .li.rows li>a:not([class]){padding:11px 14px;min-height:46px}
  .seg a{padding:6px 12px}
  td,th{padding:9px 12px}
-}
-.tabs{display:none}
-@media(max-width:880px){
- .tabs{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:60;
-  background:color-mix(in srgb,var(--pa) 88%,transparent);
-  backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);
-  border-top:1px solid var(--li);padding-bottom:env(safe-area-inset-bottom)}
- .tabs a{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
-  padding:7px 2px 6px;min-height:49px;color:var(--fg3);font-size:10px;font-weight:500;letter-spacing:0}
- .tabs a:hover{text-decoration:none}
- .tabs a.on{color:var(--ac)}
- .ct{padding-bottom:calc(62px + env(safe-area-inset-bottom))}
 }
 @media(max-width:880px){.ph h1{font-size:22px}}
 /* Bausteine */
@@ -3156,7 +3185,7 @@ body.modal{overflow:hidden}
 .pl li.on .mu2{color:rgba(255,255,255,.78)}
 .pl li b{font-weight:500}
 .pl .gr{padding:7px 12px 3px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--fg3);font-weight:600}
-@media print{.sb,.tb,.np,.pl,.tabs{display:none!important}.app{display:block}.ct{padding:0;max-width:none}
+@media print{.kopf,.np,.pl{display:none!important}.app{display:block}.ct{padding:0;max-width:none}
 .tw{overflow:visible}.c{box-shadow:none;margin:0 0 10px;background:none}.c>.hd{padding:0 0 4px}.c>.bo{padding:0}
 body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding:5px 8px}a{color:#000}@page{margin:16mm}}
 </style>
@@ -3166,35 +3195,21 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
 <div style="max-width:<?= !empty($o['weit']) ? '900' : (!empty($o['breit']) ? '580' : '340') ?>px;margin:0 auto;padding:<?= !empty($o['breit']) || !empty($o['weit']) ? '5' : '9' ?>vh 16px"><?= $inhalt ?></div>
 <?php else: ?>
 <div class="app">
- <aside class="sb">
-  <div class="bd"><i></i><?= h(APP_NAME) ?></div>
-  <nav class="nv">
-   <?php $ni = 0; foreach (nav_gruppen() as [$grp, $items]): ?>
-    <?php if ($grp !== ''): ?><div class="gr"><?= h($grp) ?></div><?php endif; ?>
-    <?php foreach ($items as [$k, $lbl, $sym]): $ni++; $b = nav_zahl($k); ?>
-     <a href="<?= url($k) ?>"<?= $p === $k ? ' class="on"' : '' ?>><?= ic($sym, 18) ?><span><?= h($lbl) ?></span>
-      <?= $b !== '' ? '<span class="b">' . h($b) . '</span>' : '' ?></a>
-    <?php endforeach; ?>
-   <?php endforeach; ?>
-  </nav>
-  <div class="sf">
-   <?php if ($u): ?>
-    <b><?= h($u['username']) ?></b>
-    <?php $sfs = ausbildungsstand($u); ?>
-    <?= h(trim((klasse_name($u) ?: $u['betrieb']) . ' · ' . $sfs['jahr'] . '. Jahr', ' ·')) ?>
-    <div class="lk">
-     <a href="<?= url('einstellungen') ?>">Einstellungen</a>
-     <form method="post" action="<?= url('logout') ?>" style="display:inline"><?= csrf_field() ?>
-      <button class="g s" style="height:auto;padding:0;color:var(--ac)" type="submit">Abmelden</button></form>
-    </div>
-   <?php endif; ?>
-  </div>
- </aside>
  <div class="mn">
-  <header class="tb np">
+  <div class="kopf np">
+   <header class="tb">
    <?php if (!empty($o['zurueck'])): ?>
     <a class="bt g s bk" href="<?= h($o['zurueck']) ?>"><?= ic('zurueck', 18) ?><span><?= h($o['zurueck_t'] ?? 'Zurueck') ?></span></a>
    <?php endif; ?>
+   <a class="bd" href="<?= url('start') ?>" title="<?= h(APP_NAME) ?>"><i></i><span><?= h(APP_NAME) ?></span></a>
+   <?php $ga = gruppe_aktiv($p); ?>
+   <nav class="gn">
+    <?php foreach (nav_gruppen() as $g): $b = nav_zahl($g[0]); ?>
+     <a href="<?= h(gruppe_url($g)) ?>"<?= $ga === $g[0] ? ' class="on"' : '' ?>><?= h($g[1]) ?><?php
+       if ($b !== ''): ?><span class="b"><?= h($b) ?></span><?php endif; ?></a>
+    <?php endforeach; ?>
+   </nav>
+   <span class="sp"></span>
    <form method="get" action="<?= h(base_path()) ?>" class="sf1" data-palette>
     <input type="hidden" name="p" value="suche">
     <?= ic('suche', 16) ?>
@@ -3203,12 +3218,23 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
            enterkeyhint="search"<?= $p === 'suche' && get('q') === '' ? ' autofocus' : '' ?>>
     <kbd>&#8984;K</kbd>
    </form>
-   <span class="sp"></span>
+   <a class="bt g s su" href="<?= url('suche') ?>" data-palette aria-label="Suchen"><?= ic('suche', 19) ?></a>
    <form method="post" action="<?= url('theme') ?>"><?= csrf_field() ?>
     <input type="hidden" name="theme" value="<?= $theme === 'dunkel' ? 'hell' : ($theme === 'hell' ? 'auto' : 'dunkel') ?>">
     <button class="g s" type="submit" title="Design"><?= $theme === 'dunkel' ? '&#9788;' : ($theme === 'hell' ? '&#9789;' : '&#9681;') ?></button>
    </form>
-  </header>
+   </header>
+   <?php
+   $gr = null;
+   foreach (nav_gruppen() as $g) if ($g[0] === $ga) { $gr = $g; break; }
+   if ($gr && $gr[3]): $hier = nav_adresse($p); ?>
+    <nav class="sn">
+     <?php foreach ($gr[3] as [$lbl, $sym, $adr]): ?>
+      <a href="<?= h($adr) ?>"<?= $adr === $hier ? ' class="on"' : '' ?>><?= ic($sym, 15) ?><span><?= h($lbl) ?></span></a>
+     <?php endforeach; ?>
+    </nav>
+   <?php endif; ?>
+  </div>
   <div class="ct">
    <div class="ph np">
     <div class="pt">
@@ -3231,12 +3257,6 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
   </div>
  </div>
 </div>
-<nav class="tabs np">
- <?php foreach (tabs() as [$tk, $tl, $tsym, $turl]): ?>
-  <a href="<?= h($turl) ?>"<?= tab_aktiv($p) === $tk ? ' class="on"' : '' ?><?= $tk === 'suche' ? ' data-palette' : '' ?>>
-   <?= ic($tsym, 23) ?><span><?= h($tl) ?></span></a>
- <?php endforeach; ?>
-</nav>
 <div class="pl" id="pl"><div class="bx">
  <div class="pf"><?= ic('suche', 18) ?><input type="search" id="pq" placeholder="Springen oder suchen" autocomplete="off"
    autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go"><button class="g s" type="button" data-schliessen>Fertig</button></div>
@@ -3245,7 +3265,7 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
 <script nonce="<?= h($n) ?>">
 (function(){
 var B=<?= json_encode(base_path()) ?>;
-var N=<?= json_encode(array_map(fn($x) => ['t' => $x[1], 'u' => url($x[0])], nav()), JSON_UNESCAPED_UNICODE) ?>;
+var N=<?= json_encode(array_map(fn($x) => ['t' => $x[1], 'u' => $x[0]], nav()), JSON_UNESCAPED_UNICODE) ?>;
 // Derselbe Zielindex wie auf dem Server, damit Palette und Suchseite gleich ranken
 <?php $zn = $u ? ziel_nutzung((int)$u['id']) : []; $zfrisch = date('Y-m-d', strtotime('-7 days')); ?>
 var Z=<?= json_encode(array_map(fn($z) => ['t' => $z[1], 'g' => $z[2] ?: 'Start',
@@ -3265,6 +3285,12 @@ document.addEventListener('click',function(e){
    var o=v.textContent;v.textContent='kopiert';setTimeout(function(){v.textContent=o;},1100);});}
 });
 document.addEventListener('submit',function(e){var m=e.target.getAttribute('data-q');if(m&&!confirm(m))e.preventDefault();});
+// Die offene Gruppe muss sichtbar sein, auch wenn die Reihe gescrollt ist
+[['.gn a.on','.gn'],['.sn a.on','.sn']].forEach(function(paar){
+ var a=document.querySelector(paar[0]); if(!a)return;
+ var w=a.closest(paar[1]); if(!w||w.scrollWidth<=w.clientWidth)return;
+ w.scrollLeft=Math.max(0,a.offsetLeft-(w.clientWidth-a.offsetWidth)/2);
+});
 document.addEventListener('change',function(e){if(e.target.matches('[data-autosubmit]'))e.target.form.submit();});
 document.addEventListener('click',function(e){
  if(e.target.closest('[data-schliessen]')){close_();return;}
@@ -4290,13 +4316,6 @@ function p_start(): void {
 
 // --- Termine ---------------------------------------------------------------
 // --- Plan: Termine, Aufgaben, Stundenplan, Blockplan ------------------------
-function plan_tabs(): array {
-    $t = [];
-    foreach (['termine' => 'Termine', 'aufgaben' => 'Aufgaben', 'stundenplan' => 'Stundenplan', 'block' => 'Blockplan'] as $k => $l) {
-        $t[$k] = [$l, url('plan', $k === 'termine' ? [] : ['t' => $k])];
-    }
-    return $t;
-}
 function p_plan(): void {
     $u = need_login();
     $t = get('t') ?: 'termine';
@@ -4355,7 +4374,7 @@ function plan_stundenplan(array $u): void {
       </form>
     </div></div>
     <?php
-    page('Stundenplan', ob_get_clean(), ['tabs' => plan_tabs(), 'aktiv' => 'stundenplan']);
+    page('Stundenplan', ob_get_clean(), []);
 }
 
 function plan_block(array $u): void {
@@ -4454,7 +4473,7 @@ function plan_block(array $u): void {
       </div>
     </div>
     <?php
-    page('Blockplan', ob_get_clean(), ['tabs' => plan_tabs(), 'aktiv' => 'block']);
+    page('Blockplan', ob_get_clean(), []);
 }
 
 function plan_termine(array $u): void {
@@ -4597,7 +4616,7 @@ function plan_termine(array $u): void {
       </div>
     </div>
     <?php
-    page('Termine', ob_get_clean(), ['tabs' => plan_tabs(), 'aktiv' => 'termine']);
+    page('Termine', ob_get_clean(), []);
 }
 
 // --- Aufgaben --------------------------------------------------------------
@@ -4690,7 +4709,7 @@ function plan_aufgaben(array $u): void {
       </div></div>
     </div>
     <?php
-    page('Aufgaben', ob_get_clean(), ['tabs' => plan_tabs(), 'aktiv' => 'aufgaben']);
+    page('Aufgaben', ob_get_clean(), []);
 }
 
 // --- Notizen ---------------------------------------------------------------
@@ -5921,13 +5940,7 @@ function pruef_projekt(array $u): void {
       </div>
     </div>
     <?php
-    page('Abschlussprojekt', ob_get_clean(), ['tabs' => pruef_tabs(), 'aktiv' => 'projekt',
-        'unter' => h((string)$p['titel'])]);
-}
-function pruef_tabs(): array {
-    return ['start' => ['Uebersicht', url('pruefung')],
-            'projekt' => ['Projekt', url('pruefung', ['t' => 'projekt'])],
-            'lf' => ['Lernfelder', url('pruefung', ['t' => 'lf'])]];
+    page('Abschlussprojekt', ob_get_clean(), ['unter' => h((string)$p['titel'])]);
 }
 
 function p_pruefung(): void {
@@ -6054,7 +6067,7 @@ function p_pruefung(): void {
     </div>
     <?php endif; ?>
     <?php
-    page('Pruefung', ob_get_clean(), ['tabs' => pruef_tabs(), 'aktiv' => $tab === 'lf' ? 'lf' : 'start']);
+    page('Pruefung', ob_get_clean(), []);
 }
 
 // --- Suche -----------------------------------------------------------------
