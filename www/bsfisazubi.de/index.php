@@ -2254,6 +2254,14 @@ function such_antwort(array $u, string $q): array {
                       . ($st['wechsel'] ? ' · ab ' . dt($st['wechsel']) . ' ' . klasse_name($u, $st['wechsel']) : '')),
             'url' => url('einstellungen')];
     }
+    if ($passt(['raum', 'stunde', 'stundenplan', 'unterricht', 'morgen', 'fach'])) {
+        $st = naechste_stunde($uid);
+        if ($st) {
+            $a[] = ['icon' => 'raster', 'label' => 'Naechste Stunde',
+                'wert' => $st['kurz'] . ($st['raum'] ? ' · Raum ' . $st['raum'] : '') . ' · ' . $st['wann'],
+                'url' => url('plan', ['t' => 'stundenplan'])];
+        }
+    }
     if ($passt(['abteilung', 'einsatz'])) {
         $ab = einsatz_am($uid, today()) ?: (string)$u['abteilung'];
         if ($ab !== '') {
@@ -2359,8 +2367,8 @@ function such_ziel(string $art, int $ref, string $datum, array $u): string {
 function art_icon(string $a): string {
     return ['notiz'=>'notizen','termin'=>'termin','aufgabe'=>'aufgabe','bericht'=>'bericht',
             'routine'=>'routine','kontakt'=>'kontakt','einsatz'=>'einsatz','fach'=>'faecher',
-            'lernfeld'=>'faecher','note'=>'noten','projekt'=>'projekt','abwesend'=>'einsatz',
-            'block'=>'plan','position'=>'pruefung','datei'=>'datei'][$a] ?? 'notizen';
+            'lernfeld'=>'liste','note'=>'noten','projekt'=>'projekt','abwesend'=>'frei',
+            'block'=>'plan','position'=>'haken','datei'=>'datei'][$a] ?? 'notizen';
 }
 function art_label(string $a): string {
     return ['notiz'=>'Notiz','termin'=>'Termin','aufgabe'=>'Aufgabe','bericht'=>'Bericht','routine'=>'Routine',
@@ -2401,6 +2409,7 @@ function icons(): array {
         'import'  => '<path d="M12 3.5v11"/><path d="M8 11l4 4 4-4"/><path d="M4.5 17v2a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2"/>',
         'raster'  => '<rect x="3" y="4" width="18" height="16" rx="2.4"/><path d="M3 9.5h18M9 9.5V20M15 9.5V20"/>',
         'liste'   => '<path d="M9 6.5h11M9 12h11M9 17.5h11"/><path d="M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01"/>',
+        'haken'   => '<path d="M4 12.5l5 5L20 6.5"/>',
         'weiter'  => '<path d="M9 5.5L15.5 12 9 18.5"/>',
         'zurueck' => '<path d="M15 5.5L8.5 12l6.5 6.5"/>',
     ];
@@ -2434,19 +2443,19 @@ function ziele_index(): array {
         ['plan',    'Blockplan',          'Plan',          'block blockplan blockwoche schulwoche ferien schulblock',           url('plan', ['t' => 'block']),                 '#0f5fa8'],
         ['bericht', 'Berichtsheft',       'Betrieb',       'berichtsheft nachweis ausbildungsnachweis wochenbericht bericht ihk woche monat', url('berichtsheft'),               '#af52de'],
         ['liste',   'Alle Nachweise',     'Betrieb',       'alle nachweise berichte heft',                                      url('berichtsheft', ['t' => 'alle']),          '#c77dff'],
-        ['pruefung','Ausbildungsplan',    'Betrieb',       'ausbildungsplan berufsbildposition fiausbv fortschritt abgedeckt',  url('berichtsheft', ['t' => 'plan']),          '#8b5cf6'],
-        ['routine', 'Routinen',           'Betrieb',       'routine routinen wiederkehrend kaffeemaschine taeglich woechentlich', url('berichtsheft', ['t' => 'routinen']),    '#ff9500'],
+        ['haken',   'Ausbildungsplan',    'Betrieb',       'ausbildungsplan berufsbildposition fiausbv fortschritt abgedeckt',  url('berichtsheft', ['t' => 'plan']),          '#8b5cf6'],
+        ['routine', 'Routinen',           'Betrieb',       'routine routinen wiederkehrend kaffeemaschine taeglich woechentlich', url('berichtsheft', ['t' => 'routinen']),    '#ffcc00'],
         ['einsatz', 'Einsaetze',          'Betrieb',       'einsatz einsaetze abteilung durchlauf versetzung wechsel',          url('einsaetze'),                              '#a2845e'],
         ['frei',    'Fehlzeiten & Urlaub','Betrieb',       'urlaub resturlaub fehlzeit fehlzeiten krank krankheit frei abwesend dienstreise schulung entschuldigung', url('einsaetze', ['t' => 'zeiten']), '#00b894'],
         ['kontakt', 'Kontakte',           'Betrieb',       'kontakt kontakte ansprechpartner ausbilder ausbilderin lehrer telefon mail ihk nummer', url('kontakte'),           '#00c7be'],
         ['pruefung','Pruefung',           'Abschluss',     'pruefung abschlusspruefung ap1 ap2 teil punkte prognose bestehen',  url('pruefung'),                               '#ff2d55'],
         ['projekt', 'Abschlussprojekt',   'Abschluss',     'projekt abschlussprojekt antrag genehmigung doku dokumentation praesentation frist stunden', url('pruefung', ['t' => 'projekt']), '#e11d48'],
-        ['liste',   'Lernfelder',         'Abschluss',     'lernfeld lernfelder lf lehrplan rahmenlehrplan',                    url('pruefung', ['t' => 'lf']),                '#0071e3'],
+        ['liste',   'Lernfelder',         'Abschluss',     'lernfeld lernfelder lf lehrplan rahmenlehrplan',                    url('pruefung', ['t' => 'lf']),                '#00a09a'],
         ['kontakt', 'Profil',             'Einstellungen', 'profil einstellungen konto klasse schule betrieb beruf beginn',     url('einstellungen'),                          '#8e8e93'],
         ['import',  'Quellen',            'Einstellungen', 'quelle quellen import webuntis ical kalender ferien feiertage blockplan abonnement sync', url('einstellungen', ['t' => 'quellen']), '#5ac8fa'],
         ['schloss', 'Sicherheit',         'Einstellungen', 'sicherheit passwort kennwort zwei-faktor 2fa totp sitzung anmeldung', url('einstellungen', ['t' => 'sicherheit']), '#636366'],
-        ['datei',   'Daten & Export',     'Einstellungen', 'daten export backup sicherung csv json kalenderadresse konto loeschen', url('einstellungen', ['t' => 'daten']),    '#8e8e93'],
-        ['teilen',  'Geteilte Links',     'Einstellungen', 'geteilt teilen link freigabe share oeffentlich',                    url('geteilt'),                                '#0071e3'],
+        ['datei',   'Daten & Export',     'Einstellungen', 'daten export backup sicherung csv json kalenderadresse konto loeschen', url('einstellungen', ['t' => 'daten']),    '#48484a'],
+        ['teilen',  'Geteilte Links',     'Einstellungen', 'geteilt teilen link freigabe share oeffentlich',                    url('geteilt'),                                '#98989d'],
     ];
 }
 /**
@@ -2481,22 +2490,23 @@ function ziel_nutzung(int $uid): array {
 function ziel_rang(array $z, string $q): int {
     $l = mb_strtolower($z[1]);
     $q = mb_strtolower(trim($q));
-    if ($q === '') return 1;
-    if ($l === $q) return 120;
-    if (str_starts_with($l, $q)) return 100;
-    foreach (preg_split('/[\s&]+/', $l) as $w) if ($w !== '' && str_starts_with($w, $q)) return 90;
-    if (str_contains($l, $q)) return 70;
+    if ($q === '') return 10;
+    if ($l === $q) return 1200;
+    if (str_starts_with($l, $q)) return 1000;
+    foreach (preg_split('/[\s&]+/', $l) as $w) if ($w !== '' && str_starts_with($w, $q)) return 900;
+    if (str_contains($l, $q)) return 700;
     $woerter = explode(' ', $z[3]);
     foreach ($woerter as $w) {
-        if ($w === $q) return 65;
-        if ($w !== '' && str_starts_with($w, $q)) return 55;
+        if ($w === $q) return 650;
+        if ($w !== '' && str_starts_with($w, $q)) return 550;
     }
-    if (mb_strlen($q) >= 4) foreach ($woerter as $w) if ($w !== '' && str_contains($w, $q)) return 35;
+    if (mb_strlen($q) >= 4) foreach ($woerter as $w) if ($w !== '' && str_contains($w, $q)) return 350;
     return 0;
 }
 /**
  * Passende Ziele, bestes zuerst. Was jemand oft oeffnet, steigt - aber
- * hoechstens um 20 Punkte, damit ein genauer Treffer nie verdraengt wird.
+ * hoechstens um 26 Punkte. Die Rangklassen liegen 100 Punkte auseinander,
+ * ein genauer Treffer wird also nie verdraengt.
  */
 function ziele_suchen(string $q, int $limit = 6): array {
     $u = me();
@@ -2507,8 +2517,8 @@ function ziele_suchen(string $q, int $limit = 6): array {
         if ($r <= 0) continue;
         $bonus = 0.0;
         if (isset($nutzung[$z[1]])) {
-            $bonus = min(16.0, 4.0 * sqrt((float)$nutzung[$z[1]]['anzahl']));
-            if ($nutzung[$z[1]]['letzt'] >= date('Y-m-d', strtotime('-7 days'))) $bonus += 4;
+            $bonus = min(20.0, 5.0 * sqrt((float)$nutzung[$z[1]]['anzahl']));
+            if ($nutzung[$z[1]]['letzt'] >= date('Y-m-d', strtotime('-7 days'))) $bonus += 6;
         }
         $t[] = ['rang' => $r + $bonus, 'icon' => $z[0], 'label' => $z[1], 'bereich' => $z[2],
                 'url' => $z[4], 'farbe' => $z[5] ?? '#8e8e93'];
@@ -2675,16 +2685,38 @@ function jetzt_karte(array $u): ?array {
     }
     return null;
 }
+/**
+ * Die naechste Unterrichtsstunde: heute nach der aktuellen Uhrzeit, sonst der
+ * naechste Werktag aus dem Stundenplan.
+ * @return array{kurz:string,raum:string,wann:string}|null
+ */
+function naechste_stunde(int $uid): ?array {
+    $e = one("SELECT e.*, s.short, s.name FROM events e LEFT JOIN subjects s ON s.id = e.subject_id
+              WHERE e.user_id = ? AND e.typ = 'unterricht' AND e.datum = ? AND e.zeit_von > ?
+              ORDER BY e.zeit_von LIMIT 1", [$uid, today(), date('H:i')]);
+    if ($e) {
+        return ['kurz' => (string)($e['short'] ?: $e['titel']), 'raum' => (string)$e['raum'],
+                'wann' => 'heute ' . substr((string)$e['zeit_von'], 0, 5)];
+    }
+    for ($i = 1; $i <= 7; $i++) {
+        $tag = (int)date('N', strtotime('+' . $i . ' day'));
+        if ($tag > 5) continue;
+        $r = one("SELECT t.raum, s.short, s.name FROM timetable t
+                  LEFT JOIN subjects s ON s.id = t.subject_id
+                  WHERE t.user_id = ? AND t.tag = ? AND t.subject_id IS NOT NULL
+                  ORDER BY t.stunde LIMIT 1", [$uid, $tag]);
+        if ($r) {
+            return ['kurz' => (string)($r['short'] ?: $r['name']), 'raum' => (string)$r['raum'],
+                    'wann' => $i === 1 ? 'morgen' : wd($tag)];
+        }
+    }
+    return null;
+}
 /** Aktueller Wert je Ziel - die Zielliste ist zugleich die Antwortliste. */
 function ziel_werte(array $u): array {
     $uid = (int)$u['id'];
     $w = [];
     $n = fn(string $sql, array $a = []) => (int)val($sql, $a, 0);
-
-    $anz = $n("SELECT COUNT(*) FROM subjects WHERE user_id = ? AND archiv = 0", [$uid]);
-    if ($anz) $w['Faecher'] = $anz . '';
-    $anz = $n("SELECT COUNT(*) FROM notes WHERE user_id = ?", [$uid]);
-    if ($anz) $w['Notizen'] = $anz . '';
 
     $g = noten_stats($uid);
     if ($g['schnitt'] !== null) $w['Noten'] = num((float)$g['schnitt'], 2);
@@ -2702,15 +2734,11 @@ function ziel_werte(array $u): array {
     $art = $u['bh_art']; $rep = report_get($uid, $art, periode_of(today(), $art));
     $sum = report_sum((int)$rep['id']);
     $w['Berichtsheft'] = $rep['status'] === 'fertig' ? 'fertig' : num((float)$sum['std'], 1) . ' h';
-    $anz = $n("SELECT COUNT(*) FROM reports WHERE user_id = ?", [$uid]);
-    if ($anz) $w['Alle Nachweise'] = $anz . '';
     $belegt = $n("SELECT COUNT(DISTINCT e.category_id) FROM report_entries e
                   JOIN categories c ON c.id = e.category_id
                   WHERE e.user_id = ? AND c.abschnitt <> 'X'", [$uid]);
     $ges = $n("SELECT COUNT(*) FROM categories WHERE abschnitt <> 'X'");
     if ($ges) $w['Ausbildungsplan'] = $belegt . ' von ' . $ges;
-    $anz = $n("SELECT COUNT(*) FROM routines WHERE user_id = ? AND aktiv = 1", [$uid]);
-    if ($anz) $w['Routinen'] = $anz . '';
 
     $ab = einsatz_am($uid, today()) ?: (string)$u['abteilung'];
     if ($ab !== '') $w['Einsaetze'] = mb_substr($ab, 0, 22);
@@ -2719,8 +2747,6 @@ function ziel_werte(array $u): array {
                  [$uid, $jahr . '%']) as $r) $genommen += werktage($r['von'], $r['bis']);
     $ansp = (float)$u['urlaub_tage'];
     if ($ansp > 0) $w['Fehlzeiten & Urlaub'] = num(max(0, $ansp - $genommen), 0) . ' T frei';
-    $anz = $n("SELECT COUNT(*) FROM kontakte WHERE user_id = ?", [$uid]);
-    if ($anz) $w['Kontakte'] = $anz . '';
 
     $cd = fn(?string $d) => $d ? (int)ceil((strtotime($d) - strtotime(today())) / 86400) : null;
     $t1 = $cd($u['ap1']); $t2 = $cd($u['ap2']);
@@ -2734,10 +2760,8 @@ function ziel_werte(array $u): array {
         }
         $w['Abschlussprojekt'] = $naechst ? dt($naechst, 'd.m.') : (string)$pj['status'];
     }
-    $anz = $n("SELECT COUNT(*) FROM shares WHERE user_id = ?", [$uid]);
-    if ($anz) $w['Geteilte Links'] = $anz . '';
-    $anz = $n("SELECT COUNT(*) FROM sources WHERE user_id = ? AND aktiv = 1", [$uid]);
-    if ($anz) $w['Quellen'] = $anz . '';
+    $st = naechste_stunde($uid);
+    if ($st) $w['Stundenplan'] = $st['kurz'] . ($st['raum'] ? ' · ' . $st['raum'] : '');
     if ((int)$u['totp_enabled'] === 1) $w['Sicherheit'] = 'Zwei-Faktor an';
     $w['Profil'] = klasse_name($u) ?: (string)$u['username'];
     return $w;
@@ -2857,6 +2881,7 @@ p{margin:0 0 8px}
 code,pre,.mo{font-family:var(--mo);font-size:12.5px}
 pre{background:var(--pa2);border-radius:var(--r2);padding:10px 12px;overflow:auto;margin:6px 0;line-height:1.55}
 kbd{font:11px var(--mo);background:var(--pa3);border-radius:4px;padding:1px 5px;color:var(--fg2)}
+@media(max-width:880px){kbd{display:none}}
 hr{border:0;border-top:1px solid var(--li);margin:14px 0}
 .mu{color:var(--fg2)}.mu2{color:var(--fg3)}.sm{font-size:13px}
 /* Rahmen */
@@ -2894,6 +2919,8 @@ border-bottom:1px solid var(--li);display:flex;align-items:center;gap:10px;paddi
 border-radius:99px;padding:0 12px;height:31px;width:290px;max-width:100%;cursor:text;color:var(--fg3);
 box-shadow:0 1px 1px rgba(0,0,0,.03) inset}
 .sf1:focus-within{border-color:var(--ac);outline:3px solid var(--acb)}
+.tb .bk{display:none}
+@media(max-width:880px){.tb .bk{display:inline-flex;flex:none;padding:0 8px 0 2px;gap:2px}}
 .sf1 input[type=search]{border:0;background:transparent;box-shadow:none;height:28px;padding:0;
 font-size:13.5px;min-width:0;flex:1}
 .sf1 input:focus{outline:none}
@@ -2912,7 +2939,8 @@ font-size:13.5px;min-width:0;flex:1}
 .ph h1.lang{font-size:21px;letter-spacing:-.022em}
 .ph .ps{font-size:13px;color:var(--fg2);margin-top:3px}
 .ph .sp{flex:1}
-.lb{font-size:12px;letter-spacing:0;color:var(--fg3);font-weight:500;margin-bottom:6px}
+.lb{font-size:12px;letter-spacing:0;color:var(--fg3);font-weight:500;margin-bottom:5px}
+@media(max-width:520px){.g3{gap:10px}.g3 .c>.bo{padding:11px 12px}}
 .ck{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--fg2);font-weight:400;margin:0}
 .ck input{margin:0}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:13px}
@@ -2932,7 +2960,7 @@ font-size:13.5px;min-width:0;flex:1}
  button,.bt{min-height:38px;padding:0 14px}
  button.s,.bt.s{min-height:32px;padding:0 11px;font-size:13px}
  input,select{height:38px}
- .li.rows li a{padding:11px 14px;min-height:46px}
+ .li.rows li>a:not([class]){padding:11px 14px;min-height:46px}
  .seg a{padding:6px 12px}
  td,th{padding:9px 12px}
 }
@@ -2958,10 +2986,15 @@ font-size:13.5px;min-width:0;flex:1}
 .c>.bo.p0{padding:0}
 .g{display:grid;gap:14px}.g>*{min-width:0}
 .g2{grid-template-columns:repeat(auto-fit,minmax(290px,1fr))}
-.g3{grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(148px,1fr))}
 .sp2{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:14px;align-items:start}
 .sp2>*{min-width:0}
-@media(max-width:1040px){.sp2{grid-template-columns:1fr}}
+@media(max-width:1040px){
+ .sp2{grid-template-columns:1fr}
+ /* Ein geoeffnetes Detail gehoert ueber die Liste, nicht darunter */
+ .sp2.det{display:flex;flex-direction:column}
+ .sp2.det>*:nth-child(2){order:-1}
+}
 .rw{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
 .line{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
 .line>*{min-width:0}
@@ -3032,22 +3065,24 @@ font-weight:500;color:var(--fg2);line-height:19px;white-space:nowrap}
 .ic{flex:none;display:block}
 .tile{width:27px;height:27px;border-radius:7px;display:grid;place-items:center;color:#fff;flex:none}
 .t-heute{background:#ff3b30}.t-faecher{background:#0071e3}.t-notizen{background:#ff9500}
-.t-noten{background:#34c759}.t-plan{background:#5856d6}.t-bericht{background:#af52de}
+.t-noten{background:#34c759}.t-plan{background:#0f5fa8}.t-bericht{background:#af52de}
 .t-einsatz{background:#a2845e}.t-kontakt{background:#00c7be}.t-pruefung{background:#ff2d55}
-.t-termin{background:#5856d6}.t-aufgabe{background:#30b0c7}.t-routine{background:#ff9500}
-.t-projekt{background:#ff2d55}.t-datei{background:#8e8e93}.t-zahnrad{background:#8e8e93}
-.t-teilen{background:#0071e3}.t-suche{background:#8e8e93}
+.t-termin{background:#5856d6}.t-aufgabe{background:#30b0c7}.t-routine{background:#ffcc00}
+.t-projekt{background:#e11d48}.t-datei{background:#48484a}.t-zahnrad{background:#636366}
+.t-haken{background:#8b5cf6}
+.t-teilen{background:#98989d}.t-suche{background:#8e8e93}
 .t-schloss{background:#636366}.t-frei{background:#00b894}.t-import{background:#5ac8fa}.t-raster{background:#5856d6}
-.t-liste{background:#0071e3}
+.t-liste{background:#00a09a}
 /* Listenzeilen mit Symbol, Text, Chevron */
 .li.rows li{padding:0}
-.li.rows li a{display:flex;gap:11px;align-items:center;width:100%;padding:9px 14px;color:var(--fg);min-width:0}
-.li.rows li a:hover{text-decoration:none}
+.li.rows li>a:not([class]){display:flex;gap:11px;align-items:center;width:100%;padding:9px 14px;
+color:var(--fg);min-width:0}
+@media(hover:hover){.li.rows li>a:not([class]):hover{text-decoration:none}}
 .li.rows .tx{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
 .li.rows .tx b{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .li.rows.antw .tx{gap:0}
 .li.rows.antw .tx b{font-size:17px;font-weight:600;letter-spacing:-.015em;white-space:normal}
-.li.rows.antw li a{padding:12px 15px}
+.li.rows.antw li>a:not([class]){padding:12px 15px}
 .li.rows .tx span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .li.rows .ic{color:var(--fg3)}
 .li.rows .tile .ic{color:#fff}
@@ -3157,11 +3192,15 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
  </aside>
  <div class="mn">
   <header class="tb np">
+   <?php if (!empty($o['zurueck'])): ?>
+    <a class="bt g s bk" href="<?= h($o['zurueck']) ?>"><?= ic('zurueck', 18) ?><span><?= h($o['zurueck_t'] ?? 'Zurueck') ?></span></a>
+   <?php endif; ?>
    <form method="get" action="<?= h(base_path()) ?>" class="sf1" data-palette>
     <input type="hidden" name="p" value="suche">
     <?= ic('suche', 16) ?>
     <input type="search" name="q" id="sq" placeholder="Suchen" value="<?= h(get('q')) ?>"
-           autocomplete="off" enterkeyhint="search"<?= $p === 'suche' && get('q') === '' ? ' autofocus' : '' ?>>
+           autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+           enterkeyhint="search"<?= $p === 'suche' && get('q') === '' ? ' autofocus' : '' ?>>
     <kbd>&#8984;K</kbd>
    </form>
    <span class="sp"></span>
@@ -3194,12 +3233,13 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
 </div>
 <nav class="tabs np">
  <?php foreach (tabs() as [$tk, $tl, $tsym, $turl]): ?>
-  <a href="<?= h($turl) ?>"<?= tab_aktiv($p) === $tk ? ' class="on"' : '' ?>>
+  <a href="<?= h($turl) ?>"<?= tab_aktiv($p) === $tk ? ' class="on"' : '' ?><?= $tk === 'suche' ? ' data-palette' : '' ?>>
    <?= ic($tsym, 23) ?><span><?= h($tl) ?></span></a>
  <?php endforeach; ?>
 </nav>
 <div class="pl" id="pl"><div class="bx">
- <div class="pf"><?= ic('suche', 18) ?><input type="search" id="pq" placeholder="Springen oder suchen" autocomplete="off" enterkeyhint="go"><button class="g s" type="button" data-schliessen>Fertig</button></div>
+ <div class="pf"><?= ic('suche', 18) ?><input type="search" id="pq" placeholder="Springen oder suchen" autocomplete="off"
+   autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go"><button class="g s" type="button" data-schliessen>Fertig</button></div>
  <ul id="pu"></ul></div></div>
 <?php endif; ?>
 <script nonce="<?= h($n) ?>">
@@ -3207,8 +3247,11 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
 var B=<?= json_encode(base_path()) ?>;
 var N=<?= json_encode(array_map(fn($x) => ['t' => $x[1], 'u' => url($x[0])], nav()), JSON_UNESCAPED_UNICODE) ?>;
 // Derselbe Zielindex wie auf dem Server, damit Palette und Suchseite gleich ranken
+<?php $zn = $u ? ziel_nutzung((int)$u['id']) : []; $zfrisch = date('Y-m-d', strtotime('-7 days')); ?>
 var Z=<?= json_encode(array_map(fn($z) => ['t' => $z[1], 'g' => $z[2] ?: 'Start',
-        'w' => $z[3], 'u' => $z[4], 'i' => $z[0], 'c' => $z[5] ?? '#8e8e93'], ziele_index()), JSON_UNESCAPED_UNICODE) ?>;
+        'w' => $z[3], 'u' => $z[4], 'i' => $z[0], 'c' => $z[5] ?? '#8e8e93',
+        'n' => (int)($zn[$z[1]]['anzahl'] ?? 0),
+        'z' => (int)(($zn[$z[1]]['letzt'] ?? '') >= $zfrisch)], ziele_index()), JSON_UNESCAPED_UNICODE) ?>;
 var SYM=<?= json_encode(icons(), JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>;
 var EX=<?= json_encode($u ? array_map(fn($z) => ['n' => $z['name'], 'u' => $z['url']],
         all("SELECT name, url FROM ziele WHERE user_id = ? ORDER BY sort, id", [(int)$u['id']])) : [], JSON_UNESCAPED_UNICODE) ?>;
@@ -3237,17 +3280,22 @@ var pl=document.getElementById('pl'),pq=document.getElementById('pq'),pu=documen
 var tref=[],aref=[],tid=0,lauf='';
 function esc(t){return String(t).replace(/[<>&"']/g,function(c){
  return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c];});}
-function rang(x,q){var l=x.t.toLowerCase();
- if(!q)return 1;
- if(l===q)return 120;
- if(l.indexOf(q)===0)return 100;
- var w=l.split(/[\s&]+/);
- for(var i=0;i<w.length;i++)if(w[i].indexOf(q)===0)return 90;
- if(l.indexOf(q)>=0)return 70;
- var k=(x.w||'').split(' ');
- for(var j=0;j<k.length;j++){if(k[j]===q)return 65;if(k[j]&&k[j].indexOf(q)===0)return 55;}
- if(q.length>=4)for(var m=0;m<k.length;m++)if(k[m]&&k[m].indexOf(q)>=0)return 35;
- return 0;}
+function rang(x,q){var l=x.t.toLowerCase(),r=0;
+ if(!q)r=10;
+ else if(l===q)r=1200;
+ else if(l.indexOf(q)===0)r=1000;
+ else{var w=l.split(/[\s&]+/),tr=0;
+  for(var i=0;i<w.length;i++)if(w[i].indexOf(q)===0){tr=900;break;}
+  if(!tr&&l.indexOf(q)>=0)tr=700;
+  if(!tr){var k=(x.w||'').split(' ');
+   for(var j=0;j<k.length;j++){if(k[j]===q){tr=650;break;}if(k[j]&&k[j].indexOf(q)===0){tr=550;break;}}
+   if(!tr&&q.length>=4)for(var m=0;m<k.length;m++)if(k[m]&&k[m].indexOf(q)>=0){tr=350;break;}}
+  r=tr;}
+ if(!r)return 0;
+ // dieselbe gedeckelte Gewichtung wie auf dem Server
+ if(x.n)r+=Math.min(20,5*Math.sqrt(x.n));
+ if(x.z)r+=6;
+ return r;}
 function kachel(x){
  var n=x.i||'suche';
  var stil=x.c?' style="background:'+esc(x.c)+'"':'';
@@ -3886,7 +3934,7 @@ function p_faecher(): void {
       </div></div>
     <?php endif; ?>
     <?php
-    page('Faecher', ob_get_clean(), ['unter' => count($faecher) . ' Faecher · alles zu einem Fach an einem Ort',
+    page('Faecher', ob_get_clean(), ['unter' => count($faecher) . ' Faecher',
         'aktion' => '<a class="bt s g" href="' . h(url('faecher', $zeigeArchiv ? [] : ['archiv' => 1])) . '">'
             . ($zeigeArchiv ? 'Archiv aus' : 'Archiv') . '</a>'
             . '<a class="bt p s" data-new href="' . h(url('faecher', ['neu' => 1])) . '">Neues Fach <kbd>n</kbd></a>']);
@@ -4076,6 +4124,7 @@ function fach_detail(array $u, array $f): void {
     $unter .= $lf ? h($lf['code']) . ' · ' . (int)$lf['jahr'] . '. Jahr' : 'ohne Lernfeld';
     if ($f['lehrer']) $unter .= ' · ' . h($f['lehrer']);
     page($f['name'], ob_get_clean(), ['unter' => $unter,
+        'zurueck' => url('faecher'), 'zurueck_t' => 'Faecher',
         'aktion' => '<a class="bt s" href="' . h(url('faecher', ['id' => $id, 'e' => 1])) . '">Bearbeiten</a>'
             . '<a class="bt s g" href="' . h(url('faecher')) . '">Alle Faecher</a>']);
 }
@@ -4345,18 +4394,23 @@ function plan_block(array $u): void {
       <div class="c"><div class="hd"><h2>Blockwochen</h2><span class="sp"></span>
         <span class="sm mu2"><?= count($bl) ?></span></div>
         <?php if (!$bl): ?><?= em('Noch nichts eingetragen.') ?><?php else: ?>
-        <div class="tw"><table><tbody>
+        <ul class="li rows">
           <?php $naechster = null;
           foreach ($bl as $b2) if ($b2['art'] === 'schule' && $b2['von'] > today()) { $naechster = (int)$b2['id']; break; }
-          foreach ($bl as $b): $jetzt = today() >= $b['von'] && today() <= $b['bis']; ?>
-            <tr><td style="width:14px"><span class="dot" style="background:<?= $b['art'] === 'schule' ? 'var(--ac)' : ($b['art'] === 'ferien' ? 'var(--ok)' : 'var(--wa)') ?>"></span></td>
-              <td class="mo sm" style="white-space:nowrap;width:150px"><?= h(dt($b['von'], 'd.m.y')) ?><?= $b['bis'] !== $b['von'] ? ' – ' . h(dt($b['bis'], 'd.m.y')) : '' ?></td>
-              <td><?= h(ucfirst($b['art'])) ?> <span class="mu2 sm"><?= h($b['label']) ?></span><?= $jetzt ? ' <span class="tg a">jetzt</span>' : ((int)$b['id'] === $naechster ? ' <span class="tg o">naechste</span>' : '') ?></td>
-              <td style="width:30px"><form method="post"><?= csrf_field() ?>
+          foreach ($bl as $b): $jetzt = today() >= $b['von'] && today() <= $b['bis'];
+            $zeit = dt($b['von'], 'd.m.y') . ($b['bis'] !== $b['von'] ? ' – ' . dt($b['bis'], 'd.m.y') : ''); ?>
+            <li<?= $b['bis'] < today() ? ' style="opacity:.5"' : '' ?>>
+              <span class="tile" style="background:<?= $b['art'] === 'schule' ? '#0f5fa8' : ($b['art'] === 'ferien' ? '#00b894' : '#ff9500') ?>">
+                <?= ic($b['art'] === 'ferien' ? 'frei' : 'plan', 17) ?></span>
+              <span class="tx"><b><?= h($b['label'] ?: ucfirst((string)$b['art'])) ?></b>
+                <span class="sm mu2"><?= h($zeit) ?></span></span>
+              <?= $jetzt ? '<span class="tg a">jetzt</span>' : ((int)$b['id'] === $naechster ? '<span class="tg o">naechste</span>' : '') ?>
+              <form method="post" style="flex:none"><?= csrf_field() ?>
                 <input type="hidden" name="a" value="del"><input type="hidden" name="id" value="<?= (int)$b['id'] ?>">
-                <button class="g s d" type="submit">&times;</button></form></td></tr>
+                <button class="g s d" type="submit">&times;</button></form>
+            </li>
           <?php endforeach; ?>
-        </tbody></table></div>
+        </ul>
         <?php endif; ?>
       </div>
       <div>
@@ -4444,7 +4498,7 @@ function plan_termine(array $u): void {
                  [$uid, $start->format('Y-m-d'), $start->modify('+41 days')->format('Y-m-d')]) as $e) $cal[$e['datum']][] = $e;
 
     ob_start(); ?>
-    <div class="sp2">
+    <div class="sp2<?= $edit !== null ? ' det' : '' ?>">
       <div>
         <div class="c">
           <div class="hd">
@@ -4579,7 +4633,7 @@ function plan_aufgaben(array $u): void {
     $rows = all($sql, $ar);
     $edit = get('id') !== '' ? one("SELECT * FROM tasks WHERE id = ? AND user_id = ?", [(int)get('id'), $uid]) : null;
     ob_start(); ?>
-    <div class="sp2">
+    <div class="sp2<?= $edit !== null ? ' det' : '' ?>">
       <div class="c">
         <div class="hd">
           <form method="get" class="rw" style="flex:1"><input type="hidden" name="p" value="plan">
@@ -4684,7 +4738,7 @@ function p_notizen(): void {
     $rows = all($sql, $ar);
     $files = $edit && !empty($edit['id']) ? all("SELECT * FROM files WHERE scope='note' AND scope_id = ? AND user_id = ?", [(int)$edit['id'], $uid]) : [];
     ob_start(); ?>
-    <div class="sp2">
+    <div class="sp2<?= $edit !== null ? ' det' : '' ?>">
       <div class="c">
         <div class="hd">
           <form method="get" class="rw" style="flex:1"><input type="hidden" name="p" value="notizen">
@@ -4779,8 +4833,9 @@ function p_notizen(): void {
       </div>
     </div>
     <?php
-    page('Notizen', ob_get_clean(), ['unter' => count($rows) . ' Eintraege',
-        'aktion' => '<a class="bt p s" data-new href="' . h(url('notizen', ['neu' => 1])) . '">Neue Notiz <kbd>n</kbd></a>']);
+    page('Notizen', ob_get_clean(), ['unter' => count($rows) . ' Eintraege']
+        + ($edit !== null ? ['zurueck' => url('notizen'), 'zurueck_t' => 'Notizen'] : [])
+        + ['aktion' => '<a class="bt p s" data-new href="' . h(url('notizen', ['neu' => 1])) . '">Neue Notiz <kbd>n</kbd></a>']);
 }
 
 // --- Noten -----------------------------------------------------------------
@@ -5127,17 +5182,19 @@ function bh_liste(array $u): void {
         <a class="bt s g" href="<?= url('berichtsheft') ?>">Aktuelle Woche</a>
         <a class="bt s g" href="<?= url('export', ['w' => 'bh']) ?>">CSV</a></div>
       <?php if (!$rows): ?><?= em('Noch keine Nachweise.') ?><?php else: ?>
-      <div class="tw"><table><thead><tr><th class="n">Nr</th><th>Zeitraum</th><th class="n">Jahr</th>
-        <th class="n">Eintraege</th><th class="n">Stunden</th><th>Status</th><th></th></tr></thead><tbody>
-        <?php foreach ($rows as $r): ?>
-          <tr><td class="n"><?= report_nr($uid, $r['von']) ?></td>
-            <td><a href="<?= url('berichtsheft', ['periode' => $r['periode'], 'art' => $r['art']]) ?>"><?= h(periode_label($r['periode'], $r['art'])) ?></a></td>
-            <td class="n"><?= (int)$r['jahr'] ?></td><td class="n"><?= (int)$r['anz'] ?></td>
-            <td class="n"><?= num((float)$r['std'], 1) ?></td>
-            <td><span class="tg <?= $r['status'] === 'fertig' ? 'o' : 'w' ?>"><?= $r['status'] === 'fertig' ? 'fertig' : 'offen' ?></span></td>
-            <td><a class="bt s g" href="<?= url('berichtsheft', ['periode' => $r['periode'], 'art' => $r['art'], 'druck' => 1]) ?>">Druck</a></td></tr>
+      <ul class="li rows">
+        <?php foreach ($rows as $r):
+          $neben = ['Nr. ' . report_nr($uid, $r['von']), (int)$r['jahr'] . '. Jahr',
+                    (int)$r['anz'] . ' Eintraege', num((float)$r['std'], 1) . ' h']; ?>
+          <li>
+            <span class="tile t-bericht"><?= ic('bericht', 17) ?></span>
+            <span class="tx"><b><a href="<?= url('berichtsheft', ['periode' => $r['periode'], 'art' => $r['art']]) ?>"><?= h(periode_label($r['periode'], $r['art'])) ?></a></b>
+              <span class="sm mu2"><?= h(implode(' · ', $neben)) ?></span></span>
+            <span class="tg <?= $r['status'] === 'fertig' ? 'o' : 'w' ?>"><?= $r['status'] === 'fertig' ? 'fertig' : 'offen' ?></span>
+            <a class="bt s g" style="flex:none" href="<?= url('berichtsheft', ['periode' => $r['periode'], 'art' => $r['art'], 'druck' => 1]) ?>">Druck</a>
+          </li>
         <?php endforeach; ?>
-      </tbody></table></div>
+      </ul>
       <?php endif; ?>
     </div>
     <?php
@@ -5279,28 +5336,27 @@ function bh_routinen(array $u): void {
         <div class="c">
           <div class="hd"><h2>Routinen</h2><span class="sp"></span>
             <a class="bt p s" data-new href="<?= url('berichtsheft', ['t' => 'routinen', 'neu' => 1]) ?>">Neu <kbd>n</kbd></a></div>
-          <div class="tw"><table><tbody>
+          <ul class="li rows">
             <?php foreach ($rt as $r):
               $f = match ($r['intervall']) {
                   'taeglich' => $r['letzte'] !== today(),
                   'woechentlich' => !$r['letzte'] || $r['letzte'] < $mo,
                   'monatlich' => !$r['letzte'] || substr((string)$r['letzte'], 0, 7) !== date('Y-m'),
-                  default => false }; ?>
-              <tr<?= (int)$r['aktiv'] ? '' : ' style="opacity:.4"' ?>>
-                <td style="width:36px">
-                  <form method="post"><?= csrf_field() ?><input type="hidden" name="a" value="log">
-                    <input type="hidden" name="id" value="<?= (int)$r['id'] ?>">
-                    <input type="hidden" name="back" value="<?= h($_SERVER['REQUEST_URI'] ?? '') ?>">
-                    <button class="<?= $f ? 'p' : 'g' ?> s" type="submit" title="erledigt">&check;</button></form>
-                </td>
-                <td><a href="<?= url('routinen', ['id' => $r['id']]) ?>"><?= h($r['name']) ?></a></td>
-                <td style="width:96px"><span class="tg<?= $f ? ' w' : '' ?>"><?= h($r['intervall']) ?></span></td>
-                <td class="mo sm" style="width:96px"><?= $r['letzte'] ? h(dt($r['letzte'], 'd.m.y')) : '<span class="mu2">nie</span>' ?></td>
-                <td class="n sm" style="width:44px"><?= (int)$r['anz'] ?>&times;</td>
-                <td class="sm mu2"><?= h($r['kat'] ?: '') ?></td>
-              </tr>
+                  default => false };
+              $neben = array_filter([$r['intervall'],
+                  $r['letzte'] ? 'zuletzt ' . dt($r['letzte'], 'd.m.y') : 'nie',
+                  (int)$r['anz'] . '&times;', $r['kat'] ?: '']); ?>
+              <li<?= (int)$r['aktiv'] ? '' : ' style="opacity:.45"' ?>>
+                <form method="post" style="flex:none"><?= csrf_field() ?><input type="hidden" name="a" value="log">
+                  <input type="hidden" name="id" value="<?= (int)$r['id'] ?>">
+                  <input type="hidden" name="back" value="<?= h($_SERVER['REQUEST_URI'] ?? '') ?>">
+                  <button class="<?= $f ? 'p' : 'g' ?> s" type="submit" title="erledigt">&check;</button></form>
+                <span class="tx"><b><a href="<?= url('berichtsheft', ['t' => 'routinen', 'id' => $r['id']]) ?>"><?= h($r['name']) ?></a></b>
+                  <span class="sm mu2"><?= implode(' · ', $neben) ?></span></span>
+                <?= $f ? '<span class="tg w">offen</span>' : '' ?>
+              </li>
             <?php endforeach; ?>
-          </tbody></table></div>
+          </ul>
         </div>
         <div class="c">
           <div class="hd"><h2>Protokoll</h2><span class="sp"></span>
@@ -5452,7 +5508,7 @@ function bh_ausbildungsplan(array $u): void {
     </div>
     <?php
     page('Ausbildungsplan', ob_get_clean(), ['tabs' => bh_tabs(), 'aktiv' => 'plan',
-        'unter' => 'Berufsbildpositionen der FIAusbV, belegt aus dem Berichtsheft']);
+        'unter' => $belegt . ' von ' . count($plan) . ' Positionen belegt']);
 }
 
 // --- Einsaetze, Fehlzeiten, Urlaub -----------------------------------------
@@ -5535,19 +5591,26 @@ function p_einsaetze(): void {
           <div class="c">
             <div class="hd"><h2>Fehlzeiten</h2><span class="sp"></span><span class="sm mu2"><?= count($rows) ?></span></div>
             <?php if (!$rows): ?><?= em('Nichts erfasst.') ?><?php else: ?>
-            <div class="tw"><table><thead><tr><th>Zeitraum</th><th class="n">Tage</th><th>Art</th><th>Grund</th><th>Schule</th><th></th></tr></thead><tbody>
-              <?php foreach ($rows as $r): ?>
-                <tr><td class="mo sm" style="white-space:nowrap"><?= h(dt($r['von'], 'd.m.y')) ?><?= $r['bis'] !== $r['von'] ? '–' . h(dt($r['bis'], 'd.m.y')) : '' ?></td>
-                  <td class="n"><?= werktage($r['von'], $r['bis']) ?></td>
-                  <td><span class="tg <?= $r['art'] === 'krank' ? 'e' : ($r['art'] === 'urlaub' ? 'o' : '') ?>"><?= h($r['art']) ?></span></td>
-                  <td class="sm"><?= h($r['grund']) ?></td>
-                  <td class="sm"><?= (int)$r['schule'] ? ((int)$r['entschuldigt'] ? '<span class="tg o">entsch.</span>' : '<span class="tg e">offen</span>') : '' ?></td>
-                  <td style="width:30px"><form method="post" data-q="Loeschen?">
+            <ul class="li rows">
+              <?php foreach ($rows as $r):
+                $tage = werktage($r['von'], $r['bis']);
+                $zeit = dt($r['von'], 'd.m.y') . ($r['bis'] !== $r['von'] ? ' bis ' . dt($r['bis'], 'd.m.y') : '');
+                $neben = array_filter([$zeit, $tage . ' ' . ($tage === 1 ? 'Tag' : 'Tage'), $r['grund'] ?: '']); ?>
+                <li>
+                  <span class="tile" style="background:<?= $r['art'] === 'krank' ? '#ff3b30' : ($r['art'] === 'urlaub' ? '#00b894' : '#8e8e93') ?>">
+                    <?= ic($r['art'] === 'urlaub' ? 'frei' : 'einsatz', 17) ?></span>
+                  <span class="tx"><b><?= h(ucfirst($r['art'])) ?></b>
+                    <span class="sm mu2"><?= h(implode(' · ', $neben)) ?></span></span>
+                  <?php if ((int)$r['schule']): ?>
+                    <span class="tg <?= (int)$r['entschuldigt'] ? 'o' : 'e' ?>"><?= (int)$r['entschuldigt'] ? 'entsch.' : 'offen' ?></span>
+                  <?php endif; ?>
+                  <form method="post" data-q="Loeschen?" style="flex:none">
                     <?= csrf_field() ?><input type="hidden" name="a" value="abwdel">
                     <input type="hidden" name="id" value="<?= (int)$r['id'] ?>">
-                    <button class="g s d" type="submit">&times;</button></form></td></tr>
+                    <button class="g s d" type="submit">&times;</button></form>
+                </li>
               <?php endforeach; ?>
-            </tbody></table></div>
+            </ul>
             <?php endif; ?>
           </div>
           <div>
@@ -5588,28 +5651,27 @@ function p_einsaetze(): void {
     if (get('neu') !== '') $edit = ['id' => 0, 'von' => today()];
     $rows = all("SELECT * FROM einsaetze WHERE user_id = ? ORDER BY von DESC", [$uid]);
     ob_start(); ?>
-    <div class="sp2">
+    <div class="sp2<?= $edit !== null ? ' det' : '' ?>">
       <div class="c">
         <div class="hd"><h2>Abteilungsdurchlauf</h2><span class="sp"></span>
           <a class="bt p s" data-new href="<?= url('einsaetze', ['neu' => 1]) ?>">Neu <kbd>n</kbd></a></div>
         <?php if (!$rows): ?><?= em('Noch kein Einsatz erfasst. Der Nachweis uebernimmt die Abteilung dann automatisch.') ?>
         <?php else: ?>
-        <div class="tw"><table><thead><tr><th style="width:150px">Zeitraum</th><th>Abteilung</th>
-          <th>Schwerpunkt</th><th style="width:130px">Ansprechpartner</th><th style="width:34px"></th></tr></thead><tbody>
-          <?php foreach ($rows as $r): $laeuft = $r['von'] <= today() && ($r['bis'] === '' || $r['bis'] >= today()); ?>
-            <tr>
-              <td class="mo sm" style="white-space:nowrap"><?= h(dt($r['von'], 'd.m.y')) ?> –
-                <?= $r['bis'] ? h(dt($r['bis'], 'd.m.y')) : 'offen' ?></td>
-              <td><a href="<?= url('einsaetze', ['id' => $r['id']]) ?>"><?= h($r['abteilung']) ?></a>
-                <?= $laeuft ? ' <span class="tg a">aktuell</span>' : '' ?></td>
-              <td class="sm mu"><?= h($r['schwerpunkt']) ?></td>
-              <td class="sm"><?= h($r['ansprech']) ?></td>
-              <td><form method="post" data-q="Einsatz loeschen?"><?= csrf_field() ?>
+        <ul class="li rows">
+          <?php foreach ($rows as $r): $laeuft = $r['von'] <= today() && ($r['bis'] === '' || $r['bis'] >= today());
+            $zeit = dt($r['von'], 'd.m.y') . ' – ' . ($r['bis'] ? dt($r['bis'], 'd.m.y') : 'offen');
+            $neben = array_filter([$zeit, $r['schwerpunkt'] ?: '', $r['ansprech'] ?: '']); ?>
+            <li>
+              <span class="tile" style="background:#a2845e"><?= ic('einsatz', 17) ?></span>
+              <span class="tx"><b><a href="<?= url('einsaetze', ['id' => $r['id']]) ?>"><?= h($r['abteilung']) ?></a></b>
+                <span class="sm mu2"><?= h(implode(' · ', $neben)) ?></span></span>
+              <?= $laeuft ? '<span class="tg a">aktuell</span>' : '' ?>
+              <form method="post" data-q="Einsatz loeschen?" style="flex:none"><?= csrf_field() ?>
                 <input type="hidden" name="a" value="del"><input type="hidden" name="id" value="<?= (int)$r['id'] ?>">
-                <button class="g s d" type="submit">&times;</button></form></td>
-            </tr>
+                <button class="g s d" type="submit">&times;</button></form>
+            </li>
           <?php endforeach; ?>
-        </tbody></table></div>
+        </ul>
         <?php endif; ?>
       </div>
       <div>
@@ -5673,33 +5735,48 @@ function p_kontakte(): void {
     }
     $edit = get('id') !== '' ? one("SELECT * FROM kontakte WHERE id = ? AND user_id = ?", [(int)get('id'), $uid]) : null;
     if (get('neu') !== '') $edit = ['id' => 0];
+    $qs = get('q');
+    $wo = 'k.user_id = ?'; $ar = [$uid];
+    if ($qs !== '') {
+        $l = '%' . $qs . '%';
+        $wo .= ' AND (k.name LIKE ? OR k.rolle LIKE ? OR k.bereich LIKE ? OR k.telefon LIKE ? OR k.notiz LIKE ?)';
+        array_push($ar, $l, $l, $l, $l, $l);
+    }
     $rows = all("SELECT k.*, s.short FROM kontakte k LEFT JOIN subjects s ON s.id = k.subject_id
-                 WHERE k.user_id = ? ORDER BY k.bereich, k.name", [$uid]);
+                 WHERE $wo ORDER BY k.bereich, k.rolle, k.name", $ar);
     $grp = [];
     foreach ($rows as $r) $grp[$r['bereich']][] = $r;
     $titel = ['betrieb' => 'Betrieb', 'schule' => 'Schule', 'ihk' => 'IHK', 'sonst' => 'Sonstige'];
     ob_start(); ?>
-    <div class="sp2">
+    <div class="sp2<?= $edit !== null ? ' det' : '' ?>">
       <div>
-        <?php if (!$rows): ?><div class="c"><?= em('Noch niemand hinterlegt.') ?></div><?php endif; ?>
+        <div class="c np"><div class="bo" style="padding:9px 12px">
+          <form method="get" class="rw"><input type="hidden" name="p" value="kontakte">
+            <input name="q" value="<?= h($qs) ?>" placeholder="Filtern" style="flex:1">
+            <?php if ($qs !== ''): ?><a class="bt s g" href="<?= url('kontakte') ?>">zurueck</a><?php endif; ?>
+          </form>
+        </div></div>
+        <?php if (!$rows): ?><div class="c"><?= em($qs !== '' ? 'Nichts gefunden.' : 'Noch niemand hinterlegt.') ?></div><?php endif; ?>
         <?php foreach ($titel as $b => $lbl): if (empty($grp[$b])) continue; ?>
           <div class="c"><div class="hd"><h2><?= h($lbl) ?></h2><span class="sp"></span>
             <span class="sm mu2"><?= count($grp[$b]) ?></span></div>
-            <div class="tw"><table><tbody>
-              <?php foreach ($grp[$b] as $k): ?>
-                <tr>
-                  <td style="width:34%"><a href="<?= url('kontakte', ['id' => $k['id']]) ?>"><?= h($k['name']) ?></a>
-                    <?= $k['short'] ? ' <span class="tg">' . h($k['short']) . '</span>' : '' ?>
-                    <div class="sm mu2"><?= h($k['rolle']) ?></div></td>
-                  <td class="sm"><?php if ($k['mail']): ?><a href="mailto:<?= h($k['mail']) ?>"><?= h($k['mail']) ?></a><br><?php endif; ?>
-                    <?= h($k['telefon']) ?></td>
-                  <td class="sm mu"><?= h($k['raum']) ?><?= $k['notiz'] ? '<div class="sm mu2">' . h($k['notiz']) . '</div>' : '' ?></td>
-                  <td style="width:30px"><form method="post" data-q="Loeschen?"><?= csrf_field() ?>
+            <ul class="li rows">
+              <?php foreach ($grp[$b] as $k):
+                $neben = array_filter([$k['rolle'] ?: '', $k['short'] ?: '', $k['raum'] ?: '',
+                                       $k['mail'] ?: '', $k['notiz'] ?: '']); ?>
+                <li>
+                  <span class="tile t-kontakt"><?= ic('kontakt', 17) ?></span>
+                  <span class="tx"><b><a href="<?= url('kontakte', ['id' => $k['id']]) ?>"><?= h($k['name']) ?></a></b>
+                    <span class="sm mu2"><?= h(implode(' · ', $neben)) ?></span></span>
+                  <?php if ($k['telefon']): ?>
+                    <a class="sm mo" style="flex:none" href="tel:<?= h(preg_replace('/[^\d+]/', '', $k['telefon'])) ?>"><?= h($k['telefon']) ?></a>
+                  <?php endif; ?>
+                  <form method="post" data-q="Loeschen?" style="flex:none"><?= csrf_field() ?>
                     <input type="hidden" name="a" value="del"><input type="hidden" name="id" value="<?= (int)$k['id'] ?>">
-                    <button class="g s d" type="submit">&times;</button></form></td>
-                </tr>
+                    <button class="g s d" type="submit">&times;</button></form>
+                </li>
               <?php endforeach; ?>
-            </tbody></table></div>
+            </ul>
           </div>
         <?php endforeach; ?>
       </div>
@@ -5728,7 +5805,7 @@ function p_kontakte(): void {
       </div></div>
     </div>
     <?php
-    page('Kontakte', ob_get_clean(), ['unter' => 'Ansprechpartner in Betrieb, Schule und IHK']);
+    page('Kontakte', ob_get_clean(), ['unter' => count($rows) . ' Ansprechpartner']);
 }
 
 // --- Pruefung --------------------------------------------------------------
@@ -5845,7 +5922,7 @@ function pruef_projekt(array $u): void {
     </div>
     <?php
     page('Abschlussprojekt', ob_get_clean(), ['tabs' => pruef_tabs(), 'aktiv' => 'projekt',
-        'unter' => h($p['titel'] ?: 'Teil 2 der gestreckten Abschlusspruefung')]);
+        'unter' => h((string)$p['titel'])]);
 }
 function pruef_tabs(): array {
     return ['start' => ['Uebersicht', url('pruefung')],
@@ -5913,15 +5990,18 @@ function p_pruefung(): void {
     ob_start(); ?>
     <?php if ($tab === 'lf'): ?>
       <div class="c"><div class="hd"><h2>Lernfelder</h2></div>
-        <div class="tw"><table><thead><tr><th>LF</th><th>Titel</th><th class="n">Jahr</th><th class="n">Std</th><th class="n">Notizen</th></tr></thead><tbody>
+        <ul class="li rows">
           <?php foreach (all("SELECT l.*, (SELECT COUNT(*) FROM notes n WHERE n.user_id = ? AND n.lf_no = l.nr) AS anz
-                              FROM lernfelder l ORDER BY l.nr", [$uid]) as $l): ?>
-            <tr><td><span class="tg a"><?= h($l['code']) ?></span></td>
-              <td><a href="<?= url('notizen', ['lf' => $l['nr']]) ?>"><?= h($l['titel']) ?></a></td>
-              <td class="n"><?= (int)$l['jahr'] ?></td><td class="n"><?= (int)$l['stunden'] ?></td>
-              <td class="n"><?= (int)$l['anz'] ?></td></tr>
+                              FROM lernfelder l ORDER BY l.nr", [$uid]) as $l):
+            $neben = [$l['code'], (int)$l['jahr'] . '. Jahr', (int)$l['stunden'] . ' Std',
+                      (int)$l['anz'] . ' ' . ((int)$l['anz'] === 1 ? 'Notiz' : 'Notizen')]; ?>
+            <li<?= (int)$l['anz'] ? '' : ' style="opacity:.6"' ?>>
+              <span class="tile t-liste"><?= ic('liste', 17) ?></span>
+              <span class="tx"><b><a href="<?= url('notizen', ['lf' => $l['nr']]) ?>"><?= h($l['titel']) ?></a></b>
+                <span class="sm mu2"><?= h(implode(' · ', $neben)) ?></span></span>
+            </li>
           <?php endforeach; ?>
-        </tbody></table></div>
+        </ul>
       </div>
     <?php else: ?>
     <div class="sp2">
@@ -6009,8 +6089,13 @@ function p_suche(): void {
       </div>
     <?php endif; ?>
 
+    <?php if ($qs !== '' && !$treffer && !$ziele && !$antwort): ?>
+      <div class="c"><?= em('Nichts gefunden.') ?></div>
+    <?php endif; ?>
+    <?php if (mb_strlen($qs) === 1): ?>
+      <div class="sm mu2" style="padding:0 4px">Ab zwei Zeichen wird auch der Inhalt durchsucht.</div>
+    <?php endif; ?>
     <?php if (mb_strlen($qs) >= 2): ?>
-      <?php if (!$treffer && !$ziele && !$antwort): ?><div class="c"><?= em('Nichts gefunden.') ?></div><?php endif; ?>
       <?php if ($treffer): ?>
         <div class="c"><div class="hd"><h2>Treffer</h2><span class="sp"></span>
           <span class="sm mu2"><?= count($treffer) ?></span></div>
@@ -6493,28 +6578,28 @@ function p_geteilt(): void {
         <span class="sm mu2"><?= count($rows) ?> aktiv</span></div>
       <?php if (!$rows): ?><div class="bo"><?= em('Noch nichts geteilt. Der Knopf dazu steht bei der Notiz, beim Fach und beim Nachweis.') ?></div>
       <?php else: ?>
-      <div class="tw"><table><thead><tr><th style="width:112px">Art</th><th>Inhalt</th>
-        <th style="width:150px">Sichtbar</th><th class="n" style="width:70px">Aufrufe</th><th style="width:150px"></th></tr></thead><tbody>
-        <?php foreach ($rows as $r): ?>
-          <tr>
-            <td><span class="tg"><?= h(share_arten()[$r['art']] ?? $r['art']) ?></span></td>
-            <td><a href="<?= h(share_url($r['token'])) ?>"><?= h($r['titel'] ?: '(ohne Titel)') ?></a>
-              <div class="sm mu2 mo"><?= h(share_url($r['token'])) ?></div></td>
-            <td class="sm"><?= $r['sichtbar'] === 'konten' ? h($r['wer'] ?: 'nur angemeldete') : 'jeder mit Link' ?></td>
-            <td class="n"><?= (int)$r['aufrufe'] ?></td>
-            <td>
+      <ul class="li rows">
+        <?php foreach ($rows as $r):
+          $sym = ['notiz' => 'notizen', 'fach' => 'faecher', 'bericht' => 'bericht'][$r['art']] ?? 'teilen';
+          $wer = $r['sichtbar'] === 'konten' ? ($r['wer'] ?: 'nur angemeldete') : 'jeder mit Link';
+          $neben = [share_arten()[$r['art']] ?? $r['art'], $wer, (int)$r['aufrufe'] . '&times; geoeffnet']; ?>
+          <li style="flex-wrap:wrap">
+            <span class="tile t-<?= h($sym) ?>"><?= ic($sym, 17) ?></span>
+            <span class="tx"><b><a href="<?= h(share_url($r['token'])) ?>"><?= h($r['titel'] ?: '(ohne Titel)') ?></a></b>
+              <span class="sm mu2"><?= implode(' · ', array_map('h', array_slice($neben, 0, 2))) ?> · <?= $neben[2] ?></span></span>
+            <span class="rw" style="flex:none;gap:6px">
               <button class="s" type="button" data-copy-val="<?= h(share_url($r['token'])) ?>">Kopieren</button>
-              <form method="post" style="display:inline"><?= csrf_field() ?>
+              <form method="post"><?= csrf_field() ?>
                 <input type="hidden" name="art" value="<?= h($r['art']) ?>"><input type="hidden" name="ref" value="<?= (int)$r['ref'] ?>">
                 <button class="s g d" name="a" value="weg" type="submit">Aufheben</button></form>
-            </td>
-          </tr>
+            </span>
+          </li>
         <?php endforeach; ?>
-      </tbody></table></div>
+      </ul>
       <?php endif; ?>
     </div>
     <?php
-    page('Geteilt', ob_get_clean(), ['unter' => 'Der einzige Weg, auf dem etwas dieses Konto verlaesst']);
+    page('Geteilt', ob_get_clean(), ['unter' => count($rows) . ' ' . (count($rows) === 1 ? 'Link' : 'Links')]);
 }
 function share_404(): void {
     http_response_code(404);
