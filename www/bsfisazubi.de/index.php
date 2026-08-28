@@ -165,6 +165,7 @@ function schema(PDO $pdo): void {
         if ($v < 4) schema_v4($pdo);
         if ($v < 5) schema_v5($pdo);
         if ($v < 6) schema_v6($pdo);
+        if ($v < 7) schema_v7($pdo);
         return;
     }
     $pdo->exec(<<<SQL
@@ -477,6 +478,18 @@ function schema_v6(PDO $pdo): void {
     $pdo->exec("CREATE INDEX IF NOT EXISTS ix_ko ON kontakte(user_id, bereich)");
     $pdo->exec("CREATE INDEX IF NOT EXISTS ix_ei ON einsaetze(user_id, von)");
     $pdo->exec("INSERT INTO meta (k,v) VALUES ('schema','6') ON CONFLICT(k) DO UPDATE SET v='6'");
+    schema_v7($pdo);
+}
+
+/** v7: merkt sich, welche Ziele jemand tatsaechlich oeffnet. */
+function schema_v7(PDO $pdo): void {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS ziel_nutzung (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        ziel TEXT NOT NULL,
+        anzahl INTEGER NOT NULL DEFAULT 0,
+        letzt TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (user_id, ziel))");
+    $pdo->exec("INSERT INTO meta (k,v) VALUES ('schema','7') ON CONFLICT(k) DO UPDATE SET v='7'");
 }
 function fts_trigger_sql(): array {
     $t = [];
@@ -2436,6 +2449,34 @@ function ziele_index(): array {
         ['teilen',  'Geteilte Links',     'Einstellungen', 'geteilt teilen link freigabe share oeffentlich',                    url('geteilt'),                                '#0071e3'],
     ];
 }
+/**
+ * Zaehlt, welches Ziel gerade offen ist. Hoechstens ein Schreibvorgang je
+ * Ziel und Viertelstunde, damit SQLite nicht unnoetig sperrt.
+ */
+function ziel_zaehlen(array $u, string $seite): void {
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') return;
+    $jetzt = $_GET; unset($jetzt['p']);
+    $adresse = url($seite, array_intersect_key($jetzt, ['t' => 1]));
+    $treffer = null;
+    foreach (ziele_index() as $z) if ($z[4] === $adresse) { $treffer = $z[1]; break; }
+    if ($treffer === null) return;
+    $marke = $_SESSION['zz'][$treffer] ?? 0;
+    if (time() - $marke < 900) return;
+    $_SESSION['zz'][$treffer] = time();
+    q("INSERT INTO ziel_nutzung (user_id, ziel, anzahl, letzt) VALUES (?, ?, 1, ?)
+       ON CONFLICT(user_id, ziel) DO UPDATE SET anzahl = anzahl + 1, letzt = excluded.letzt",
+      [(int)$u['id'], $treffer, today()]);
+}
+/** Wie oft wurde welches Ziel geoeffnet? */
+function ziel_nutzung(int $uid): array {
+    static $n = null;
+    if ($n !== null) return $n;
+    $n = [];
+    foreach (all("SELECT ziel, anzahl, letzt FROM ziel_nutzung WHERE user_id = ?", [$uid]) as $r) {
+        $n[$r['ziel']] = ['anzahl' => (int)$r['anzahl'], 'letzt' => (string)$r['letzt']];
+    }
+    return $n;
+}
 /** Wie gut passt ein Ziel zur Eingabe? 0 heisst: gar nicht. */
 function ziel_rang(array $z, string $q): int {
     $l = mb_strtolower($z[1]);
@@ -2453,13 +2494,24 @@ function ziel_rang(array $z, string $q): int {
     if (mb_strlen($q) >= 4) foreach ($woerter as $w) if ($w !== '' && str_contains($w, $q)) return 35;
     return 0;
 }
-/** Passende Ziele, bestes zuerst. */
+/**
+ * Passende Ziele, bestes zuerst. Was jemand oft oeffnet, steigt - aber
+ * hoechstens um 20 Punkte, damit ein genauer Treffer nie verdraengt wird.
+ */
 function ziele_suchen(string $q, int $limit = 6): array {
+    $u = me();
+    $nutzung = $u ? ziel_nutzung((int)$u['id']) : [];
     $t = [];
     foreach (ziele_index() as $z) {
         $r = ziel_rang($z, $q);
-        if ($r > 0) $t[] = ['rang' => $r, 'icon' => $z[0], 'label' => $z[1], 'bereich' => $z[2],
-                            'url' => $z[4], 'farbe' => $z[5] ?? '#8e8e93'];
+        if ($r <= 0) continue;
+        $bonus = 0.0;
+        if (isset($nutzung[$z[1]])) {
+            $bonus = min(16.0, 4.0 * sqrt((float)$nutzung[$z[1]]['anzahl']));
+            if ($nutzung[$z[1]]['letzt'] >= date('Y-m-d', strtotime('-7 days'))) $bonus += 4;
+        }
+        $t[] = ['rang' => $r + $bonus, 'icon' => $z[0], 'label' => $z[1], 'bereich' => $z[2],
+                'url' => $z[4], 'farbe' => $z[5] ?? '#8e8e93'];
     }
     usort($t, fn($a, $b) => [$b['rang'], mb_strlen($a['label'])] <=> [$a['rang'], mb_strlen($b['label'])]);
     return array_slice($t, 0, $limit);
@@ -2741,6 +2793,7 @@ function nav_zahl(string $key): string {
 
 function page(string $titel, string $inhalt, array $o = []): void {
     $u = me(); $n = $GLOBALS['NONCE']; $p = $_GET['p'] ?? 'heute';
+    if ($u && empty($o['bare'])) ziel_zaehlen($u, $p);
     $theme = $u['theme'] ?? 'auto';
     $flash = take_flash();
     $bare = !empty($o['bare']);
