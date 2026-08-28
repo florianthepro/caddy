@@ -54,6 +54,16 @@ eigene Notizen, eigenes Berichtsheft. Keine Rollen, keine Verwaltung.
 Aufgebaut entlang der Faecher und des Betriebs, nicht entlang von Terminen:
 jede Information haengt an der Stelle, zu der sie gehoert.
 
+### Die Jetzt-Karte
+
+Der Startbildschirm beginnt mit einer einzigen Karte, die nach Zeitnaehe
+entscheidet, was gerade zaehlt: laufender Unterricht mit Raum und Endzeit,
+Termin heute, ueberfaellige Aufgabe, Termin morgen, Projektfrist in Sicht,
+offener Nachweis ab Donnerstag, laufender Block oder Ferien, sonst der
+naechste Termin innerhalb von drei Wochen. Steht nichts an, faellt sie
+ersatzlos weg. Jede Karte fuehrt auf die Seite, auf der man es selbst
+nachsieht.
+
 ### Konto
 
 Nur ein Benutzername und ein Passwort. Keine E-Mail, kein voller Name, kein
@@ -68,15 +78,50 @@ Ausbildungsjahr aus dem Vertragsbeginn.
 
 ### Navigation
 
-`1` Heute · Schule: `2` Faecher `3` Notizen `4` Noten `5` Plan ·
-Betrieb: `6` Berichtsheft `7` Einsaetze `8` Kontakte · Abschluss: `9` Pruefung.
-Dazu `/` Suche, `n` neuer Eintrag, `Strg+K` Sprungliste mit Sofortsuche.
+Am Rechner eine Seitenleiste in drei Bloecken, jedes Ziel mit eigenem Symbol
+und eigener Farbe: `1` Heute · Schule `2` Faecher `3` Notizen `4` Noten
+`5` Plan · Betrieb `6` Berichtsheft `7` Einsaetze `8` Kontakte · Abschluss
+`9` Pruefung. Dazu `/` Suche, `n` neuer Eintrag, `Strg+K` Sprungliste.
+
+Auf dem Handy eine feste Leiste unten im Daumenbereich - Heute, Faecher,
+Suchen, Nachweis, Mehr - mit `env(safe-area-inset-bottom)`. Keine Schublade:
+die war reines JavaScript, ohne das es gar keine Navigation gab. *Mehr* listet
+jedes Ziel als Zeile mit Symbol, Wert und Chevron und ist damit zugleich die
+Antwortliste: Noten `2,13`, Berichtsheft `3,5 h`, Fehlzeiten `18 T frei`,
+Einsaetze `IT-Betrieb`.
+
+### Suche
+
+Ein Feld, ueberall dasselbe: die Suchpille oben oeffnet am Rechner wie auf dem
+Handy dieselbe Sofortsuche (`Strg+K`); ohne JavaScript ist sie ein Formular
+auf `?p=suche`, das genau dasselbe findet.
+
+Drei Abschnitte in fester Reihenfolge:
+
+1. **Antwort** - fertig gerechnet, damit man nicht erst eine Seite oeffnen
+   muss: Resturlaub, Krankheitstage, Stand des laufenden Nachweises,
+   Notenschnitt, naechste Blockwoche, laufende Ferien, naechster Termin mit
+   Countdown, naechste Projektfrist, Ausbildungsstand, aktuelle Abteilung.
+2. **Springen** - 23 Seiten und Reiter mit den Woertern, unter denen jemand
+   danach sucht: `ur` findet *Fehlzeiten & Urlaub*, `doku` das
+   *Abschlussprojekt*, `raum` den *Stundenplan*, `2fa` die *Sicherheit*.
+   Was oft geoeffnet wird, steigt - gedeckelt auf 20 Punkte, damit ein genauer
+   Treffer nie verdraengt wird.
+3. **Treffer** - eine gerankte Liste, nicht eine Karte je Art: Titeltreffer vor
+   Texttreffer, frisch vor alt. Volltextindex (SQLite FTS5) ueber Notizen,
+   Termine, Aufgaben, Berichtsheft und Routinen; direkt dazu Faecher,
+   Lernfelder, Noten, Abschlussprojekt, Fehlzeiten, Schulbloecke,
+   Berufsbildpositionen, Ansprechpartner, Einsaetze und Dateien.
+
+Deutsche Komposita greifen: `maschine` findet `Kaffeemaschine`. Praefixsuche
+zuerst, Suche im Wort als Rueckfall ab vier Zeichen.
+Filter: `lf:9`, `fach:LF9`, `typ:notiz` - auch allein, ohne Suchwort.
 
 ### Was wo liegt
 
 | Seite | Inhalt |
 |---|---|
-| Heute | Tag, Stand der Ausbildung, Schnellerfassung, anstehende Termine, offene Routinen |
+| Heute | die Jetzt-Karte, Wochenstreifen, Schnellerfassung, Faecher mit Inhalt, anstehende Termine, offene Routinen |
 | Faecher | je Fach: Notizen nach Art, Noten mit Schnitt und Verlauf, Proben mit Stoff, Material |
 | Notizen | alles Festgehaltene mit Filter nach Art und Lernfeld |
 | Noten | Noten, Schnitt je Fach, Verteilung, Verlauf |
@@ -114,12 +159,6 @@ Dazu `/` Suche, `n` neuer Eintrag, `Strg+K` Sprungliste mit Sofortsuche.
 
 Importe gehen nur ueber https und niemals ins lokale Netz; `IMPORT_PRIVAT`
 erlaubt das ausdruecklich fuer einen eigenen Server.
-
-### Suche
-
-Volltextindex (SQLite FTS5) ueber Notizen, Termine, Aufgaben, Berichtsheft und
-Routinen, dazu Ansprechpartner und Einsaetze. Ergebnisse erscheinen waehrend des
-Tippens in `Strg+K`. Filter: `lf:9`, `fach:LF9`, `typ:notiz`.
 
 ### Fachseite
 
@@ -178,6 +217,19 @@ Uebersicht unter *Einstellungen > Daten > Geteilte Links*.
 
 Daten liegen in `C:\caddy\www\bsfisazubi.de-data`, also neben dem Webroot.
 Dieser Ordner gehoert ins Backup.
+
+### Auf dem iPhone
+
+Tab-Leiste statt Schublade, Eingabefelder mit 16px (sonst zoomt Safari beim
+Antippen hinein), Tippflaechen ab 38px und Listenzeilen ab 46px,
+`viewport-fit=cover` mit `env(safe-area-inset-*)` fuer Notch und
+Home-Indicator, `:hover` nur unter `@media(hover:hover)` - sonst klebt der
+Zustand nach dem Antippen. Die Tagestabelle des Berichtshefts stapelt unter
+700px, statt seitlich zu scrollen.
+
+Typografie in vier Stufen nach iOS-Vorbild: 28px Seitentitel, 17px
+Abschnittsueberschrift in voller Farbe, 15px Zeilen, 13px Nebentext. Rang ist
+damit ohne Lesen erkennbar.
 
 ### Sicherheit
 
