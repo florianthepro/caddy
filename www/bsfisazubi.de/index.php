@@ -2145,6 +2145,111 @@ function such_direkt(int $uid, array $worte): array {
     }
     return $t;
 }
+/**
+ * Fertige Antworten auf die Fragen, die ein Azubi wirklich stellt.
+ * Wer "urlaub" tippt, will die Zahl sehen, nicht erst die Seite oeffnen.
+ */
+function such_antwort(array $u, string $q): array {
+    $uid = (int)$u['id'];
+    $q = mb_strtolower(trim($q));
+    if ($q === '' || mb_strlen($q) < 2) return [];
+    $passt = function (array $woerter) use ($q): bool {
+        foreach ($woerter as $w) if (str_starts_with($w, $q) || str_starts_with($q, $w)) return true;
+        return false;
+    };
+    $a = [];
+
+    if ($passt(['urlaub', 'resturlaub', 'frei'])) {
+        $jahr = date('Y'); $genommen = 0;
+        foreach (all("SELECT von, bis FROM absences WHERE user_id = ? AND art = 'urlaub'
+                      AND von LIKE ?", [$uid, $jahr . '%']) as $r) $genommen += werktage($r['von'], $r['bis']);
+        $anspruch = (float)$u['urlaub_tage'];
+        $a[] = ['icon' => 'einsatz', 'label' => 'Resturlaub ' . $jahr,
+            'wert' => $anspruch > 0 ? num(max(0, $anspruch - $genommen), 0) . ' von ' . num($anspruch, 0) . ' Tagen'
+                                    : $genommen . ' Tage genommen, kein Anspruch hinterlegt',
+            'url' => url('einsaetze', ['t' => 'zeiten'])];
+    }
+    if ($passt(['krank', 'krankheit', 'fehlzeit', 'fehlzeiten'])) {
+        $jahr = date('Y'); $tage = 0;
+        foreach (all("SELECT von, bis FROM absences WHERE user_id = ? AND art = 'krank'
+                      AND von LIKE ?", [$uid, $jahr . '%']) as $r) $tage += werktage($r['von'], $r['bis']);
+        $a[] = ['icon' => 'einsatz', 'label' => 'Krank ' . $jahr, 'wert' => $tage . ' Tage',
+            'url' => url('einsaetze', ['t' => 'zeiten'])];
+    }
+    if ($passt(['berichtsheft', 'nachweis', 'bericht', 'heft'])) {
+        $art = $u['bh_art']; $per = periode_of(today(), $art);
+        $rep = report_get($uid, $art, $per);
+        $sum = report_sum((int)$rep['id']);
+        $a[] = ['icon' => 'bericht', 'label' => 'Nachweis ' . periode_label($per, $art),
+            'wert' => num((float)$sum['std'], 1) . ' h · ' . ($rep['status'] === 'fertig' ? 'fertig' : 'offen'),
+            'url' => url('berichtsheft')];
+    }
+    if ($passt(['note', 'noten', 'schnitt', 'durchschnitt'])) {
+        $g = noten_stats($uid);
+        if ($g['schnitt'] !== null) {
+            $a[] = ['icon' => 'noten', 'label' => 'Notenschnitt',
+                'wert' => num((float)$g['schnitt'], 2) . ' aus ' . count($g['rows']) . ' Noten',
+                'url' => url('noten')];
+        }
+    }
+    if ($passt(['block', 'blockwoche', 'schulblock', 'schule'])) {
+        $b = one("SELECT * FROM blocks WHERE user_id = ? AND art = 'schule' AND bis >= date('now','localtime')
+                  ORDER BY von LIMIT 1", [$uid]);
+        if ($b) {
+            $laeuft = $b['von'] <= today();
+            $a[] = ['icon' => 'plan', 'label' => $laeuft ? 'Blockwoche laeuft' : 'Naechste Blockwoche',
+                'wert' => dt($b['von'], 'd.m.') . ' bis ' . dt($b['bis'], 'd.m.Y'),
+                'url' => url('plan', ['t' => 'block'])];
+        }
+    }
+    if ($passt(['ferien', 'schulferien'])) {
+        $b = one("SELECT * FROM blocks WHERE user_id = ? AND art = 'ferien' AND bis >= date('now','localtime')
+                  ORDER BY von LIMIT 1", [$uid]);
+        if ($b) {
+            $a[] = ['icon' => 'plan', 'label' => $b['von'] <= today() ? ($b['label'] ?: 'Ferien') . ' laeuft' : ($b['label'] ?: 'Naechste Ferien'),
+                'wert' => dt($b['von'], 'd.m.') . ' bis ' . dt($b['bis'], 'd.m.Y'),
+                'url' => url('plan', ['t' => 'block'])];
+        }
+    }
+    if ($passt(['probe', 'pruefung', 'test', 'schulaufgabe', 'termin'])) {
+        $e = one("SELECT e.*, s.short FROM events e LEFT JOIN subjects s ON s.id = e.subject_id
+                  WHERE e.user_id = ? AND e.typ IN ('probe','test','pruefung','abgabe','frist')
+                  AND e.datum >= date('now','localtime') ORDER BY e.datum LIMIT 1", [$uid]);
+        if ($e) {
+            $tage = (int)ceil((strtotime($e['datum']) - strtotime(today())) / 86400);
+            $a[] = ['icon' => 'termin', 'label' => 'Naechster Termin',
+                'wert' => $e['titel'] . ' · ' . dt($e['datum'], 'd.m.') . ' (' . ($tage === 0 ? 'heute' : 'in ' . $tage . ' Tagen') . ')',
+                'url' => url('plan', ['id' => (int)$e['id']])];
+        }
+    }
+    if ($passt(['projekt', 'abschlussprojekt', 'doku', 'dokumentation', 'antrag', 'praesentation'])) {
+        $pj = one("SELECT * FROM projekt WHERE user_id = ? ORDER BY id LIMIT 1", [$uid]);
+        if ($pj) {
+            $naechst = null;
+            foreach (projekt_termine() as $k => $lbl) {
+                if ($pj[$k] && $pj[$k] >= today() && ($naechst === null || $pj[$k] < $naechst[0])) $naechst = [$pj[$k], $lbl];
+            }
+            $a[] = ['icon' => 'projekt', 'label' => $pj['titel'] ?: 'Abschlussprojekt',
+                'wert' => $naechst ? $naechst[1] . ' am ' . dt($naechst[0]) : 'Status: ' . $pj['status'],
+                'url' => url('pruefung', ['t' => 'projekt'])];
+        }
+    }
+    if ($passt(['klasse', 'jahr', 'ausbildungsjahr', 'lehrjahr'])) {
+        $st = ausbildungsstand($u);
+        $a[] = ['icon' => 'heute', 'label' => 'Ausbildungsstand',
+            'wert' => trim((klasse_name($u) ? klasse_name($u) . ' · ' : '') . $st['jahr'] . '. Ausbildungsjahr'
+                      . ($st['wechsel'] ? ' · ab ' . dt($st['wechsel']) . ' ' . klasse_name($u, $st['wechsel']) : '')),
+            'url' => url('einstellungen')];
+    }
+    if ($passt(['abteilung', 'einsatz'])) {
+        $ab = einsatz_am($uid, today()) ?: (string)$u['abteilung'];
+        if ($ab !== '') {
+            $a[] = ['icon' => 'einsatz', 'label' => 'Aktuelle Abteilung', 'wert' => $ab,
+                'url' => url('einsaetze')];
+        }
+    }
+    return array_slice($a, 0, 2);
+}
 /** Fach ueber Kuerzel oder Name finden; "LF3" soll auch "LF 3" treffen. */
 function fach_finden(int $uid, string $q): int {
     $eng = mb_strtolower(preg_replace('/\s+/', '', $q));
@@ -2488,21 +2593,22 @@ function page(string $titel, string $inhalt, array $o = []): void {
 }
 *,*::before,*::after{box-sizing:border-box}
 html,body{margin:0;padding:0}
-body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text",
+body{background:var(--bg);color:var(--fg);font:15px/1.47 -apple-system,BlinkMacSystemFont,"SF Pro Text",
 "Segoe UI Variable Text","Segoe UI",Inter,system-ui,sans-serif;font-variant-numeric:tabular-nums;
 -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;letter-spacing:-.005em}
 a{color:var(--ac);text-decoration:none}
 @media(hover:hover){a:hover{text-decoration:underline}}
-h1,h2,h3{margin:0;font-weight:590;line-height:1.28;letter-spacing:-.015em}
-h1{font-size:15px}
-h2{font-size:12px;color:var(--fg2);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
-h3{font-size:14px}
+h1,h2,h3{margin:0;font-weight:600;line-height:1.25;letter-spacing:-.015em}
+h1{font-size:17px}
+/* Abschnittsueberschrift muss groesser sein als das, was sie ueberschreibt */
+h2{font-size:17px;color:var(--fg);letter-spacing:-.02em;font-weight:600}
+h3{font-size:15px}
 p{margin:0 0 8px}
 code,pre,.mo{font-family:var(--mo);font-size:12.5px}
 pre{background:var(--pa2);border-radius:var(--r2);padding:10px 12px;overflow:auto;margin:6px 0;line-height:1.55}
 kbd{font:11px var(--mo);background:var(--pa3);border-radius:4px;padding:1px 5px;color:var(--fg2)}
 hr{border:0;border-top:1px solid var(--li);margin:14px 0}
-.mu{color:var(--fg2)}.mu2{color:var(--fg3)}.sm{font-size:12.5px}
+.mu{color:var(--fg2)}.mu2{color:var(--fg3)}.sm{font-size:13px}
 /* Rahmen */
 .app{display:grid;grid-template-columns:212px 1fr;min-height:100vh}
 .sb{background:var(--sb);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow:auto}
@@ -2534,8 +2640,10 @@ background:color-mix(in srgb,var(--bg) 82%,transparent);
 backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);
 border-bottom:1px solid var(--li);display:flex;align-items:center;gap:10px;padding-left:max(18px,env(safe-area-inset-left));padding-right:max(18px,env(safe-area-inset-right))}
 .tb .sp{flex:1}
-.sf1{display:flex;align-items:center;gap:7px;background:var(--pa2);border-radius:99px;
-padding:0 11px;height:30px;width:280px;max-width:100%;cursor:text;color:var(--fg3)}
+.sf1{display:flex;align-items:center;gap:7px;background:var(--pa);border:.5px solid var(--li2);
+border-radius:99px;padding:0 12px;height:31px;width:290px;max-width:100%;cursor:text;color:var(--fg3);
+box-shadow:0 1px 1px rgba(0,0,0,.03) inset}
+.sf1:focus-within{border-color:var(--ac);outline:3px solid var(--acb)}
 .sf1 input[type=search]{border:0;background:transparent;box-shadow:none;height:28px;padding:0;
 font-size:13.5px;min-width:0;flex:1}
 .sf1 input:focus{outline:none}
@@ -2544,11 +2652,11 @@ font-size:13.5px;min-width:0;flex:1}
 .ph{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:2px 0 16px}
 .ph .pt{min-width:0}
 .ph .pt{max-width:100%}
-.ph h1{font-size:24px;font-weight:640;letter-spacing:-.025em;line-height:1.15}
-.ph h1.lang{font-size:19px;letter-spacing:-.02em}
-.ph .ps{font-size:12.5px;color:var(--fg2);margin-top:2px}
+.ph h1{font-size:28px;font-weight:700;letter-spacing:-.03em;line-height:1.14}
+.ph h1.lang{font-size:21px;letter-spacing:-.022em}
+.ph .ps{font-size:13px;color:var(--fg2);margin-top:3px}
 .ph .sp{flex:1}
-.lb{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--fg3);font-weight:600;margin-bottom:6px}
+.lb{font-size:12px;letter-spacing:0;color:var(--fg3);font-weight:500;margin-bottom:6px}
 .ck{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--fg2);font-weight:400;margin:0}
 .ck input{margin:0}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:13px}
@@ -2586,8 +2694,8 @@ font-size:13.5px;min-width:0;flex:1}
 }
 @media(max-width:880px){.ph h1{font-size:22px}}
 /* Bausteine */
-.c{background:var(--pa);border-radius:var(--r);box-shadow:var(--sh);margin-bottom:14px;min-width:0;max-width:100%}
-.c>.hd{display:flex;align-items:center;gap:8px;padding:11px 14px 9px;flex-wrap:wrap}
+.c{background:var(--pa);border-radius:var(--r);box-shadow:var(--sh);margin-bottom:20px;min-width:0;max-width:100%}
+.c>.hd{display:flex;align-items:center;gap:9px;padding:12px 15px 8px;flex-wrap:wrap}
 .c>.hd+.bo,.c>.hd+.tw{padding-top:0}
 .c>.hd h2,.c>.hd h3{margin:0}.c>.hd .sp{flex:1}
 .c>.bo{padding:14px}
@@ -2605,7 +2713,7 @@ font-size:13.5px;min-width:0;flex:1}
 @media(min-width:760px){.line{flex-wrap:nowrap}.line>input[name=text]{flex:1 1 auto}}
 .st{display:flex;flex-direction:column;gap:7px}
 button,.bt{display:inline-flex;align-items:center;justify-content:center;gap:5px;height:30px;padding:0 12px;
-font:inherit;font-size:13px;font-weight:500;background:var(--pa);color:var(--fg);border:.5px solid var(--li2);
+font:inherit;font-size:14px;font-weight:500;background:var(--pa);color:var(--fg);border:.5px solid var(--li2);
 border-radius:var(--r2);cursor:pointer;white-space:nowrap;box-shadow:0 1px 1px rgba(0,0,0,.04);transition:background .12s}
 @media(hover:hover){.bt:hover,button:hover{background:var(--pa2);text-decoration:none}}
 .bt:active,button:active{background:var(--pa3)}
@@ -2613,13 +2721,13 @@ border-radius:var(--r2);cursor:pointer;white-space:nowrap;box-shadow:0 1px 1px r
 @media(hover:hover){.bt.p:hover,button.p:hover{filter:brightness(1.07)}}
 .bt.d,button.d{color:var(--er)}
 @media(hover:hover){.bt.d:hover,button.d:hover{background:var(--erb)}}
-.bt.s,button.s{height:24px;padding:0 9px;font-size:12.5px}
+.bt.s,button.s{height:26px;padding:0 10px;font-size:13px}
 .bt.g,button.g{border-color:transparent;background:transparent;box-shadow:none}
 @media(hover:hover){.bt.g:hover,button.g:hover{background:var(--pa2)}}
 button[disabled]{opacity:.4;cursor:not-allowed}
-label{display:block;font-size:12px;font-weight:500;color:var(--fg2);margin-bottom:4px}
+label{display:block;font-size:13px;font-weight:500;color:var(--fg2);margin-bottom:5px}
 input,select,textarea{width:100%;height:30px;background:var(--pa);color:var(--fg);border:.5px solid var(--li2);
-border-radius:var(--r2);padding:0 9px;font:inherit;font-size:13.5px;box-shadow:0 1px 1px rgba(0,0,0,.03) inset}
+border-radius:var(--r2);padding:0 10px;font:inherit;font-size:14.5px;box-shadow:0 1px 1px rgba(0,0,0,.03) inset}
 textarea{height:auto;min-height:80px;padding:7px 9px;line-height:1.55;resize:vertical}
 input:focus,select:focus,textarea:focus{outline:3px solid var(--acb);outline-offset:0;border-color:var(--ac)}
 input:disabled,textarea:disabled,select:disabled{background:var(--pa2);color:var(--fg3);cursor:not-allowed}
@@ -2629,18 +2737,32 @@ input[type=color]{padding:2px}
 .fg{display:grid;gap:9px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
 /* Segmentierte Steuerung */
 .seg{display:inline-flex;background:var(--pa3);border-radius:8px;padding:2px;gap:2px;flex-wrap:wrap;max-width:100%}
-.seg a{padding:3px 11px;border-radius:6px;font-size:12.5px;color:var(--fg);font-weight:500}
+.seg a{padding:4px 12px;border-radius:6px;font-size:13.5px;color:var(--fg);font-weight:500}
 @media(hover:hover){.seg a:hover{text-decoration:none}}
 .seg a.on{background:var(--pa);box-shadow:0 1px 2px rgba(0,0,0,.12);font-weight:590}
-table{width:100%;border-collapse:collapse;font-size:13.5px}
-th,td{text-align:left;padding:7px 14px;border-bottom:1px solid var(--li);vertical-align:top}
-th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--fg3);font-weight:600;white-space:nowrap;border-bottom-color:var(--li)}
+table{width:100%;border-collapse:collapse;font-size:15px}
+th,td{text-align:left;padding:9px 15px;border-bottom:1px solid var(--li);vertical-align:top}
+th{font-size:12px;letter-spacing:0;color:var(--fg3);font-weight:500;white-space:nowrap;border-bottom-color:var(--li)}
 tbody tr:last-child td{border-bottom:0}
 @media(hover:hover){tbody tr:hover{background:var(--pa2)}}
 td.n,th.n{text-align:right;font-family:var(--mo);font-size:12.5px}
 .tw{overflow-x:auto;max-width:100%}
-.tg{display:inline-block;background:var(--pa3);border-radius:5px;padding:0 6px;font-size:11.5px;
-font-weight:500;color:var(--fg2);line-height:18px;white-space:nowrap}
+@media(max-width:700px){
+ .bhz thead{display:none}
+ .bhz,.bhz tbody,.bhz tr,.bhz td{display:block;width:auto!important}
+ .bhz tr{padding:10px 14px 11px;border-bottom:1px solid var(--li);position:relative}
+ .bhz tr:last-child{border-bottom:0}
+ .bhz td{border:0;padding:0}
+ .bhz td:nth-child(1),.bhz td:nth-child(2),.bhz td:nth-child(3){display:inline-block;vertical-align:middle}
+ .bhz td:nth-child(2){margin-left:10px;text-align:left}
+ .bhz td:nth-child(2):not(:empty):not([colspan])::after{content:' h';color:var(--fg3);font-size:12px}
+ .bhz td:nth-child(3){margin-left:8px}
+ .bhz td:nth-child(4){margin:5px 34px 8px 0}
+ .bhz td:nth-child(6){position:absolute;top:6px;right:8px}
+ .bhz td[colspan]{display:inline-block;margin-left:10px}
+}
+.tg{display:inline-block;background:var(--pa3);border-radius:5px;padding:0 7px;font-size:12px;
+font-weight:500;color:var(--fg2);line-height:19px;white-space:nowrap}
 .tg.a{background:var(--acb);color:var(--ac)}
 .tg.o{background:var(--okb);color:var(--ok)}
 .tg.w{background:var(--wab);color:var(--wa)}
@@ -2667,14 +2789,17 @@ font-weight:500;color:var(--fg2);line-height:18px;white-space:nowrap}
 .li.rows li a:hover{text-decoration:none}
 .li.rows .tx{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
 .li.rows .tx b{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.li.rows.antw .tx{gap:0}
+.li.rows.antw .tx b{font-size:17px;font-weight:600;letter-spacing:-.015em;white-space:normal}
+.li.rows.antw li a{padding:12px 15px}
 .li.rows .tx span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .li.rows .ic{color:var(--fg3)}
 .li.rows .tile .ic{color:#fff}
 .li{list-style:none;margin:0;padding:0}
-.li li{display:flex;gap:9px;align-items:baseline;padding:7px 14px;border-bottom:1px solid var(--li)}
+.li li{display:flex;gap:9px;align-items:baseline;padding:9px 15px;border-bottom:1px solid var(--li)}
 .li li:last-child{border-bottom:0}
 @media(hover:hover){.li li:hover{background:var(--pa2)}}
-.em{padding:22px 14px;color:var(--fg3);font-size:13px;text-align:center}
+.em{padding:26px 14px;color:var(--fg3);font-size:14px;text-align:center}
 .br{height:6px;background:var(--pa3);border-radius:99px;overflow:hidden}
 .br>i{display:block;height:100%;background:var(--ac);border-radius:99px}
 .dot{width:7px;height:7px;border-radius:99px;display:inline-block;flex:none}
@@ -2731,10 +2856,13 @@ backdrop-filter:saturate(180%) blur(30px);border-radius:14px;box-shadow:var(--sh
 -webkit-overflow-scrolling:touch}
 .pl li{padding:7px 11px;border-radius:7px;cursor:pointer;font-size:13.5px;display:flex;gap:10px;align-items:center}
 .pl li b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pl li .col{display:flex;flex-direction:column;min-width:0;flex:1}
+.pl li.aw b{font-size:16px;font-weight:600;white-space:normal}
 .pl li.on .tile{box-shadow:0 0 0 1.5px rgba(255,255,255,.5)}
 body.modal{overflow:hidden}
 .pl li.on{background:var(--ac);color:#fff}
-.pl li.on .tg,.pl li.on .mu2{background:rgba(255,255,255,.22);color:#fff}
+.pl li.on .tg{background:rgba(255,255,255,.22);color:#fff}
+.pl li.on .mu2{color:rgba(255,255,255,.78)}
 .pl li b{font-weight:500}
 .pl .gr{padding:7px 12px 3px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--fg3);font-weight:600}
 @media print{.sb,.tb,.np,.pl,.tabs{display:none!important}.app{display:block}.ct{padding:0;max-width:none}
@@ -2754,7 +2882,7 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
     <?php if ($grp !== ''): ?><div class="gr"><?= h($grp) ?></div><?php endif; ?>
     <?php foreach ($items as [$k, $lbl, $sym]): $ni++; $b = nav_zahl($k); ?>
      <a href="<?= url($k) ?>"<?= $p === $k ? ' class="on"' : '' ?>><?= ic($sym, 18) ?><span><?= h($lbl) ?></span>
-      <?= $b !== '' ? '<span class="b">' . h($b) . '</span>' : '<span class="k">' . $ni . '</span>' ?></a>
+      <?= $b !== '' ? '<span class="b">' . h($b) . '</span>' : '' ?></a>
     <?php endforeach; ?>
    <?php endforeach; ?>
   </nav>
@@ -2846,7 +2974,7 @@ document.addEventListener('click',function(e){
 document.addEventListener('focus',function(e){if(e.target.matches('[data-sel]'))e.target.select();},true);
 var pl=document.getElementById('pl'),pq=document.getElementById('pq'),pu=document.getElementById('pu'),
     sq=document.getElementById('sq'),sel=0,cur=[];
-var tref=[],tid=0,lauf='';
+var tref=[],aref=[],tid=0,lauf='';
 function esc(t){return String(t).replace(/[<>&"']/g,function(c){
  return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c];});}
 function rang(x,q){var l=x.t.toLowerCase();
@@ -2867,33 +2995,35 @@ function draw(){var q=(pq.value||'').toLowerCase().trim();
  var nav=Z.map(function(x){return {x:x,r:rang(x,q)};}).filter(function(o){return o.r>0;})
    .sort(function(a,b){return b.r-a.r||a.x.t.length-b.x.t.length;})
    .slice(0,q?6:Z.length).map(function(o){return o.x;});
- cur=nav.concat(tref);
+ cur=aref.concat(nav,tref);
  if(q){cur=cur.concat([{t:'Alles durchsuchen: '+pq.value,u:B+'?p=suche&q='+encodeURIComponent(pq.value),g:'Suchen'}]);
   EX.forEach(function(z){cur=cur.concat([{t:z.n+': '+pq.value,g:'Suchen',
    u:z.u.indexOf('%s')>=0?z.u.replace('%s',encodeURIComponent(pq.value)):z.u}]);});}
  if(sel>=cur.length)sel=Math.max(0,cur.length-1);
  var html='',letzt='';
  cur.forEach(function(x,i){
-  var gr=x.g==='Treffer'?'Treffer':(x.g==='Suchen'?'Suchen':'Springen');
+  var gr=x.g==='Treffer'?'Treffer':(x.g==='Suchen'?'Suchen':(x.g==='Antwort'?'Antwort':'Springen'));
   if(gr!==letzt){html+='<li class="gr" style="pointer-events:none">'+esc(gr)+'</li>';letzt=gr;}
-  html+='<li'+(i===sel?' class="on"':'')+' data-u="'+esc(x.u)+'">'
+  var kl=(i===sel?'on ':'')+(x.l?'aw':'');
+  html+='<li'+(kl.trim()?' class="'+kl.trim()+'"':'')+' data-u="'+esc(x.u)+'">'
       +(x.i?'<span class="tile t-'+esc(x.i)+'">'+sym(x.i,16)+'</span>':'<span class="tile t-suche">'+sym('suche',16)+'</span>')
-      +'<b>'+esc(x.t)+'</b>'
+      +(x.l?'<span class="col"><span class="mu2 sm">'+esc(x.l)+'</span><b>'+esc(x.t)+'</b></span>':'<b>'+esc(x.t)+'</b>')
       +(x.s?'<span class="mu2 sm" style="margin-left:auto">'+esc(x.s)+'</span>':'')+'</li>';});
  pu.innerHTML=html;
  pu.querySelectorAll('li.gr').forEach(function(l){l.removeAttribute('data-u');});}
 function hole(){var q=pq.value.trim();
- if(q.length<2){tref=[];draw();return;}
+ if(q.length<2){tref=[];aref=[];draw();return;}
  if(q===lauf)return; lauf=q;
  fetch(B+'?p=api&a=s&q='+encodeURIComponent(q),{headers:{'Accept':'application/json'}})
   .then(function(r){return r.json();})
   .then(function(j){ if(pq.value.trim()!==q)return;
+    aref=(j.antwort||[]).map(function(x){return {t:x.wert,u:x.url,s:'',g:'Antwort',i:x.icon,l:x.label};});
     tref=(j.treffer||[]).map(function(t){return {t:t.titel||'(ohne Titel)',u:t.u||t.url,
       s:[t.art,t.datum].filter(Boolean).join(' · '),g:'Treffer',i:t.icon||'notizen'};});
     draw();})
   .catch(function(){lauf='';});}
 function open_(v){pl.classList.add('on');document.body.classList.add('modal');
- pq.value=v||'';sel=0;tref=[];lauf='';draw();pq.focus();if(v)hole();}
+ pq.value=v||'';sel=0;tref=[];aref=[];lauf='';draw();pq.focus();if(v)hole();}
 function close_(){pl.classList.remove('on');document.body.classList.remove('modal');}
 if(pl){pq.addEventListener('input',function(){sel=0;draw();clearTimeout(tid);tid=setTimeout(hole,120);});
  pu.addEventListener('click',function(e){var l=e.target.closest('li');if(l&&l.dataset.u)location.href=l.dataset.u;});
@@ -4601,7 +4731,7 @@ function p_berichtsheft(): void {
             <?php endif; ?>
           </div>
           <?php if (!$s['rows']): ?><?= em('Noch nichts eingetragen.') ?><?php else: ?>
-          <div class="tw"><table><thead><tr><th>Tag</th><th class="n">Std</th><th>Ort</th><th>Taetigkeit</th><th>Zuordnung</th><th></th></tr></thead><tbody>
+          <div class="tw"><table class="bhz"><thead><tr><th>Tag</th><th class="n">Std</th><th>Ort</th><th>Taetigkeit</th><th>Zuordnung</th><th></th></tr></thead><tbody>
             <?php foreach ($tage as $ds => $dd):
               $ee = $s['tag'][$ds] ?? [];
               if (!$ee && (int)$dd->format('N') > 5) continue;
@@ -5572,9 +5702,21 @@ function p_pruefung(): void {
 // --- Suche -----------------------------------------------------------------
 function p_suche(): void {
     $u = need_login(); $uid = (int)$u['id']; $qs = get('q');
+    $antwort = such_antwort($u, $qs);
     $ziele   = mb_strlen($qs) >= 1 ? ziele_suchen($qs, 5) : [];
     $treffer = mb_strlen($qs) >= 2 ? suche($uid, $qs, 60) : [];
     ob_start(); ?>
+
+    <?php if ($antwort): ?>
+      <div class="c"><ul class="li rows antw">
+        <?php foreach ($antwort as $x): ?>
+          <li><a href="<?= h($x['url']) ?>">
+            <span class="tile t-<?= h($x['icon']) ?>"><?= ic($x['icon'], 17) ?></span>
+            <span class="tx"><span class="sm mu2"><?= h($x['label']) ?></span><b><?= h($x['wert']) ?></b></span>
+            <?= ic('weiter', 17) ?></a></li>
+        <?php endforeach; ?>
+      </ul></div>
+    <?php endif; ?>
     <?php if ($ziele): ?>
       <div class="c"><div class="hd"><h2>Springen</h2></div>
         <ul class="li rows">
@@ -5590,7 +5732,7 @@ function p_suche(): void {
     <?php endif; ?>
 
     <?php if (mb_strlen($qs) >= 2): ?>
-      <?php if (!$treffer && !$ziele): ?><div class="c"><?= em('Nichts gefunden.') ?></div><?php endif; ?>
+      <?php if (!$treffer && !$ziele && !$antwort): ?><div class="c"><?= em('Nichts gefunden.') ?></div><?php endif; ?>
       <?php if ($treffer): ?>
         <div class="c"><div class="hd"><h2>Treffer</h2><span class="sp"></span>
           <span class="sm mu2"><?= count($treffer) ?></span></div>
@@ -5615,7 +5757,7 @@ function p_suche(): void {
     <?php endif; ?>
     <?php
     page('Suche', ob_get_clean(), ['unter' => mb_strlen($qs) >= 2
-        ? (count($ziele) + count($treffer)) . ' Treffer fuer &bdquo;' . h($qs) . '&ldquo;' : '']);
+        ? (count($antwort) + count($ziele) + count($treffer)) . ' Treffer fuer &bdquo;' . h($qs) . '&ldquo;' : '']);
 }
 
 // --- Einstellungen ---------------------------------------------------------
@@ -6378,6 +6520,8 @@ function a_api(): void {
     if (!rl('api:' . (int)$u['id'], 240, 60)) { http_response_code(429); echo '{"treffer":[]}'; exit; }
     $q = get('q');
     $out = [];
+    $antw = array_map(fn($x) => ['label' => $x['label'], 'wert' => $x['wert'],
+        'icon' => $x['icon'], 'url' => $x['url']], such_antwort($u, $q));
     if (mb_strlen($q) >= 2) {
         foreach (suche((int)$u['id'], $q, 14) as $t) {
             $out[] = ['art' => art_label($t['art']), 'icon' => art_icon($t['art']),
@@ -6387,7 +6531,7 @@ function a_api(): void {
                 'url' => such_ziel($t['art'], $t['ref'], (string)$t['datum'], $u)];
         }
     }
-    echo json_encode(['treffer' => $out], JSON_UNESCAPED_UNICODE);
+    echo json_encode(['antwort' => $antw, 'treffer' => $out], JSON_UNESCAPED_UNICODE);
     exit;
 }
 
