@@ -78,8 +78,7 @@ Ausbildungsjahr aus dem Vertragsbeginn.
 
 ### Navigation
 
-Eine Kopfleiste mit zwei Reihen - auf dem Handy genauso wie am Rechner. Oben
-sechs Gruppen, darunter ihre Unterpunkte:
+Sechs Gruppen mit ihren Unterpunkten - dieselbe Aufteilung auf jedem Geraet:
 
 | Gruppe | Unterpunkte |
 |---|---|
@@ -90,12 +89,17 @@ sechs Gruppen, darunter ihre Unterpunkte:
 | Abschluss | Pruefung · Projekt · Lernfelder |
 | Mehr | Alles · Profil · Quellen · Sicherheit · Daten |
 
-Keine Seitenleiste, keine Schublade, keine untere Leiste: dieselbe Struktur auf
-jedem Geraet, damit man an einer Stelle lernt, wo etwas liegt. Auf schmalen
-Schirmen scrollen beide Reihen waagerecht mit weicher Kante, die offene Gruppe
-rueckt von selbst ins Bild, und die Suchpille wird zum Knopf. Tasten `1`–`9`
-springen auf die ersten neun Unterpunkte, `/` in die Suche, `Strg+K` in die
-Sprungliste.
+Keine Seitenleiste und keine Schublade. Am Rechner stehen die Gruppen in der
+Kopfleiste neben dem Namen, die Unterpunkte in einer zweiten Reihe darunter;
+Kopfreihen und Inhalt teilen sich dieselbe 1220px-Spalte, also fluchten Marke,
+Gruppe und Seitentitel auf einer Linie. Auf dem Handy wandern die Gruppen an
+den unteren Rand in den Daumenbereich - mit Symbol und Beschriftung, ueber der
+Home-Indicator-Zone - waehrend oben die Suche die volle Breite bekommt und die
+Unterpunkte als Segmentreihe darunter bleiben. Gleiche Struktur, gleiche
+Reihenfolge, gleiche Namen; nur die Leiste sitzt dort, wo der Daumen ist.
+Die offene Gruppe rueckt von selbst ins Bild, schmale Unterpunktreihen scrollen
+waagerecht mit weicher Kante. Tasten `1`–`9` springen auf die ersten neun
+Unterpunkte, `/` in die Suche, `Strg+K` in die Sprungliste.
 
 *Mehr → Alles* listet jedes Ziel als Zeile mit Symbol, Wert und Chevron und ist
 damit zugleich die Antwortliste: Noten `2,13`, Berichtsheft `3,5 h`,
@@ -231,7 +235,7 @@ Dieser Ordner gehoert ins Backup.
 
 ### Auf dem iPhone
 
-Tab-Leiste statt Schublade, Eingabefelder mit 16px (sonst zoomt Safari beim
+Gruppenleiste unten im Daumenbereich, Eingabefelder mit 16px (sonst zoomt Safari beim
 Antippen hinein), Tippflaechen ab 38px und Listenzeilen ab 46px,
 `viewport-fit=cover` mit `env(safe-area-inset-*)` fuer Notch und
 Home-Indicator, `:hover` nur unter `@media(hover:hover)` - sonst klebt der

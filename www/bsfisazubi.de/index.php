@@ -2934,10 +2934,11 @@ mask-image:linear-gradient(90deg,#000 0,#000 calc(100% - 14px),transparent 100%)
 font-weight:500;color:var(--fg2);white-space:nowrap}
 @media(hover:hover){.gn a:hover{background:var(--pa2);color:var(--fg);text-decoration:none}}
 .gn a.on{background:var(--pa);color:var(--fg);font-weight:600;box-shadow:var(--sh)}
+.gn .ic{display:none}
 .gn .b{background:var(--ac);color:#fff;border-radius:9px;font-size:11px;font-weight:600;
 padding:0 5px;min-width:17px;text-align:center;line-height:17px}
 .sn{display:flex;gap:3px;padding:0 18px 8px;min-width:0;overflow-x:auto;overscroll-behavior-x:contain;
-scrollbar-width:none;-ms-overflow-style:none}
+width:100%;max-width:1220px;margin:0 auto;scrollbar-width:none;-ms-overflow-style:none}
 .sn::-webkit-scrollbar{display:none}
 .sn{-webkit-mask-image:linear-gradient(90deg,#000 0,#000 calc(100% - 14px),transparent 100%);
 mask-image:linear-gradient(90deg,#000 0,#000 calc(100% - 14px),transparent 100%)}
@@ -2950,6 +2951,7 @@ color:var(--fg2);white-space:nowrap}
 .tb .su{display:none}
 .mn{min-width:0;display:flex;flex-direction:column;background:var(--bg)}
 .tb{display:flex;align-items:center;gap:10px;height:52px;min-width:0;
+width:100%;max-width:1220px;margin:0 auto;
 padding-left:max(18px,env(safe-area-inset-left));padding-right:max(18px,env(safe-area-inset-right))}
 .tb .sp{flex:1}
 .sf1{display:flex;align-items:center;gap:7px;background:var(--pa);border:.5px solid var(--li2);
@@ -2962,7 +2964,7 @@ box-shadow:0 1px 1px rgba(0,0,0,.03) inset}
 font-size:13.5px;min-width:0;flex:1}
 .sf1 input:focus{outline:none}
 .sf1 kbd{font:11px var(--mo);color:var(--fg3);background:transparent;padding:0}
-.ct{padding:18px;max-width:1220px;width:100%}
+.ct{padding:18px;max-width:1220px;width:100%;margin:0 auto}
 .jetzt{display:flex;align-items:center;gap:13px;padding:14px 15px;color:var(--fg)}
 .jetzt:hover{text-decoration:none}
 .jetzt .tile{width:38px;height:38px;border-radius:9px}
@@ -3004,6 +3006,29 @@ font-size:13.5px;min-width:0;flex:1}
  .li.rows li>a:not([class]){padding:11px 14px;min-height:46px}
  .seg a{padding:6px 12px}
  td,th{padding:9px 12px}
+}
+/* Handy: die Gruppen wandern in den Daumenbereich, die Suche fuellt die Kopfreihe.
+   Kein backdrop-filter auf .kopf, sonst waere sie der Bezug fuer die feste Leiste. */
+@media(max-width:760px){
+ .kopf{background:var(--bg);backdrop-filter:none;-webkit-backdrop-filter:none}
+ .tb .su{display:none}
+ .sf1{display:flex;flex:1;width:auto;height:34px}
+ .sf1 input[type=search]{height:32px}
+ .gn{position:fixed;left:0;right:0;bottom:0;z-index:40;flex:none;gap:0;overflow:visible;
+  padding:5px max(4px,env(safe-area-inset-right)) calc(4px + env(safe-area-inset-bottom))
+   max(4px,env(safe-area-inset-left));
+  border-top:1px solid var(--li);background:color-mix(in srgb,var(--bg) 86%,transparent);
+  backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);
+  -webkit-mask-image:none;mask-image:none}
+ .gn a{flex:1;min-width:0;flex-direction:column;justify-content:center;gap:2px;position:relative;
+  padding:5px 2px 3px;border-radius:10px;font-size:10.5px;font-weight:510;letter-spacing:-.01em;
+  color:var(--fg3)}
+ .gn .ic{display:block}
+ .gn .nl{max-width:100%;overflow:hidden;text-overflow:ellipsis}
+ .gn a.on{background:none;box-shadow:none;color:var(--ac);font-weight:590}
+ .gn .b{position:absolute;top:1px;left:50%;margin-left:4px;font-size:10px;
+  min-width:15px;line-height:15px;padding:0 4px}
+ .mn{padding-bottom:calc(56px + env(safe-area-inset-bottom))}
 }
 @media(max-width:880px){.ph h1{font-size:22px}}
 /* Bausteine */
@@ -3205,7 +3230,7 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
    <?php $ga = gruppe_aktiv($p); ?>
    <nav class="gn">
     <?php foreach (nav_gruppen() as $g): $b = nav_zahl($g[0]); ?>
-     <a href="<?= h(gruppe_url($g)) ?>"<?= $ga === $g[0] ? ' class="on"' : '' ?>><?= h($g[1]) ?><?php
+     <a href="<?= h(gruppe_url($g)) ?>"<?= $ga === $g[0] ? ' class="on"' : '' ?>><?= ic($g[2], 22) ?><span class="nl"><?= h($g[1]) ?></span><?php
        if ($b !== ''): ?><span class="b"><?= h($b) ?></span><?php endif; ?></a>
     <?php endforeach; ?>
    </nav>
