@@ -66,15 +66,33 @@ nachsieht.
 
 ### Konto
 
-Nur ein Benutzername und ein Passwort. Keine E-Mail, kein voller Name, kein
-Geburtsdatum. Wer einen Ausdruck braucht, der einen Namen traegt, gibt ihn
-vorher in einer Maske ein - auf Wunsch gemerkt, sonst nur fuer die Sitzung.
+Die Registrierung fragt drei Dinge: Benutzername, Klasse, Passwort. Sonst
+nichts - keine E-Mail, kein voller Name, kein Geburtsdatum, keine Schule, kein
+Betrieb, kein Ausbildungsbeginn.
 
-Ausbildungsjahr und Klasse ergeben sich aus Klassenbezeichnung und
-Ausbildungsbeginn und werden nicht abgefragt: aus `2FS152` und dem 10.09.2024
-wird im August 2026 *2FS152, 2. Ausbildungsjahr, ab 15.09.2026 3FS152*. Der
-Schuljahreswechsel kommt aus den importierten Ferienterminen, das
-Ausbildungsjahr aus dem Vertragsbeginn.
+Alles Weitere leitet sich aus der Klasse ab. `2FS152` heisst zweite
+Jahrgangsstufe, Kuerzel FS, laufende Nummer 15, Zeitgruppe 2; `WFS152` ist die
+Verkuerzerklasse. Aus Stufe und Eingabetag ergibt sich der Vertragsbeginn und
+daraus das Ausbildungsjahr: im August 2026 steht dort *2FS152, 2.
+Ausbildungsjahr, ab 15.09.2026 3FS152*. Den Schuljahreswechsel liefern die
+importierten Ferientermine.
+
+Was danach noch fehlt, wird erst gefragt, wenn es gebraucht wird - und dann
+behalten. Der erste Ausdruck eines Nachweises fragt Name, Geburtsdatum
+(freiwillig), Betrieb und den aus der Klasse abgeleiteten Ausbildungsbeginn;
+der zweite fragt nichts mehr. Der volle Name bleibt die einzige Angabe mit
+Haken: ohne ihn lebt er nur in der Sitzung. Alles davon steht danach unter
+*Mehr > Profil* in drei kleinen Formularen und laesst sich dort aendern oder
+loeschen. Ein geaenderter Beginn rechnet die Ausbildungsjahre aller Nachweise
+nach und sagt, wie viele es waren.
+
+Ein neues Konto bekommt die Faecher der Stundentafel - zwoelf Lernfelder nach
+Rahmenlehrplan und die allgemeinbildenden Faecher. Sonst nichts: keine
+Beispielroutinen, keine Beispieltermine, keine Musterkontakte. Was regelmaessig
+anfaellt, legt jeder selbst fest. Konten aus einer frueheren Fassung sehen ihre
+zehn vorangelegten Routinen als *Beispiel* markiert und werden sie mit einem
+Knopf los; sobald eine davon bearbeitet oder abgehakt wird, gilt sie als
+uebernommen.
 
 ### Navigation
 
@@ -148,32 +166,41 @@ Filter: `lf:9`, `fach:LF9`, `typ:notiz` - auch allein, ohne Suchwort.
 
 ### Anbindung an die Schule
 
-* **Schulsuche in der Registrierung** - sucht im oeffentlichen WebUntis-Verzeichnis
-  nach Name oder Strasse und uebernimmt Server und Schulkuerzel. Aus der
-  Klassenbezeichnung (z.B. `2FS152`) leitet das Formular Stufe, laufende Nummer
-  und Zeitgruppe ab und zeigt sofort, was daraus folgt. Wer Zugangsdaten
+* **Schulsuche im Profil** - ein GET-Formular, das im oeffentlichen
+  WebUntis-Verzeichnis nach Name oder Strasse sucht; ein Klick auf einen Treffer
+  traegt Server und Schulkuerzel ein. Laeuft ohne JavaScript. Fuer Klassen mit
+  dem Kuerzel `FS` ist die BS FiSi bereits vorbelegt. Wer Zugangsdaten
   hinterlegt, kann die Klassenliste spaeter direkt aus WebUntis abrufen
-  (anonymer Zugriff ist dort meist gesperrt).
-* **Blockplan** - laedt das oeffentliche Archiv der BS FiSi
-  ([Blockplaene](https://bsfisi.m-bildung.de/service/blockplaene)) und uebernimmt
-  Blockwochen, Ferien und Schultermine fuer die eigene Zeitgruppe und
-  Jahrgangsstufe. Die IHK-Pruefungstermine landen dabei direkt im Profil.
-  Zu finden unter *Plan > Blockplan*.
+  (anonymer Zugriff ist dort gesperrt).
+* **Blockplan mit einem Knopf** - *Plan > Blockplan > Blockplan holen* nimmt
+  Zeitgruppe und Jahrgangsstufe aus der Klasse, laedt das oeffentliche Archiv der
+  BS FiSi ([Blockplaene](https://bsfisi.m-bildung.de/service/blockplaene)) und
+  uebernimmt Blockwochen, Ferien und Schultermine; beim ersten Mal legt es
+  gleich die Ferienquelle des Bundeslandes mit an. Die IHK-Pruefungstermine
+  landen direkt im Profil. Solange keine Blockwoche eingetragen ist, steht der
+  Weg dorthin als Chip auf *Heute*. Ein anderes Schuljahr waehlt man darunter.
 * **Ferien und Feiertage** - ein Klick unter *Einstellungen > Quellen* holt
   Schulferien und gesetzliche Feiertage des Bundeslandes aus dem offenen
   Verzeichnis [openholidaysapi.org](https://openholidaysapi.org). Sie erscheinen
   im Plan, im Berichtsheft und bestimmen den Schuljahreswechsel.
-* **iCal-Quellen** - WebUntis, Moodle und mebis/BYCS geben jeweils eine
-  persoenliche Kalenderadresse aus. Als Quelle eingetragen wird sie regelmaessig
-  abgerufen, wahlweise als Termine oder als Stundenplan.
+* **Moodle / mebis** - die Quellenart *Moodle* nimmt die Kalender-URL aus
+  *Kalender > Kalender exportieren > Kalender-URL abfragen*, prueft sie, stellt
+  sie auf alle kommenden Termine um und legt sie **verschluesselt** ab; in der
+  Quellenliste steht nur die Adresse ohne `authtoken`. Ohne die Extension
+  `sodium` wird sie gar nicht gespeichert. Termine bringen ihren Kurslink mit.
+* **iCal-Quellen** - jede andere Plattform, die eine persoenliche
+  Kalenderadresse ausgibt. Wahlweise als Termine oder als Stundenplan.
 * **WebUntis** - optional direkt ueber die JSON-RPC-Schnittstelle (Stundenplan
   und, wenn der Server es unterstuetzt, Pruefungen). Zugangsdaten werden mit
   libsodium verschluesselt abgelegt.
-* **Externe Suchziele** - frei definierbare Adressen mit `%s`; sie erscheinen in
-  der Sprungliste, damit ein Suchbegriff direkt in WebUntis oder Moodle weiterlaeuft.
+* **Schul-Apps** - frei verknuepfbare Adressen unter *Quellen*. Sie stehen
+  danach in derselben Rangfolge wie die eigenen Seiten: in der Sprungliste, in
+  der serverseitigen Suche und unter *Mehr* in der Gruppe *Verknuepft*. Steht
+  ein `%s` darin, laeuft der Suchbegriff direkt in WebUntis oder Moodle weiter.
 
-Importe gehen nur ueber https und niemals ins lokale Netz; `IMPORT_PRIVAT`
-erlaubt das ausdruecklich fuer einen eigenen Server.
+Importe gehen nur ueber https und niemals ins lokale Netz; jede Umleitung wird
+einzeln geprueft, damit sie nicht daran vorbeifuehrt. `IMPORT_PRIVAT` erlaubt
+den eigenen Server ausdruecklich.
 
 ### Fachseite
 
@@ -213,7 +240,9 @@ auf Knopfdruck wandern sie als Termine in den Plan.
 Der einzige Weg, auf dem etwas dieses Konto verlaesst. Notiz, Fach oder
 Ausbildungsnachweis bekommen eine eigene Adresse - entweder fuer jeden mit dem
 Link oder nur fuer bestimmte Benutzernamen. Nur lesend, ohne Kommentare,
-jederzeit aufhebbar, `noindex`, mit eigener Ratenbegrenzung.
+jederzeit aufhebbar, `noindex`, mit eigener Ratenbegrenzung. Ein geteilter
+Nachweis traegt die Klasse, nicht den Namen; der volle Name steht nur darauf,
+wenn er beim Erstellen des Links ausdruecklich freigegeben wurde.
 Uebersicht unter *Einstellungen > Daten > Geteilte Links*.
 
 ### Installation
@@ -235,6 +264,10 @@ Dieser Ordner gehoert ins Backup.
 
 ### Auf dem iPhone
 
+Breite Tabellen stapeln unter 700px zu Zeilen statt seitlich zu scrollen -
+Termine, Aufgaben, Routine-Protokoll, Ausbildungsplan und Lernfelder; die
+Spaltenueberschrift wandert als `data-l` vor den Wert. Der Stundenplan zeigt
+zuerst die Woche als Gitter, das Bearbeiten liegt darunter zugeklappt.
 Gruppenleiste unten im Daumenbereich, Eingabefelder mit 16px (sonst zoomt Safari beim
 Antippen hinein), Tippflaechen ab 38px und Listenzeilen ab 46px,
 `viewport-fit=cover` mit `env(safe-area-inset-*)` fuer Notch und
