@@ -2107,6 +2107,17 @@ function blockplan_auto(array $u): array {
           ? 'W' : (string)(9 + max(1, min(3, ausbildungsstand($u)['stufe'])));
     return blockplan_import($u, (string)array_key_first($arch), $zg, $jgst);
 }
+/** Blockwochen und die Ferien des Bundeslandes zusammen holen - beides ohne Zugangsdaten. */
+function blockplan_und_ferien(array $u): array {
+    $uid = (int)$u['id'];
+    $r = blockplan_auto($u);
+    if ($r['fehler'] === '' && !val("SELECT 1 FROM sources WHERE user_id = ? AND typ = 'feiertage'", [$uid])) {
+        $sid = ins('sources', ['user_id' => $uid, 'name' => 'Ferien und Feiertage', 'typ' => 'feiertage',
+            'modus' => 'termine', 'url' => '', 'region' => 'DE-BY', 'intervall' => 10080, 'aktiv' => 1]);
+        feiertage_sync(one("SELECT * FROM sources WHERE id = ?", [$sid]), $u);
+    }
+    return $r;
+}
 
 // ===========================================================================
 //  Volltextsuche
@@ -2714,8 +2725,9 @@ function nav_gruppen(): array {
             ['Lernfelder', 'liste',    url('pruefung', ['t' => 'lf'])],
         ]],
         ['mehr', 'Mehr', 'zahnrad', [
-            ['Alles',      'liste',   url('mehr')],
-            ['Profil',     'kontakt', url('einstellungen')],
+            ['Alles',       'liste',   url('mehr')],
+            ['Einrichtung', 'import',  url('einrichtung')],
+            ['Profil',      'kontakt', url('einstellungen')],
             ['Quellen',    'import',  url('einstellungen', ['t' => 'quellen'])],
             ['Sicherheit', 'schloss', url('einstellungen', ['t' => 'sicherheit'])],
             ['Daten',      'datei',   url('einstellungen', ['t' => 'daten'])],
@@ -2734,7 +2746,7 @@ function gruppe_aktiv(string $p): string {
         'plan' => 'plan',
         'berichtsheft', 'einsaetze', 'kontakte' => 'betrieb',
         'pruefung' => 'abschluss',
-        'mehr', 'einstellungen', 'geteilt' => 'mehr',
+        'mehr', 'einrichtung', 'einstellungen', 'geteilt' => 'mehr',
         default => '',
     };
 }
@@ -4320,8 +4332,18 @@ function p_start(): void {
     foreach (all("SELECT datum FROM events WHERE user_id = ? AND typ <> 'unterricht' AND datum BETWEEN ? AND date(?,'+6 day')", [$uid, $mo, $mo]) as $r) $marks[$r['datum']]['e'] = true;
     foreach (all("SELECT faellig FROM tasks WHERE user_id = ? AND status='offen' AND faellig BETWEEN ? AND date(?,'+6 day')", [$uid, $mo, $mo]) as $r) $marks[$r['faellig']]['t'] = true;
 
+    $frisch = !val("SELECT 1 FROM sources WHERE user_id = ?", [$uid])
+              && !val("SELECT 1 FROM blocks WHERE user_id = ?", [$uid]);
     $jetzt = jetzt_karte($u);
     ob_start(); ?>
+    <?php if ($frisch): ?>
+      <a class="c jetzt" href="<?= url('einrichtung') ?>">
+        <span class="tile" style="background:linear-gradient(160deg,#3aa0ff,#0055c9)"><?= ic('import', 21) ?></span>
+        <span class="tx"><b>Apps verbinden</b>
+          <span class="sm mu">Stundenplan, Blockwochen und Fristen laden - dann steht dein Interface.</span></span>
+        <?= ic('weiter', 18) ?>
+      </a>
+    <?php endif; ?>
     <?php if ($jetzt): ?>
       <a class="c jetzt" href="<?= h($jetzt['url']) ?>">
         <span class="tile" style="background:<?= h($jetzt['farbe']) ?>"><?= ic($jetzt['icon'], 21) ?></span>
@@ -4345,7 +4367,7 @@ function p_start(): void {
       <div class="rw sm mu" style="margin-top:8px;gap:8px">
         <span class="tg"><?= h(klasse_name($u) ?: 'ohne Klasse') ?></span>
         <?php if (!val("SELECT 1 FROM blocks WHERE user_id = ?", [$uid])): ?>
-          <a href="<?= url('plan', ['t' => 'block']) ?>"><span class="tg w">Blockplan holen</span></a>
+          <a href="<?= url('einrichtung') ?>"><span class="tg w">Blockplan holen</span></a>
         <?php endif; ?>
         <?php if ($block): ?><span class="tg a"><?= h(ucfirst($block['art'])) ?> bis <?= h(dt($block['bis'], 'd.m.')) ?></span><?php endif; ?>
         <a href="<?= url('berichtsheft') ?>"><span class="tg <?= $rep['status'] === 'fertig' ? 'o' : 'w' ?>">Berichtsheft <?= num($sum['std'], 1) ?> h</span></a>
@@ -4537,13 +4559,7 @@ function plan_block(array $u): void {
         } elseif ($a === 'auto') {
             if (!rl('bp:' . $uid, 5, 3600)) flash('Zu viele Versuche.', 'err');
             else {
-                $r = blockplan_auto($u);
-                // Ferien und Feiertage gehoeren dazu, aber nur einmal
-                if ($r['fehler'] === '' && !val("SELECT 1 FROM sources WHERE user_id = ? AND typ = 'feiertage'", [$uid])) {
-                    $sid = ins('sources', ['user_id' => $uid, 'name' => 'Ferien und Feiertage', 'typ' => 'feiertage',
-                        'modus' => 'termine', 'url' => '', 'region' => 'DE-BY', 'intervall' => 10080, 'aktiv' => 1]);
-                    feiertage_sync(one("SELECT * FROM sources WHERE id = ?", [$sid]), $u);
-                }
+                $r = blockplan_und_ferien($u);
                 flash($r['fehler'] !== '' ? $r['fehler'] : $r['n'] . ' Eintraege uebernommen.',
                       $r['fehler'] !== '' ? 'err' : 'ok');
             }
@@ -6359,6 +6375,172 @@ function p_suche(): void {
 }
 
 // --- Einstellungen ---------------------------------------------------------
+/**
+ * Einrichtung: alle Schul-Apps an einer Stelle verbinden. Verbinden heisst
+ * laden - jede Quelle wird sofort abgerufen, damit das Interface befuellt ist.
+ */
+function p_einrichtung(): void {
+    $u = need_login(); $uid = (int)$u['id'];
+    $fs = strtoupper((string)$u['kl_kuerzel']) === 'FS';
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        csrf_check();
+        $a = post('a');
+        if ($a === 'untis') {
+            if (!rl('untis:' . $uid, 8, 600)) { flash('Zu viele Versuche.', 'err'); redirect(url('einrichtung')); }
+            $srv = preg_match('~^[a-z0-9.-]+\.webuntis\.com$~i', post('server')) ? post('server') : ($fs ? UNTIS_SERVER_FS : '');
+            $sch = mb_substr(preg_replace('/[^A-Za-z0-9._-]/', '', post('schule')) ?: ($fs ? UNTIS_SCHULE_FS : ''), 0, 60);
+            $ben = mb_substr(post('benutzer'), 0, 80);
+            $pw  = (string)($_POST['pw'] ?? '');
+            if ($srv === '' || $sch === '' || $ben === '' || $pw === '') { flash('Server, Schule, Benutzer und Passwort noetig.', 'err'); redirect(url('einrichtung')); }
+            $c = verschluesseln($pw);
+            if ($c === null) { flash('Ohne die PHP-Extension sodium kann kein Passwort gespeichert werden.', 'err'); redirect(url('einrichtung')); }
+            $alt = one("SELECT id FROM sources WHERE user_id = ? AND typ = 'webuntis'", [$uid]);
+            $d = ['name' => 'WebUntis', 'typ' => 'webuntis', 'modus' => 'stundenplan',
+                  'server' => $srv, 'schule' => $sch, 'benutzer' => $ben, 'secret' => $c,
+                  'intervall' => 360, 'aktiv' => 1];
+            if ($alt) { upd('sources', $d, 'id = :id AND user_id = :u', ['id' => (int)$alt['id'], 'u' => $uid]); $sid = (int)$alt['id']; }
+            else { $d['user_id'] = $uid; $sid = ins('sources', $d); }
+            $r = einr_sync($sid, $u);
+            flash($r['fehler'] !== '' ? 'WebUntis: ' . $r['fehler'] : 'WebUntis verbunden, ' . $r['n'] . ' Stunden geladen.',
+                  $r['fehler'] !== '' ? 'err' : 'ok');
+        } elseif ($a === 'block') {
+            if (!rl('bp:' . $uid, 5, 3600)) { flash('Zu viele Versuche.', 'err'); redirect(url('einrichtung')); }
+            $r = blockplan_und_ferien($u);
+            flash($r['fehler'] !== '' ? $r['fehler'] : $r['n'] . ' Eintraege geladen, Ferien dazu.',
+                  $r['fehler'] !== '' ? 'err' : 'ok');
+        } elseif ($a === 'moodle') {
+            if (!rl('untis:' . $uid, 8, 600)) { flash('Zu viele Versuche.', 'err'); redirect(url('einrichtung')); }
+            $m = moodle_teile(post('url'));
+            if ($m['fehler'] !== '') { flash($m['fehler'], 'err'); redirect(url('einrichtung')); }
+            $c = verschluesseln($m['voll']);
+            if ($c === null) { flash('Ohne die PHP-Extension sodium wird die Adresse nicht gespeichert.', 'err'); redirect(url('einrichtung')); }
+            $alt = one("SELECT id FROM sources WHERE user_id = ? AND typ = 'moodle'", [$uid]);
+            $d = ['name' => 'Moodle', 'typ' => 'moodle', 'modus' => 'termine',
+                  'url' => $m['anzeige'], 'secret' => $c, 'intervall' => 360, 'aktiv' => 1];
+            if ($alt) { upd('sources', $d, 'id = :id AND user_id = :u', ['id' => (int)$alt['id'], 'u' => $uid]); $sid = (int)$alt['id']; }
+            else { $d['user_id'] = $uid; $sid = ins('sources', $d); }
+            $r = einr_sync($sid, $u);
+            flash($r['fehler'] !== '' ? 'Moodle: ' . $r['fehler'] : 'Moodle verbunden, ' . $r['n'] . ' Termine geladen.',
+                  $r['fehler'] !== '' ? 'err' : 'ok');
+        } elseif ($a === 'alles') {
+            if (!rl('alles:' . $uid, 6, 600)) { flash('Zu viele Versuche.', 'err'); redirect(url('einrichtung')); }
+            $teile = [];
+            if ($fs && !val("SELECT 1 FROM blocks WHERE user_id = ? AND label LIKE 'Blockplan%'", [$uid])) {
+                $r = blockplan_und_ferien($u);
+                $teile[] = $r['fehler'] === '' ? $r['n'] . ' Blockeintraege' : 'Blockplan: ' . $r['fehler'];
+            }
+            foreach (all("SELECT * FROM sources WHERE user_id = ? AND aktiv = 1 AND typ <> 'feiertage'", [$uid]) as $src) {
+                $r = einr_sync((int)$src['id'], $u);
+                $einheit = $src['typ'] === 'webuntis' && $src['modus'] === 'stundenplan' ? ' Stunden' : ' Termine';
+                $teile[] = $src['name'] . ': ' . ($r['fehler'] === '' ? $r['n'] . $einheit : $r['fehler']);
+            }
+            flash($teile ? implode(' · ', $teile) : 'Noch nichts zum Laden - verbinde zuerst eine App.');
+        } elseif ($a === 'trennen') {
+            $id = (int)post('id', '0');
+            del('events', 'user_id = ? AND quelle = ?', [$uid, 'q' . $id]);
+            del('blocks', 'user_id = ? AND quelle = ?', [$uid, 'q' . $id]);
+            del('sources', 'id = ? AND user_id = ?', [$id, $uid]);
+            flash('Getrennt.', 'warn');
+        }
+        redirect(url('einrichtung'));
+    }
+
+    $untis  = one("SELECT * FROM sources WHERE user_id = ? AND typ = 'webuntis'", [$uid]);
+    $moodle = one("SELECT * FROM sources WHERE user_id = ? AND typ = 'moodle'", [$uid]);
+    $blocks = (int)val("SELECT COUNT(*) FROM blocks WHERE user_id = ? AND label LIKE 'Blockplan%'", [$uid], 0);
+    $ferien = (bool)val("SELECT 1 FROM sources WHERE user_id = ? AND typ = 'feiertage'", [$uid]);
+    $verbunden = ($untis ? 1 : 0) + ($moodle ? 1 : 0) + ($blocks ? 1 : 0);
+    $anzahl = fn(?array $src) => $src ? (int)val("SELECT COUNT(*) FROM events WHERE user_id = ? AND quelle = ?", [$uid, 'q' . $src['id']], 0) : 0;
+    $stand = fn(?array $src) => $src && $src['letzter_sync'] ? date('d.m. H:i', (int)$src['letzter_sync']) : '';
+
+    ob_start(); ?>
+    <?php if ($verbunden): ?>
+      <form method="post" class="c np"><div class="bo rw" style="padding:11px 15px">
+        <?= csrf_field() ?><input type="hidden" name="a" value="alles">
+        <div><b>Verbunden</b><div class="sm mu2"><?= $verbunden ?> von 3 · <?= $blocks ?> Blockeintraege<?= $untis ? ' · ' . $anzahl($untis) . ' Stunden' : '' ?><?= $moodle ? ' · ' . $anzahl($moodle) . ' Termine' : '' ?></div></div>
+        <span class="sp"></span>
+        <button class="p" type="submit">Alles aktualisieren</button>
+      </div></form>
+    <?php else: ?>
+      <div class="c"><div class="bo"><b>Verbinde deine Schul-Apps.</b>
+        <div class="sm mu2" style="margin-top:2px">Einmal verbunden, steht dein Plan, dein Stundenplan und deine Fristen von selbst.</div></div></div>
+    <?php endif; ?>
+
+    <div class="g g2">
+      <?php /* Blockplan + Ferien - oeffentlich, ein Klick */ ?>
+      <div class="c"><div class="bo">
+        <div class="rw" style="gap:10px;align-items:flex-start">
+          <span class="tile" style="background:#0f5fa8"><?= ic('plan', 18) ?></span>
+          <div style="flex:1;min-width:0"><b>Blockwochen &amp; Ferien</b>
+            <div class="sm mu2"><?php if ($blocks): ?><?= $blocks ?> Eintraege<?= $ferien ? ', Ferien geladen' : '' ?><?php else: ?>Aus dem oeffentlichen Plan der Schule - ohne Zugangsdaten.<?php endif; ?></div></div>
+        </div>
+        <form method="post" style="margin-top:11px"><?= csrf_field() ?><input type="hidden" name="a" value="block">
+          <button class="<?= $blocks ? 'g s' : 'p' ?>" type="submit"><?= $blocks ? 'Aktualisieren' : 'Holen' ?></button>
+          <?php if (!$fs): ?><span class="sm mu2" style="margin-left:8px">Blockplan der BS FiSi Muenchen</span><?php endif; ?>
+        </form>
+      </div></div>
+
+      <?php /* WebUntis - Stundenplan, braucht Zugangsdaten */ ?>
+      <div class="c"><div class="bo">
+        <div class="rw" style="gap:10px;align-items:flex-start">
+          <span class="tile" style="background:#e8500e"><?= ic('raster', 18) ?></span>
+          <div style="flex:1;min-width:0"><b>Stundenplan (WebUntis)</b>
+            <div class="sm mu2"><?php if ($untis): ?>verbunden<?= $stand($untis) ? ' · ' . $stand($untis) : '' ?> · <?= $anzahl($untis) ?> Stunden<?php else: ?>Dein Stundenplan direkt aus WebUntis.<?php endif; ?></div></div>
+        </div>
+        <form method="post" style="margin-top:11px"><?= csrf_field() ?><input type="hidden" name="a" value="untis">
+          <?php if (!$fs): ?>
+            <div class="fg">
+              <div class="f"><label for="us">Server</label><input id="us" name="server" value="<?= h($untis['server'] ?? '') ?>" placeholder="mese.webuntis.com"></div>
+              <div class="f"><label for="uc">Schule</label><input id="uc" name="schule" value="<?= h($untis['schule'] ?? '') ?>"></div>
+            </div>
+          <?php endif; ?>
+          <div class="fg">
+            <div class="f"><label for="ub">Benutzer</label><input id="ub" name="benutzer" value="<?= h($untis['benutzer'] ?? '') ?>" autocomplete="off"></div>
+            <div class="f"><label for="up">Passwort</label><input id="up" name="pw" type="password" autocomplete="new-password" placeholder="<?= $untis ? 'gespeichert' : '' ?>"></div>
+          </div>
+          <div class="rw"><button class="<?= $untis ? 'g s' : 'p' ?>" type="submit"><?= $untis ? 'Aktualisieren' : 'Verbinden' ?></button>
+            <?php if ($untis): ?><button class="g s d" name="a" value="trennen" type="submit" data-q="WebUntis trennen?" formnovalidate><input type="hidden" name="id" value="<?= (int)$untis['id'] ?>">Trennen</button><?php endif; ?></div>
+        </form>
+      </div></div>
+
+      <?php /* Moodle / mebis - Fristen und Termine */ ?>
+      <div class="c"><div class="bo">
+        <div class="rw" style="gap:10px;align-items:flex-start">
+          <span class="tile" style="background:#f7931e"><?= ic('import', 18) ?></span>
+          <div style="flex:1;min-width:0"><b>Moodle / mebis</b>
+            <div class="sm mu2"><?php if ($moodle): ?>verbunden<?= $stand($moodle) ? ' · ' . $stand($moodle) : '' ?> · <?= $anzahl($moodle) ?> Termine<?php else: ?>Abgabefristen und Termine aus dem Kurskalender.<?php endif; ?></div></div>
+        </div>
+        <form method="post" style="margin-top:11px"><?= csrf_field() ?><input type="hidden" name="a" value="moodle">
+          <div class="f"><label for="mu">Kalender-Adresse</label>
+            <input id="mu" name="url" placeholder="https://.../calendar/export_execute.php?...">
+            <div class="sm mu2" style="margin-top:4px">In Moodle: Kalender &rsaquo; Kalender exportieren &rsaquo; Kalender-URL abfragen.</div></div>
+          <div class="rw"><button class="<?= $moodle ? 'g s' : 'p' ?>" type="submit"><?= $moodle ? 'Neu verbinden' : 'Verbinden' ?></button>
+            <?php if ($moodle): ?><button class="g s d" name="a" value="trennen" type="submit" data-q="Moodle trennen?" formnovalidate><input type="hidden" name="id" value="<?= (int)$moodle['id'] ?>">Trennen</button><?php endif; ?></div>
+        </form>
+      </div></div>
+
+      <?php /* weitere Kalender */ ?>
+      <div class="c"><div class="bo">
+        <div class="rw" style="gap:10px;align-items:flex-start">
+          <span class="tile" style="background:#8e8e93"><?= ic('termin', 18) ?></span>
+          <div style="flex:1;min-width:0"><b>Weiterer Kalender</b>
+            <div class="sm mu2">Jede andere App mit iCal-Adresse - unter Quellen.</div></div>
+        </div>
+        <a class="bt g s" style="margin-top:11px" href="<?= url('einstellungen', ['t' => 'quellen']) ?>">Quellen oeffnen</a>
+      </div></div>
+    </div>
+    <?php
+    page('Einrichtung', ob_get_clean(), []);
+}
+
+/** Eine Quelle sofort abrufen und den Status setzen. */
+function einr_sync(int $sid, array $u): array {
+    $src = one("SELECT * FROM sources WHERE id = ? AND user_id = ?", [$sid, (int)$u['id']]);
+    if (!$src) return ['fehler' => 'Quelle weg.', 'n' => 0];
+    try { return quelle_sync($src, $u); }
+    catch (Throwable $ex) { quelle_status($sid, 'fehler', $ex->getMessage()); return ['fehler' => $ex->getMessage(), 'n' => 0]; }
+}
+
 function p_einstellungen(): void {
     $u = need_login(); $uid = (int)$u['id'];
     $t = get('t') ?: 'profil';
@@ -6438,6 +6620,12 @@ function p_einstellungen(): void {
             if ($d['typ'] === 'ics' && !filter_var($d['url'], FILTER_VALIDATE_URL)) flash('iCal-Adresse fehlt.', 'err');
             elseif ($id) { upd('sources', $d, 'id = :id AND user_id = :u', ['id' => $id, 'u' => $uid]); flash('Gespeichert.'); }
             else { $d['user_id'] = $uid; $id = ins('sources', $d); flash('Quelle angelegt.'); }
+            // Verbinden heisst laden: die frische Quelle gleich abrufen
+            if ((int)($d['aktiv'] ?? 1) === 1 && in_array($d['typ'], ['webuntis','moodle','ics'], true)) {
+                $r = einr_sync($id, $u);
+                if ($r['fehler'] !== '') flash($r['fehler'], 'err');
+                elseif ($r['n'] > 0) flash($r['n'] . ' geladen.');
+            }
             redirect(url('einstellungen', ['t' => 'quellen', 'id' => $id]));
         } elseif ($a === 'qsync') {
             $id = (int)post('id', '0');
@@ -7251,6 +7439,7 @@ switch ($p) {
     case 'aufgaben':      redirect(url('plan', ['t' => 'aufgaben'] + (get('id') !== '' ? ['id' => (int)get('id')] : [])));
     case 'routinen':      redirect(url('berichtsheft', ['t' => 'routinen']));
     case 'abwesend':      redirect(url('einsaetze', ['t' => 'zeiten']));
+    case 'einrichtung':   p_einrichtung(); break;
     case 'einstellungen': p_einstellungen(); break;
     case 'suche':         p_suche(); break;
     case 'geteilt':       p_geteilt(); break;

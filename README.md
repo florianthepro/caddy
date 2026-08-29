@@ -164,6 +164,25 @@ Filter: `lf:9`, `fach:LF9`, `typ:notiz` - auch allein, ohne Suchwort.
 | Kontakte | Ansprechpartner in Betrieb, Schule und IHK |
 | Pruefung | Teil 1 und 2, Punkte und Prognose, Abschlussprojekt, Lernfelder |
 
+### Einrichtung
+
+Eine Seite, die alle Schul-Apps an einer Stelle verbindet - *Mehr &gt; Einrichtung*,
+und fuer ein frisches Konto als Karte auf *Heute*. Verbinden heisst laden: jede
+Quelle wird sofort abgerufen, damit das Interface gleich befuellt ist.
+
+* **Blockwochen &amp; Ferien** - ein Klick, ohne Zugangsdaten. Zeitgruppe und
+  Jahrgangsstufe stehen in der Klasse; die Ferien des Bundeslandes kommen dazu.
+* **Stundenplan (WebUntis)** - fuer FS-Klassen ist Server und Schule vorbelegt;
+  nach Benutzer und Passwort laedt der Stundenplan sofort.
+* **Moodle / mebis** - die Kalender-Adresse einmal eingefuegt, danach laufen die
+  Fristen von selbst ein.
+* **Alles aktualisieren** - holt in einem Zug jede verbundene Quelle neu.
+
+Jeder Schueler bekommt so sein eigenes, mit seinen Daten befuelltes Interface -
+die Moeglichkeiten der Oberflaeche bleiben fuer alle gleich, nur die Daten sind
+seine. Nichts davon ist Pflicht: die Oberflaeche funktioniert auch ganz ohne
+Anbindung, jede Angabe laesst sich von Hand eintragen.
+
 ### Anbindung an die Schule
 
 * **Schulsuche im Profil** - ein GET-Formular, das im oeffentlichen
