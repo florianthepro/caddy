@@ -513,13 +513,14 @@ function schema_v8(PDO $pdo): void {
         }
     }
     // Die zehn frueher vorangelegten Routinen kennzeichnen - nur unberuehrte
+    // sort trennt die Seed-Zeilen (0..90) von selbst angelegten (immer 500)
     $pdo->exec("UPDATE routines SET herkunft = 'beispiel'
-        WHERE (name, intervall, minuten) IN (
-          ('Kaffeemaschine reinigen','taeglich',10),('Spuelmaschine ein-/ausraeumen','taeglich',10),
-          ('Post holen und verteilen','taeglich',15),('Ticketqueue sichten','taeglich',30),
-          ('Backup-Protokoll pruefen','taeglich',15),('Monitoring durchsehen','taeglich',15),
-          ('Drucker: Papier und Toner','woechentlich',15),('Serverraum-Check','woechentlich',15),
-          ('Patchstand pruefen','woechentlich',30),('Lager inventarisieren','monatlich',45))
+        WHERE (name, intervall, minuten, sort) IN (
+          ('Kaffeemaschine reinigen','taeglich',10,0),('Spuelmaschine ein-/ausraeumen','taeglich',10,10),
+          ('Post holen und verteilen','taeglich',15,20),('Ticketqueue sichten','taeglich',30,30),
+          ('Backup-Protokoll pruefen','taeglich',15,40),('Monitoring durchsehen','taeglich',15,50),
+          ('Drucker: Papier und Toner','woechentlich',15,60),('Serverraum-Check','woechentlich',15,70),
+          ('Patchstand pruefen','woechentlich',30,80),('Lager inventarisieren','monatlich',45,90))
           AND id NOT IN (SELECT routine_id FROM routine_logs)");
     $pdo->exec("INSERT INTO meta (k,v) VALUES ('schema','8') ON CONFLICT(k) DO UPDATE SET v='8'");
 }
@@ -1176,11 +1177,13 @@ function ausbildungsstand(array $u, string $datum = ''): array {
     if (!empty($u['start']) && isodate(substr((string)$u['start'], 0, 10))) {
         $start = substr((string)$u['start'], 0, 10);
     } elseif ((int)($u['kl_stufe'] ?? 0) > 0) {
+        // Feste Grenze 15.09., nicht schuljahr_start() - sonst schoebe ein importierter
+        // Ferienblock vor dem 15.09. den Beginn um ein Jahr und das Ausbildungsjahr liefe rueckwaerts.
         $s0    = max(1, min(3, (int)$u['kl_stufe']));
         $stand = isodate((string)($u['kl_stand'] ?? '')) ? (string)$u['kl_stand'] : $datum;
         $y0    = (int)substr($stand, 0, 4);
-        if ($stand < schuljahr_start($uid, $y0)) $y0--;
-        $start = schuljahr_start($uid, $y0 - ($s0 - 1));
+        if ($stand < $y0 . '-09-15') $y0--;
+        $start = ($y0 - ($s0 - 1)) . '-09-15';
     }
     if ($start === '') return $leer;
     // Regeldauer drei Jahre, bei eingetragenem Ende die tatsaechliche Dauer
@@ -1554,11 +1557,17 @@ function http_ruf(string $url, array $o = []): array {
         if (preg_match_all('/^Set-Cookie:\s*([^;]+)/mi', $kopfteil, $m)) $cookie = implode('; ', $m[1]);
 
         if ($code >= 300 && $code < 400 && $sprung < 3 && !isset($o['json'])
-            && preg_match('/^Location:\s*(\S+)/mi', $kopfteil, $lm)) {
-            $ziel = trim($lm[1]);
-            if (str_starts_with($ziel, '/')) {
-                $b = parse_url($aktuell);
-                $ziel = $b['scheme'] . '://' . $b['host'] . (isset($b['port']) ? ':' . (int)$b['port'] : '') . $ziel;
+            && preg_match('/^Location:\s*([^\r\n]+)/mi', $kopfteil, $lm)) {
+            $ziel = str_replace(' ', '%20', trim($lm[1]));
+            $b = parse_url($aktuell);
+            $wurzel = $b['scheme'] . '://' . $b['host'] . (isset($b['port']) ? ':' . (int)$b['port'] : '');
+            if (preg_match('#^//#', $ziel)) {                     // protokollrelativ: //host/pfad
+                $ziel = $b['scheme'] . ':' . $ziel;
+            } elseif (str_starts_with($ziel, '/')) {              // wurzelrelativ
+                $ziel = $wurzel . $ziel;
+            } elseif (!preg_match('#^[a-z][a-z0-9+.-]*:#i', $ziel)) {  // relativ zum aktuellen Pfad
+                $pfad = $b['path'] ?? '/';
+                $ziel = $wurzel . substr($pfad, 0, strrpos($pfad, '/') + 1) . $ziel;
             }
             if ($f = $pruefen($ziel)) return $f;
             $aktuell = $ziel;
@@ -1596,7 +1605,7 @@ function entschluesseln(?string $c): ?string {
 function ics_parse(string $text): array {
     $text = preg_replace("/\r\n[ \t]/", '', str_replace("\n", "\r\n", str_replace("\r\n", "\n", $text)));
     $zeilen = preg_split("/\r\n/", (string)$text);
-    $out = []; $ev = null; $alarm = false;
+    $out = []; $ev = null; $alarm = 0;
     $entschaerf = fn($v) => str_replace(['\\n', '\\N', '\\,', '\;', '\\\\'], ["\n", "\n", ',', ';', '\\'], $v);
     $zeit = function (string $params, string $wert): array {
         $wert = trim($wert);
@@ -1612,11 +1621,14 @@ function ics_parse(string $text): array {
         return ['', '', false];
     };
     foreach ($zeilen as $z) {
-        // Eine Erinnerung traegt eine eigene SUMMARY - die gehoert nicht zum Termin
-        if ($z === 'BEGIN:VALARM') { $alarm = true; continue; }
-        if ($z === 'END:VALARM')   { $alarm = false; continue; }
-        if ($alarm) continue;
-        if ($z === 'BEGIN:VEVENT') { $ev = ['uid'=>'','rid'=>'','titel'=>'','text'=>'','ort'=>'','datum'=>'','von'=>'','bis'=>'','ganz'=>false,'link'=>'']; continue; }
+        // Eine Erinnerung traegt eine eigene SUMMARY - die gehoert nicht zum Termin.
+        // Zaehlen statt schalten und an jeder VEVENT-Grenze raeumen: ein fehlendes
+        // END:VALARM verdirbt so hoechstens seinen Termin, nicht den ganzen Kalender.
+        if ($z === 'BEGIN:VALARM') { $alarm++; continue; }
+        if ($z === 'END:VALARM')   { $alarm = max(0, $alarm - 1); continue; }
+        if ($z === 'BEGIN:VEVENT') { $alarm = 0; $ev = ['uid'=>'','rid'=>'','titel'=>'','text'=>'','ort'=>'','datum'=>'','von'=>'','bis'=>'','ganz'=>false,'link'=>'']; continue; }
+        if ($z === 'END:VEVENT') { $alarm = 0; }
+        if ($alarm > 0) continue;
         if (count($out) >= 2000) break;
         if ($z === 'END:VEVENT') {
             if ($ev && $ev['datum'] !== '') {
@@ -1761,7 +1773,7 @@ function moodle_teile(string $roh): array {
         return array_merge($leer, ['fehler' => 'Erwartet wird die Kalender-URL aus Moodle (calendar/export_execute.php).']);
     }
     parse_str((string)($t['query'] ?? ''), $q);
-    if (!preg_match('/^[0-9a-f]{40}$/', (string)($q['authtoken'] ?? ''))) {
+    if (!is_string($q['authtoken'] ?? null) || !preg_match('/^[0-9a-f]{40}$/', $q['authtoken'])) {
         return array_merge($leer, ['fehler' => 'In der Adresse fehlt der authtoken.']);
     }
     if (empty($q['userid']) && empty($q['username'])) {
@@ -1932,11 +1944,14 @@ function quelle_sync(array $src, array $u): array {
         else { $daten['user_id'] = $uid; $daten['extern_id'] = $ext; ins('events', $daten); }
         $n++;
     }
-    // Was die Quelle nicht mehr liefert, verschwindet auch hier
+    // Was die Quelle nicht mehr liefert, verschwindet auch hier - aber nur, wenn
+    // ueberhaupt etwas kam. Ein leeres oder abgeschnittenes Ergebnis loescht sonst alles.
     $weg = 0;
-    foreach (all("SELECT id, extern_id FROM events WHERE user_id = ? AND quelle = ? AND datum BETWEEN ? AND ?",
-                 [$uid, 'q' . $sid, $von, $bis]) as $alt) {
-        if (!in_array($alt['extern_id'], $gesehen, true)) { del('events', 'id = ?', [(int)$alt['id']]); $weg++; }
+    if ($n > 0) {
+        foreach (all("SELECT id, extern_id FROM events WHERE user_id = ? AND quelle = ? AND datum BETWEEN ? AND ?",
+                     [$uid, 'q' . $sid, $von, $bis]) as $alt) {
+            if (!in_array($alt['extern_id'], $gesehen, true)) { del('events', 'id = ?', [(int)$alt['id']]); $weg++; }
+        }
     }
     quelle_status($sid, 'ok', $n . ' Termine' . ($weg ? ', ' . $weg . ' entfernt' : ''), $n);
     return ['fehler' => '', 'n' => $n];
@@ -3260,6 +3275,7 @@ td.n,th.n{text-align:right;font-family:var(--mo);font-size:12.5px}
  .stk td:empty{display:none}
  .stk td[data-l]:not(:empty)::before{content:attr(data-l) " ";color:var(--fg3);font-size:12px}
  .stk td[data-eck]{position:absolute;top:6px;right:8px;padding:0}
+ .stk td[data-eck]+td{margin-right:62px}
  /* Kein Scrollfenster im Scrollfenster */
  #bt{max-height:none!important}
 }
@@ -3327,10 +3343,10 @@ details.add>div{padding:0 14px 14px}
 .ka .kn{font-weight:590;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ka .kz{font-size:12px;color:var(--fg3);display:flex;gap:9px;flex-wrap:wrap}
 /* Stundenplan */
-.tt{display:grid;grid-template-columns:24px repeat(5,1fr);gap:3px;font-size:12px}
+.tt{display:grid;grid-template-columns:24px repeat(5,minmax(0,1fr));gap:3px;font-size:12px}
 .tt .h{font-size:11px;color:var(--fg3);text-transform:uppercase;text-align:center;font-weight:600}
 .tt .s{color:var(--fg3);text-align:right;padding-right:3px;font-size:11px;line-height:28px}
-.tt .c2{background:var(--pa2);border-radius:6px;padding:4px 6px;min-height:28px;border-left:2.5px solid transparent}
+.tt .c2{background:var(--pa2);border-radius:6px;padding:4px 6px;min-height:28px;border-left:2.5px solid transparent;min-width:0;overflow-wrap:anywhere}
 /* Kalender */
 .cal{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
 .cal .h{font-size:11px;color:var(--fg3);text-align:center;font-weight:600;text-transform:uppercase;padding:2px}
@@ -5376,6 +5392,9 @@ function angaben_holen(array $u, string $zurueck, string $weiter): ?array {
         csrf_check();
         $name = mb_substr(post('dok_name'), 0, 80);
         if ($name === '') { flash('Name fehlt.', 'err'); redirect($weiter . '&dok=1'); }
+        // Was die Maske gerade verlangt, muss auch ankommen - sonst kaeme sie stumm wieder
+        if ((string)$u['betrieb'] === '' && post('betrieb') === '') { flash('Betrieb fehlt.', 'err'); redirect($weiter . '&dok=1'); }
+        if (empty($u['start']) && !isodate(post('start'))) { flash('Ausbildungsbeginn fehlt.', 'err'); redirect($weiter . '&dok=1'); }
         $d = ['name' => $name, 'geb' => isodate(post('dok_geb')) ? post('dok_geb') : ''];
         $_SESSION['dok'] = $d;
         if (post('merken') !== '') {
@@ -5420,15 +5439,15 @@ function angaben_holen(array $u, string $zurueck, string $weiter): ?array {
         <?php if ((string)$u['betrieb'] === '' || (string)$u['beruf'] === '' || empty($u['start'])): ?>
           <hr>
           <?php if ((string)$u['betrieb'] === ''): ?>
-            <div class="f"><label for="dkb">Betrieb</label><input id="dkb" name="betrieb"></div>
+            <div class="f"><label for="dkb">Betrieb</label><input id="dkb" name="betrieb" required></div>
           <?php endif; ?>
           <?php if ((string)$u['beruf'] === ''): ?>
             <div class="f"><label for="dkr">Beruf</label><input id="dkr" name="beruf" value="Fachinformatiker/-in Systemintegration"></div>
           <?php endif; ?>
           <?php if (empty($u['start'])): ?>
             <div class="f"><label for="dks">Ausbildungsbeginn</label>
-              <input id="dks" name="start" type="date" value="<?= h($stand['beginn'] ?? '') ?>">
-              <div class="sm mu2" style="margin-top:4px">aus der Klasse abgeleitet, bitte pruefen</div></div>
+              <input id="dks" name="start" type="date" required value="<?= h($stand['beginn'] ?? '') ?>">
+              <?php if (($stand['beginn'] ?? '') !== ''): ?><div class="sm mu2" style="margin-top:4px">aus der Klasse abgeleitet, bitte pruefen</div><?php endif; ?></div>
           <?php endif; ?>
           <div class="sm mu2" style="margin-bottom:9px">Wird im Konto behalten und nicht erneut gefragt.</div>
         <?php endif; ?>
@@ -6361,10 +6380,12 @@ function p_einstellungen(): void {
                 $d['kl_stufe'] = max(1, min(3, (int)$teile['stufe']));
                 $d['kl_stand'] = today();
             }
+            $vorher = ausbildungsstand($u)['beginn'];
             upd('users', $d, 'id = :id', ['id' => $uid]);
             flash('Gespeichert.');
-            if ((string)($d['start'] ?? '') !== (string)($u['start'] ?? '')) {
-                $n = reports_jahr_nachziehen(one("SELECT * FROM users WHERE id = ?", [$uid]));
+            $frisch = one("SELECT * FROM users WHERE id = ?", [$uid]);
+            if (ausbildungsstand($frisch)['beginn'] !== $vorher) {
+                $n = reports_jahr_nachziehen($frisch);
                 if ($n) flash($n . ' Nachweise nachgerechnet.');
             }
         } elseif ($a === 'profil_betrieb') {
@@ -6375,7 +6396,8 @@ function p_einstellungen(): void {
             flash('Gespeichert.');
         } elseif ($a === 'profil_druck') {
             $nm = mb_substr(post('dok_name'), 0, 80);
-            upd('users', ['dok_name' => $nm, 'dok_geb' => isodate(post('dok_geb')) ? post('dok_geb') : '',
+            upd('users', ['dok_name' => $nm,
+                'dok_geb' => $nm !== '' && isodate(post('dok_geb')) ? post('dok_geb') : '',
                 'dok_merken' => $nm !== '' ? 1 : 0], 'id = :id', ['id' => $uid]);
             unset($_SESSION['dok']);
             flash($nm === '' ? 'Name entfernt.' : 'Gespeichert.');
@@ -6397,13 +6419,21 @@ function p_einstellungen(): void {
                 else $d['secret'] = $c;
             }
             if ($d['typ'] === 'moodle') {
-                $m = moodle_teile($d['url'] !== '' ? $d['url'] : (string)($_POST['url'] ?? ''));
-                if ($m['fehler'] !== '') { flash($m['fehler'], 'err'); redirect(url('einstellungen', ['t' => 'quellen'] + ($id ? ['id' => $id] : ['neu' => 1]))); }
-                $c = verschluesseln($m['voll']);
-                if ($c === null) { flash('Ohne die PHP-Extension sodium wird die Adresse nicht gespeichert.', 'err'); redirect(url('einstellungen', ['t' => 'quellen'])); }
-                $d['url'] = $m['anzeige'];   // ohne Token, damit er nirgends im Klartext steht
-                $d['secret'] = $c;
-                $d['modus'] = 'termine';
+                $alt = $id ? one("SELECT url, secret FROM sources WHERE id = ? AND user_id = ?", [$id, $uid]) : null;
+                // Steht im Feld nur die gekuerzte Anzeige-Adresse (ohne Token), bleibt die gespeicherte unveraendert
+                $unveraendert = $alt && !empty($alt['secret']) && ($d['url'] === '' || $d['url'] === (string)$alt['url']);
+                if ($unveraendert) {
+                    $d['url'] = (string)$alt['url']; $d['modus'] = 'termine';
+                    unset($d['secret']);   // vorhandenes Geheimnis nicht ueberschreiben
+                } else {
+                    $m = moodle_teile($d['url'] !== '' ? $d['url'] : (string)($_POST['url'] ?? ''));
+                    if ($m['fehler'] !== '') { flash($m['fehler'], 'err'); redirect(url('einstellungen', ['t' => 'quellen'] + ($id ? ['id' => $id] : ['neu' => 1]))); }
+                    $c = verschluesseln($m['voll']);
+                    if ($c === null) { flash('Ohne die PHP-Extension sodium wird die Adresse nicht gespeichert.', 'err'); redirect(url('einstellungen', ['t' => 'quellen'])); }
+                    $d['url'] = $m['anzeige'];   // ohne Token, damit er nirgends im Klartext steht
+                    $d['secret'] = $c;
+                    $d['modus'] = 'termine';
+                }
             }
             if ($d['typ'] === 'ics' && !filter_var($d['url'], FILTER_VALIDATE_URL)) flash('iCal-Adresse fehlt.', 'err');
             elseif ($id) { upd('sources', $d, 'id = :id AND user_id = :u', ['id' => $id, 'u' => $uid]); flash('Gespeichert.'); }
