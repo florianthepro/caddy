@@ -673,12 +673,24 @@ function url(string $p = '', array $q = []): string {
     return base_path() . ($a ? '?' . http_build_query($a) : '');
 }
 function redirect(string $to): void { header('Location: ' . $to, true, 303); exit; }
+/** Nur eigene Adressen als Rueckweg - sonst waere es eine offene Weiterleitung. */
+function zurueck(string $z, string $sonst): string {
+    return ($z !== '' && str_starts_with($z, base_path()) && !str_starts_with($z, '//')
+            && !preg_match('/[\r\n]/', $z)) ? $z : $sonst;
+}
 function post(string $k, string $d = ''): string { return is_string($_POST[$k] ?? null) ? trim($_POST[$k]) : $d; }
 function postn(string $k) { $v = $_POST[$k] ?? null; return ($v === null || $v === '') ? null : $v; }
 function get(string $k, string $d = ''): string { return is_string($_GET[$k] ?? null) ? trim($_GET[$k]) : $d; }
 function inull($v): ?int { return ($v === null || $v === '' || $v === '0') ? null : (int)$v; }
 function today(): string { return date('Y-m-d'); }
-function isodate(string $s): bool { return (bool)preg_match('/^\d{4}-\d{2}-\d{2}$/', $s); }
+/** Ganze Tage von $von bis $bis - ueber den Kalender, damit die Sommerzeit nicht um einen Tag verschiebt. */
+function tage(string $von, string $bis): int {
+    $a = new DateTimeImmutable(substr($von, 0, 10)); $b = new DateTimeImmutable(substr($bis, 0, 10));
+    $d = $a->diff($b); return $d->invert ? -$d->days : $d->days;
+}
+function isodate(string $s): bool {
+    return (bool)preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', $s, $m) && checkdate((int)$m[2], (int)$m[3], (int)$m[1]);
+}
 function flash(string $m, string $t = 'ok'): void { $_SESSION['flash'][] = [$t, $m]; }
 function take_flash(): array { $f = $_SESSION['flash'] ?? []; unset($_SESSION['flash']); return $f; }
 function lines(string $s): array {
@@ -710,8 +722,9 @@ function csrf(): string {
 }
 function csrf_field(): string { return '<input type="hidden" name="_csrf" value="' . h(csrf()) . '">'; }
 function csrf_check(): void {
-    if (!isset($_POST['_csrf']) || !is_string($_POST['_csrf'])
-        || !hash_equals($_SESSION['csrf'] ?? '', $_POST['_csrf'])) {
+    $soll = (string)($_SESSION['csrf'] ?? '');
+    if ($soll === '' || !isset($_POST['_csrf']) || !is_string($_POST['_csrf'])
+        || !hash_equals($soll, $_POST['_csrf'])) {
         http_response_code(419);
         exit('<!doctype html><meta charset="utf-8"><p style="font:15px system-ui;padding:2rem">'
            . 'Sitzung abgelaufen. Seite neu laden.</p>');
@@ -1121,7 +1134,10 @@ function periode_of(string $datum, string $art): string {
     return $art === 'monat' ? $t->format('Y-m') : $t->format('o-\WW');
 }
 function periode_ok(string $p, string $art): bool {
-    return (bool)preg_match($art === 'monat' ? '/^\d{4}-(0[1-9]|1[0-2])$/' : '/^\d{4}-W(0[1-9]|[1-4]\d|5[0-3])$/', $p);
+    if ($art === 'monat') return (bool)preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $p);
+    if (!preg_match('/^(\d{4})-W(\d{2})$/', $p, $m)) return false;
+    // Der 28.12. liegt immer in der letzten ISO-Woche des Jahres
+    return (int)$m[2] >= 1 && (int)$m[2] <= (int)date('W', strtotime($m[1] . '-12-28'));
 }
 function periode_range(string $p, string $art): array {
     if ($art === 'monat') {
@@ -1243,7 +1259,7 @@ function klasse_name(array $u, string $datum = ''): string {
     if (($u['kl_kuerzel'] ?? '') === '') return (string)($u['klasse'] ?? '');
     if ((int)($u['verkuerzt'] ?? 0) === 1) return 'W' . $u['kl_kuerzel'] . $u['kl_nr'] . (int)$u['zeitgruppe'];
     $st = ausbildungsstand($u, $datum);
-    return $st['stufe'] . $u['kl_kuerzel'] . $u['kl_nr'] . (int)$u['zeitgruppe'];
+    return min(3, (int)$st['stufe']) . $u['kl_kuerzel'] . $u['kl_nr'] . (int)$u['zeitgruppe'];
 }
 
 // --- Berichtsheft ----------------------------------------------------------
@@ -1481,8 +1497,12 @@ function ihk_probleme(array $p): array {
 // ===========================================================================
 
 /** Blockt Ziele im lokalen Netz, damit die Import-Funktion kein Portscanner wird. */
-function host_erlaubt(string $host): bool {
-    if (IMPORT_PRIVAT) return true;
+/**
+ * Loest den Host auf und prueft jede Adresse gegen private und reservierte Bereiche.
+ * @return array{ips:string[],fehler:string}
+ */
+function host_ips(string $host): array {
+    if (IMPORT_PRIVAT) return ['ips' => [], 'fehler' => ''];
     $ips = [];
     if (filter_var($host, FILTER_VALIDATE_IP)) { $ips[] = $host; }
     else {
@@ -1491,29 +1511,36 @@ function host_erlaubt(string $host): bool {
         $aaaa = @dns_get_record($host, DNS_AAAA);
         foreach ($aaaa ?: [] as $r) if (!empty($r['ipv6'])) $ips[] = $r['ipv6'];
     }
-    if (!$ips) return false;
+    if (!$ips) return ['ips' => [], 'fehler' => 'Server nicht gefunden.'];
     foreach ($ips as $ip) {
-        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) return false;
-        if (preg_match('/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./', $ip)) return false; // CGNAT
+        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)
+            || preg_match('/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./', $ip)) {   // CGNAT
+            return ['ips' => [], 'fehler' => 'Ziel liegt im lokalen Netz.'];
+        }
     }
-    return true;
+    return ['ips' => $ips, 'fehler' => ''];
 }
+function host_erlaubt(string $host): bool { return host_ips($host)['fehler'] === ''; }
 /** @return array{ok:bool,code:int,body:string,fehler:string,cookie:string} */
 function http_ruf(string $url, array $o = []): array {
     $leer = ['ok' => false, 'code' => 0, 'body' => '', 'fehler' => '', 'cookie' => ''];
     if (!extension_loaded('curl')) return array_merge($leer, ['fehler' => 'PHP-Extension curl fehlt.']);
-    // Jeder Sprung wird einzeln geprueft - curl wuerde sonst an host_erlaubt() vorbei umleiten
+    // Jeder Sprung wird einzeln geprueft - curl wuerde sonst an der Netzpruefung vorbei umleiten.
+    // Die geprueften Adressen werden festgenagelt, damit ein zweiter DNS-Blick nicht woandershin fuehrt.
     $pruefen = function (string $u) use ($leer): array {
         $t = parse_url($u);
-        if (!$t || empty($t['host'])) return array_merge($leer, ['fehler' => 'Adresse unvollstaendig.']);
+        if (!$t || empty($t['host'])) return ['fehler' => array_merge($leer, ['fehler' => 'Adresse unvollstaendig.'])];
         $schema = strtolower($t['scheme'] ?? '');
         if ($schema !== 'https' && !(IMPORT_PRIVAT && $schema === 'http')) {
-            return array_merge($leer, ['fehler' => 'Nur https erlaubt.']);
+            return ['fehler' => array_merge($leer, ['fehler' => 'Nur https erlaubt.'])];
         }
-        if (!host_erlaubt($t['host'])) return array_merge($leer, ['fehler' => 'Ziel liegt im lokalen Netz.']);
-        return [];
+        $hi = host_ips($t['host']);
+        if ($hi['fehler'] !== '') return ['fehler' => array_merge($leer, ['fehler' => $hi['fehler']])];
+        $port = (int)($t['port'] ?? ($schema === 'https' ? 443 : 80));
+        return ['pin' => $hi['ips'] ? [$t['host'] . ':' . $port . ':' . implode(',', $hi['ips'])] : []];
     };
-    if ($f = $pruefen($url)) return $f;
+    $pr = $pruefen($url);
+    if (isset($pr['fehler'])) return $pr['fehler'];
 
     $max     = (int)($o['max'] ?? 4 * 1024 * 1024);
     $aktuell = $url;
@@ -1521,8 +1548,8 @@ function http_ruf(string $url, array $o = []): array {
     for ($sprung = 0; ; $sprung++) {
         $ch = curl_init($aktuell);
         $kopf = $o['header'] ?? [];
+        $kopfteil = ''; $body = ''; $zuGross = false;
         curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_CONNECTTIMEOUT => 8,
             CURLOPT_TIMEOUT        => (int)($o['timeout'] ?? 15),
@@ -1530,9 +1557,16 @@ function http_ruf(string $url, array $o = []): array {
             CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_PROTOCOLS_STR  => IMPORT_PRIVAT ? 'https,http' : 'https',
             CURLOPT_USERAGENT      => APP_NAME . '/' . APP_VERSION,
-            CURLOPT_HEADER         => true,
             CURLOPT_ENCODING       => '',
+            // Groesse nach dem Entpacken zaehlen - die Progress-Zahlen kennen nur die komprimierten Bytes
+            CURLOPT_HEADERFUNCTION => function ($c, string $h) use (&$kopfteil): int { $kopfteil .= $h; return strlen($h); },
+            CURLOPT_WRITEFUNCTION  => function ($c, string $d) use (&$body, &$zuGross, $max): int {
+                $body .= $d;
+                if (strlen($body) > $max) { $zuGross = true; return -1; }
+                return strlen($d);
+            },
         ]);
+        if (!empty($pr['pin'])) curl_setopt($ch, CURLOPT_RESOLVE, $pr['pin']);
         if (isset($o['json'])) {
             $kopf[] = 'Content-Type: application/json';
             curl_setopt($ch, CURLOPT_POST, true);
@@ -1541,19 +1575,16 @@ function http_ruf(string $url, array $o = []): array {
         if (!empty($o['cookie'])) $kopf[] = 'Cookie: ' . $o['cookie'];
         if ($kopf) curl_setopt($ch, CURLOPT_HTTPHEADER, $kopf);
         curl_setopt($ch, CURLOPT_NOPROGRESS, false);
-        // Vierter Wert ist das bereits Uebertragene - die Ankuendigung darf nicht zaehlen
         curl_setopt($ch, CURLOPT_PROGRESSFUNCTION,
             fn($r, $dlGesamt, $dlJetzt) => ($dlJetzt > $max || $dlGesamt > $max) ? 1 : 0);
-        $roh = curl_exec($ch);
-        if ($roh === false) {
+        $ok = curl_exec($ch);
+        if ($ok === false) {
             $fehler = curl_error($ch); curl_close($ch);
+            if ($zuGross) return array_merge($leer, ['fehler' => 'Antwort zu gross.']);
             return array_merge($leer, ['fehler' => $fehler ?: 'Verbindung fehlgeschlagen.']);
         }
-        $hs   = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
         $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-        $kopfteil = substr($roh, 0, $hs);
-        $body     = substr($roh, $hs);
         if (preg_match_all('/^Set-Cookie:\s*([^;]+)/mi', $kopfteil, $m)) $cookie = implode('; ', $m[1]);
 
         if ($code >= 300 && $code < 400 && $sprung < 3 && !isset($o['json'])
@@ -1569,7 +1600,8 @@ function http_ruf(string $url, array $o = []): array {
                 $pfad = $b['path'] ?? '/';
                 $ziel = $wurzel . substr($pfad, 0, strrpos($pfad, '/') + 1) . $ziel;
             }
-            if ($f = $pruefen($ziel)) return $f;
+            $pr = $pruefen($ziel);
+            if (isset($pr['fehler'])) return $pr['fehler'];
             $aktuell = $ziel;
             continue;
         }
@@ -1661,7 +1693,7 @@ function ics_parse(string $text): array {
 }
 
 /** WebUntis JSON-RPC. Liefert Stundenplan und, wenn der Server es kann, Pruefungen. */
-function untis_hole(array $src, string $von, string $bis): array {
+function untis_hole(array $src, string $von, string $bis, int $timeout = 20): array {
     $server = preg_replace('~^https?://~', '', trim($src['server']));
     $server = rtrim(explode('/', $server)[0], '/');
     if ($server === '' || $src['schule'] === '') return ['fehler' => 'Server oder Schule fehlt.', 'termine' => []];
@@ -1671,7 +1703,7 @@ function untis_hole(array $src, string $von, string $bis): array {
     $nr = 0; $cookie = '';
     $rpc = function (string $methode, array $params = []) use ($url, &$nr, &$cookie) {
         $r = http_ruf($url, ['json' => ['id' => (string)(++$nr), 'method' => $methode,
-            'params' => $params ?: new stdClass(), 'jsonrpc' => '2.0'], 'cookie' => $cookie, 'timeout' => 20]);
+            'params' => $params ?: new stdClass(), 'jsonrpc' => '2.0'], 'cookie' => $cookie, 'timeout' => $timeout]);
         if (!$r['ok']) return ['fehler' => $r['fehler'] ?: 'keine Antwort'];
         if ($r['cookie'] !== '') $cookie = $r['cookie'];
         $j = json_decode($r['body'], true);
@@ -1852,7 +1884,7 @@ function laender(): array {
  * Ferien und gesetzliche Feiertage aus dem offenen Verzeichnis openholidaysapi.org.
  * Schreibt in die Blocktabelle, damit Berichtsheft und Kalender sie kennen.
  */
-function feiertage_sync(array $src, array $u): array {
+function feiertage_sync(array $src, array $u, int $timeout = 20): array {
     $uid = (int)$u['id']; $sid = (int)$src['id'];
     $land = isset(laender()[$src['region']]) ? $src['region'] : 'DE-BY';
     $von = date('Y-m-d', strtotime('-6 months'));
@@ -1861,7 +1893,7 @@ function feiertage_sync(array $src, array $u): array {
     foreach ([['SchoolHolidays', 'ferien'], ['PublicHolidays', 'feiertag']] as [$pfad, $art]) {
         $url = 'https://openholidaysapi.org/' . $pfad . '?countryIsoCode=DE&subdivisionCode=' . $land
              . '&languageIsoCode=DE&validFrom=' . $von . '&validTo=' . $bis;
-        $r = http_ruf($url, ['timeout' => 20]);
+        $r = http_ruf($url, ['timeout' => $timeout]);
         if (!$r['ok']) { quelle_status($sid, 'fehler', $r['fehler'] ?: 'Abruf fehlgeschlagen'); return ['fehler' => $r['fehler'] ?: 'Abruf fehlgeschlagen', 'n' => 0]; }
         $j = json_decode($r['body'], true);
         if (!is_array($j)) { quelle_status($sid, 'fehler', 'Unerwartete Antwort.'); return ['fehler' => 'Unerwartete Antwort', 'n' => 0]; }
@@ -1886,14 +1918,14 @@ function feiertage_sync(array $src, array $u): array {
     schuljahr_start($uid, (int)date('Y'), true);   // gemerkte Schuljahresgrenzen verwerfen
     return ['fehler' => '', 'n' => $n];
 }
-function quelle_sync(array $src, array $u): array {
+function quelle_sync(array $src, array $u, int $timeout = 20): array {
     $uid = (int)$u['id']; $sid = (int)$src['id'];
     $von = date('Y-m-d', strtotime('-14 days'));
     $bis = date('Y-m-d', strtotime('+120 days'));
     q("UPDATE sources SET letzter_sync = ? WHERE id = ?", [time(), $sid]);   // Sperre gegen Doppellauf
-    if ($src['typ'] === 'feiertage') return feiertage_sync($src, $u);
+    if ($src['typ'] === 'feiertage') return feiertage_sync($src, $u, $timeout);
     if ($src['typ'] === 'webuntis') {
-        $r = untis_hole($src, $von, $bis);
+        $r = untis_hole($src, $von, $bis, $timeout);
         if ($r['fehler'] !== '') { quelle_status($sid, 'fehler', $r['fehler']); return ['fehler' => $r['fehler'], 'n' => 0]; }
         $roh = $r['termine'];
     } else {
@@ -1903,7 +1935,7 @@ function quelle_sync(array $src, array $u): array {
             $adr = (string)entschluesseln($src['secret']);
             if ($adr === '') { quelle_status($sid, 'fehler', 'Adresse nicht lesbar.'); return ['fehler' => 'Adresse nicht lesbar.', 'n' => 0]; }
         }
-        $r = http_ruf($adr, ['timeout' => 20]);
+        $r = http_ruf($adr, ['timeout' => $timeout]);
         if (!$r['ok']) { quelle_status($sid, 'fehler', $r['fehler'] ?: 'Abruf fehlgeschlagen'); return ['fehler' => $r['fehler'], 'n' => 0]; }
         if (!str_contains($r['body'], 'BEGIN:VEVENT') && !str_contains($r['body'], 'BEGIN:VCALENDAR')) {
             quelle_status($sid, 'fehler', 'Kein iCalendar unter dieser Adresse.');
@@ -1962,9 +1994,10 @@ function quelle_status(int $sid, string $status, string $meldung, int $anzahl = 
 }
 /** Eine faellige Quelle im Hintergrund eines Seitenaufrufs nachziehen. */
 function quellen_auto(array $u): void {
-    $s = one("SELECT * FROM sources WHERE user_id = ? AND aktiv = 1 AND letzter_sync + intervall * 60 < ?
+    $s = one("SELECT * FROM sources WHERE user_id = ? AND aktiv = 1
+              AND letzter_sync + intervall * 60 < CAST(? AS INTEGER)
               ORDER BY letzter_sync LIMIT 1", [(int)$u['id'], time()]);
-    if ($s) { try { quelle_sync($s, $u); } catch (Throwable $e) { quelle_status((int)$s['id'], 'fehler', $e->getMessage()); } }
+    if ($s) { try { quelle_sync($s, $u, 6); } catch (Throwable $e) { quelle_status((int)$s['id'], 'fehler', $e->getMessage()); } }
 }
 
 // ---------------------------------------------------------------------------
@@ -2100,6 +2133,7 @@ function blockplan_import(array $u, string $zipUrl, int $zg, string $jgst): arra
  * stehen bereits in der Klasse.
  */
 function blockplan_auto(array $u): array {
+    if ((int)$u['zeitgruppe'] < 1) return ['fehler' => 'In der Klasse steht keine Zeitgruppe (letzte Ziffer, z.B. 2FS152).', 'n' => 0];
     $arch = blockplan_archive();
     if (!$arch) return ['fehler' => 'Blockplan-Seite nicht erreichbar.', 'n' => 0];
     $zg   = max(1, min(9, (int)$u['zeitgruppe']));
@@ -2107,14 +2141,22 @@ function blockplan_auto(array $u): array {
           ? 'W' : (string)(9 + max(1, min(3, ausbildungsstand($u)['stufe'])));
     return blockplan_import($u, (string)array_key_first($arch), $zg, $jgst);
 }
+/** Anzeigename eines Blocks - die Herkunftsmarke "Blockplan" bleibt intern. */
+function block_label(array $b): string {
+    $l = (string)($b['label'] ?? '');
+    if ($l === 'Blockplan') return 'Schulblock';
+    if (str_starts_with($l, 'Blockplan · ')) return substr($l, strlen('Blockplan · '));
+    return $l !== '' ? $l : ucfirst((string)($b['art'] ?? ''));
+}
 /** Blockwochen und die Ferien des Bundeslandes zusammen holen - beides ohne Zugangsdaten. */
 function blockplan_und_ferien(array $u): array {
     $uid = (int)$u['id'];
-    $r = blockplan_auto($u);
+    $r = blockplan_auto($u); $r['ferien'] = '';
     if ($r['fehler'] === '' && !val("SELECT 1 FROM sources WHERE user_id = ? AND typ = 'feiertage'", [$uid])) {
         $sid = ins('sources', ['user_id' => $uid, 'name' => 'Ferien und Feiertage', 'typ' => 'feiertage',
             'modus' => 'termine', 'url' => '', 'region' => 'DE-BY', 'intervall' => 10080, 'aktiv' => 1]);
-        feiertage_sync(one("SELECT * FROM sources WHERE id = ?", [$sid]), $u);
+        $f = feiertage_sync(one("SELECT * FROM sources WHERE id = ?", [$sid]), $u);
+        $r['ferien'] = $f['fehler'] === '' ? ', Ferien dazu' : ', Ferien: ' . $f['fehler'];
     }
     return $r;
 }
@@ -2383,7 +2425,7 @@ function such_antwort(array $u, string $q): array {
                   WHERE e.user_id = ? AND e.typ IN ('probe','test','pruefung','abgabe','frist')
                   AND e.datum >= date('now','localtime') ORDER BY e.datum LIMIT 1", [$uid]);
         if ($e) {
-            $tage = (int)ceil((strtotime($e['datum']) - strtotime(today())) / 86400);
+            $tage = tage(today(), $e['datum']);
             $a[] = ['icon' => 'termin', 'label' => 'Naechster Termin',
                 'wert' => $e['titel'] . ' · ' . dt($e['datum'], 'd.m.') . ' (' . ($tage === 0 ? 'heute' : 'in ' . $tage . ' Tagen') . ')',
                 'url' => url('plan', ['id' => (int)$e['id']])];
@@ -2606,7 +2648,8 @@ function ziele_index(): array {
         ['projekt', 'Abschlussprojekt',   'Abschluss',     'projekt abschlussprojekt antrag genehmigung doku dokumentation praesentation frist stunden', url('pruefung', ['t' => 'projekt']), '#e11d48'],
         ['liste',   'Lernfelder',         'Abschluss',     'lernfeld lernfelder lf lehrplan rahmenlehrplan',                    url('pruefung', ['t' => 'lf']),                '#00a09a'],
         ['kontakt', 'Profil',             'Einstellungen', 'profil einstellungen konto klasse schule betrieb beruf beginn',     url('einstellungen'),                          '#8e8e93'],
-        ['import',  'Quellen',            'Einstellungen', 'quelle quellen import webuntis ical kalender ferien feiertage blockplan abonnement sync', url('einstellungen', ['t' => 'quellen']), '#5ac8fa'],
+        ['import',  'Einrichtung',        'Einstellungen', 'einrichtung einrichten setup verbinden apps app webuntis untis moodle mebis blockplan ferien stundenplan laden', url('einrichtung'), '#0071e3'],
+        ['import',  'Quellen',            'Einstellungen', 'quelle quellen import ical kalender abonnement sync', url('einstellungen', ['t' => 'quellen']), '#5ac8fa'],
         ['schloss', 'Sicherheit',         'Einstellungen', 'sicherheit passwort kennwort zwei-faktor 2fa totp sitzung anmeldung', url('einstellungen', ['t' => 'sicherheit']), '#636366'],
         ['datei',   'Daten & Export',     'Einstellungen', 'daten export backup sicherung csv json kalenderadresse konto loeschen', url('einstellungen', ['t' => 'daten']),    '#48484a'],
         ['teilen',  'Geteilte Links',     'Einstellungen', 'geteilt teilen link freigabe share oeffentlich',                    url('geteilt'),                                '#98989d'],
@@ -2802,7 +2845,7 @@ function jetzt_karte(array $u): ?array {
     $t = one("SELECT * FROM tasks WHERE user_id = ? AND status = 'offen'
               AND faellig IS NOT NULL AND faellig < ? ORDER BY faellig LIMIT 1", [$uid, $heute]);
     if ($t) {
-        $tage = (int)floor((strtotime($heute) - strtotime($t['faellig'])) / 86400);
+        $tage = tage($t['faellig'], $heute);
         return ['icon' => 'aufgabe', 'farbe' => '#ff3b30', 'titel' => $t['titel'],
             'kontext' => $tage . ' ' . ($tage === 1 ? 'Tag' : 'Tage') . ' ueberfaellig',
             'url' => url('plan', ['t' => 'aufgaben', 'id' => (int)$t['id']])];
@@ -2828,7 +2871,7 @@ function jetzt_karte(array $u): ?array {
                 'doku' => 'Dokumentation abgeben', 'praesentation' => 'Praesentation'];
         foreach (projekt_termine() as $k => $lbl) {
             if (!$pj[$k] || $pj[$k] < $heute) continue;
-            $tage = (int)ceil((strtotime($pj[$k]) - strtotime($heute)) / 86400);
+            $tage = tage($heute, $pj[$k]);
             if ($tage > 14) break;
             return ['icon' => 'projekt', 'farbe' => '#e11d48',
                 'titel' => ($tun[$k] ?? $lbl) . ' in ' . $tage . ' ' . ($tage === 1 ? 'Tag' : 'Tagen'),
@@ -2860,7 +2903,7 @@ function jetzt_karte(array $u): ?array {
     $b = one("SELECT * FROM blocks WHERE user_id = ? AND ? BETWEEN von AND bis
               ORDER BY (art = 'schule') DESC LIMIT 1", [$uid, $heute]);
     if ($b) {
-        $rest = (int)ceil((strtotime($b['bis']) - strtotime($heute)) / 86400);
+        $rest = tage($heute, $b['bis']);
         return ['icon' => $b['art'] === 'schule' ? 'plan' : 'frei',
             'farbe' => $b['art'] === 'schule' ? '#0f5fa8' : '#00b894',
             'titel' => ($b['label'] ?: ucfirst((string)$b['art'])) . ' bis ' . dt($b['bis'], 'd.m.'),
@@ -2873,7 +2916,7 @@ function jetzt_karte(array $u): ?array {
               WHERE e.user_id = ? AND e.typ <> 'unterricht' AND e.datum > ?
               ORDER BY e.datum, e.zeit_von LIMIT 1", [$uid, $heute]);
     if ($e) {
-        $tage = (int)ceil((strtotime($e['datum']) - strtotime($heute)) / 86400);
+        $tage = tage($heute, $e['datum']);
         if ($tage <= 21) {
             return ['icon' => 'termin', 'farbe' => '#5856d6',
                 'titel' => $e['titel'], 'kontext' => 'in ' . $tage . ' Tagen · ' . dt($e['datum'], 'D d.m.'),
@@ -2945,7 +2988,7 @@ function ziel_werte(array $u): array {
     $ansp = (float)$u['urlaub_tage'];
     if ($ansp > 0) $w['Fehlzeiten & Urlaub'] = num(max(0, $ansp - $genommen), 0) . ' T frei';
 
-    $cd = fn(?string $d) => $d ? (int)ceil((strtotime($d) - strtotime(today())) / 86400) : null;
+    $cd = fn(?string $d) => $d ? tage(today(), $d) : null;
     $t1 = $cd($u['ap1']); $t2 = $cd($u['ap2']);
     if ($t2 !== null && $t2 > 0) $w['Pruefung'] = 'in ' . $t2 . ' T';
     elseif ($t1 !== null && $t1 > 0) $w['Pruefung'] = 'Teil 1 in ' . $t1 . ' T';
@@ -3017,7 +3060,7 @@ function nav_zahl(string $key): string {
 }
 
 function page(string $titel, string $inhalt, array $o = []): void {
-    $u = me(); $n = $GLOBALS['NONCE']; $p = $_GET['p'] ?? 'heute';
+    $u = me(); $n = $GLOBALS['NONCE']; $p = is_string($_GET['p'] ?? null) ? $_GET['p'] : 'heute';
     if ($u && empty($o['bare'])) ziel_zaehlen($u, $p);
     $theme = $u['theme'] ?? 'auto';
     $flash = take_flash();
@@ -3034,7 +3077,7 @@ function page(string $titel, string $inhalt, array $o = []): void {
 <style>
 :root{
  --bg:#f5f5f7; --sb:#ececee; --pa:#ffffff; --pa2:#f5f5f7; --pa3:#ebebed;
- --fg:#1d1d1f; --fg2:#6e6e73; --fg3:#8e8e93;
+ --fg:#1d1d1f; --fg2:#6e6e73; --fg3:#737378;
  --li:rgba(0,0,0,.09); --li2:rgba(0,0,0,.16);
  --ac:#0071e3; --acb:rgba(0,113,227,.10); --acf:#fff;
  --ok:#1d8a4a; --okb:rgba(29,138,74,.12);
@@ -3047,7 +3090,7 @@ function page(string $titel, string $inhalt, array $o = []): void {
 }
 @media(prefers-color-scheme:dark){:root:not([data-t=hell]){
  --bg:#1c1c1e; --sb:#232325; --pa:#2c2c2e; --pa2:#242426; --pa3:#3a3a3c;
- --fg:#f5f5f7; --fg2:#a1a1a6; --fg3:#8e8e93;
+ --fg:#f5f5f7; --fg2:#a1a1a6; --fg3:#98989d;
  --li:rgba(255,255,255,.10); --li2:rgba(255,255,255,.18);
  --ac:#0a84ff; --acb:rgba(10,132,255,.18); --acf:#fff;
  --ok:#32d74b; --okb:rgba(50,215,75,.16);
@@ -3058,7 +3101,7 @@ function page(string $titel, string $inhalt, array $o = []): void {
 }}
 :root[data-t=dunkel]{
  --bg:#1c1c1e; --sb:#232325; --pa:#2c2c2e; --pa2:#242426; --pa3:#3a3a3c;
- --fg:#f5f5f7; --fg2:#a1a1a6; --fg3:#8e8e93;
+ --fg:#f5f5f7; --fg2:#a1a1a6; --fg3:#98989d;
  --li:rgba(255,255,255,.10); --li2:rgba(255,255,255,.18);
  --ac:#0a84ff; --acb:rgba(10,132,255,.18); --acf:#fff;
  --ok:#32d74b; --okb:rgba(50,215,75,.16); --wa:#ffd60a; --wab:rgba(255,214,10,.14);
@@ -3114,6 +3157,8 @@ width:100%;max-width:1220px;margin:0 auto;scrollbar-width:none;-ms-overflow-styl
 .sn::-webkit-scrollbar{display:none}
 .sn{-webkit-mask-image:linear-gradient(90deg,#000 0,#000 calc(100% - 14px),transparent 100%);
 mask-image:linear-gradient(90deg,#000 0,#000 calc(100% - 14px),transparent 100%)}
+.sn.sl{-webkit-mask-image:linear-gradient(90deg,transparent 0,#000 14px,#000 calc(100% - 14px),transparent 100%);
+mask-image:linear-gradient(90deg,transparent 0,#000 14px,#000 calc(100% - 14px),transparent 100%)}
 .sn a{display:flex;align-items:center;gap:6px;padding:5px 11px;border-radius:7px;font-size:13.5px;
 color:var(--fg2);white-space:nowrap}
 .sn a .ic{color:var(--fg3)}
@@ -3218,7 +3263,7 @@ font-size:13.5px;min-width:0;flex:1}
 @media(max-width:1040px){
  .sp2{grid-template-columns:1fr}
  /* Ein geoeffnetes Detail gehoert ueber die Liste, nicht darunter */
- .sp2.det{display:flex;flex-direction:column}
+ .sp2.det{display:flex;flex-direction:column;align-items:stretch}
  .sp2.det>*:nth-child(2){order:-1}
 }
 .rw{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
@@ -3247,7 +3292,10 @@ textarea{height:auto;min-height:80px;padding:7px 9px;line-height:1.55;resize:ver
 input:focus,select:focus,textarea:focus{outline:3px solid var(--acb);outline-offset:0;border-color:var(--ac)}
 input:disabled,textarea:disabled,select:disabled{background:var(--pa2);color:var(--fg3);cursor:not-allowed}
 input[type=checkbox]{width:auto;height:auto;accent-color:var(--ac);box-shadow:none}
+::placeholder{color:var(--fg3);opacity:1}
 input[type=color]{padding:2px}
+/* 16px verhindert den iOS-Zoom, 38px ist die Tippflaeche - muss nach der Basisregel stehen */
+@media(max-width:880px){input,select,textarea,.sf1 input[type=search]{font-size:16px}input,select{height:38px}}
 .f{margin-bottom:9px}
 .fg{display:grid;gap:9px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
 /* Segmentierte Steuerung */
@@ -3321,6 +3369,7 @@ color:var(--fg);min-width:0}
 @media(hover:hover){.li.rows li>a:not([class]):hover{text-decoration:none}}
 .li.rows .tx{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
 .li.rows .tx b{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media(max-width:700px){.li.rows .tx b{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.3}}
 .li.rows.antw .tx{gap:0}
 .li.rows.antw .tx b{font-size:17px;font-weight:600;letter-spacing:-.015em;white-space:normal}
 .li.rows.antw li>a:not([class]){padding:12px 15px}
@@ -3397,6 +3446,7 @@ body.modal{overflow:hidden}
 .pl li.on .mu2{color:rgba(255,255,255,.78)}
 .pl li b{font-weight:500}
 .pl .gr{padding:7px 12px 3px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--fg3);font-weight:600}
+@media(max-width:700px){.cal .e{min-height:20px;line-height:20px;font-size:11px}}
 @media print{.kopf,.np,.pl{display:none!important}.app{display:block}.ct{padding:0;max-width:none}
 .tw{overflow:visible}.c{box-shadow:none;margin:0 0 10px;background:none}.c>.hd{padding:0 0 4px}.c>.bo{padding:0}
 body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding:5px 8px}a{color:#000}@page{margin:16mm}}
@@ -3441,8 +3491,11 @@ body{background:#fff;color:#000;font-size:10.5pt}th,td{border-color:#bbb;padding
    foreach (nav_gruppen() as $g) if ($g[0] === $ga) { $gr = $g; break; }
    if ($gr && $gr[3]): $hier = nav_adresse($p); ?>
     <nav class="sn">
-     <?php foreach ($gr[3] as [$lbl, $sym, $adr]): ?>
-      <a href="<?= h($adr) ?>"<?= $adr === $hier ? ' class="on"' : '' ?>><?= ic($sym, 15) ?><span><?= h($lbl) ?></span></a>
+     <?php $exakt = in_array($hier, array_column($gr[3], 2), true);
+     foreach ($gr[3] as [$lbl, $sym, $adr]):
+       // Ohne exakten Treffer zaehlt die Seite: Berichtsheft&t=plan liegt unter Berichtsheft
+       $an = $exakt ? $adr === $hier : (preg_match('/[?&]p=([a-z]+)/', $adr, $pm) && $pm[1] === $p && !str_contains($adr, '&t=')); ?>
+      <a href="<?= h($adr) ?>"<?= $an ? ' class="on"' : '' ?>><?= ic($sym, 15) ?><span><?= h($lbl) ?></span></a>
      <?php endforeach; ?>
     </nav>
    <?php endif; ?>
@@ -3496,13 +3549,16 @@ document.addEventListener('click',function(e){
  if(v&&navigator.clipboard){navigator.clipboard.writeText(v.dataset.copyVal).then(function(){
    var o=v.textContent;v.textContent='kopiert';setTimeout(function(){v.textContent=o;},1100);});}
 });
-document.addEventListener('submit',function(e){var m=e.target.getAttribute('data-q');if(m&&!confirm(m))e.preventDefault();});
+document.addEventListener('submit',function(e){var b=e.submitter,m=(b&&b.getAttribute('data-q'))||e.target.getAttribute('data-q');if(m&&!confirm(m))e.preventDefault();});
 // Die offene Gruppe muss sichtbar sein, auch wenn die Reihe gescrollt ist
 [['.gn a.on','.gn'],['.sn a.on','.sn']].forEach(function(paar){
  var a=document.querySelector(paar[0]); if(!a)return;
  var w=a.closest(paar[1]); if(!w||w.scrollWidth<=w.clientWidth)return;
- w.scrollLeft=Math.max(0,a.offsetLeft-(w.clientWidth-a.offsetWidth)/2);
+ var l=a.offsetLeft-12,r=a.offsetLeft+a.offsetWidth+12;
+ if(l<w.scrollLeft)w.scrollLeft=Math.max(0,l);else if(r>w.scrollLeft+w.clientWidth)w.scrollLeft=r-w.clientWidth;
+ function mk(){w.classList.toggle('sl',w.scrollLeft>2);}mk();w.addEventListener('scroll',mk,{passive:true});
 });
+document.querySelectorAll('[data-print]').forEach(function(b){b.addEventListener('click',function(){window.print();});});
 document.addEventListener('change',function(e){if(e.target.matches('[data-autosubmit]'))e.target.form.submit();});
 document.addEventListener('click',function(e){
  if(e.target.closest('[data-schliessen]')){close_();return;}
@@ -3841,14 +3897,16 @@ function p_konto(): void {
         if (!$erst && !hash_equals(reg_code(), strtoupper(preg_replace('/\s+/', '', post('code'))))) {
             $err[] = 'Code stimmt nicht.';
         }
-        $user = preg_replace('/[^A-Za-z0-9._-]/', '', post('username'));
+        $user = mb_substr(preg_replace('/[^A-Za-z0-9._-]/', '', post('username')), 0, 32);
         $pw   = (string)($_POST['pw'] ?? '');
         if (mb_strlen($user) < 3) $err[] = 'Benutzername: mindestens 3 Zeichen.';
         if (val("SELECT 1 FROM users WHERE username = ?", [$user])) $err[] = 'Benutzername vergeben.';
         if ($pw !== (string)($_POST['pw2'] ?? '')) $err[] = 'Passwoerter stimmen nicht ueberein.';
         foreach (pw_problems($pw, $user) as $p) $err[] = 'Passwort: ' . $p;
         $teile = klasse_teile(post('klasse'));
-        if ($teile['kuerzel'] === '') $err[] = 'Klasse zum Beispiel 2FS152.';
+        if ($teile['kuerzel'] === '' || ($teile['stufe'] !== null && ($teile['stufe'] < 1 || $teile['stufe'] > 3))) {
+            $err[] = 'Klasse zum Beispiel 2FS152.';
+        }
         if (!$err) {
             // Alles Weitere leitet sich aus der Klasse ab oder wird gefragt, wenn es gebraucht wird.
             $uid = ins('users', ['username' => $user, 'pass_hash' => pw_hash($pw),
@@ -3923,13 +3981,14 @@ function a_neu(): void {
     $typ = post('typ', 'bericht'); $text = post('text');
     $datum = isodate(post('datum')) ? post('datum') : today();
     $rid = inull(postn('rid'));
-    if ($text === '') redirect(post('back') ?: url('start'));
+    if ($text === '') redirect(zurueck(post('back'), url('start')));
     $std = 0.0;
     if (preg_match('/(?:^|[\s\-,;(])(\d+(?:[.,]\d+)?)\s*(h|std|stunden|min)\b\.?\s*\)?\s*$/iu', $text, $m)) {
         $w = (float)str_replace(',', '.', $m[1]);
         $std = strtolower($m[2]) === 'min' ? round($w / 60, 2) : $w;
         $text = trim(preg_replace('/(?:^|[\s\-,;(])(\d+(?:[.,]\d+)?)\s*(h|std|stunden|min)\b\.?\s*\)?\s*$/iu', '', $text), " -,;\t");
     }
+    if ($text === '') { flash('Was wurde gemacht? Nur eine Zeit reicht nicht.', 'err'); redirect(zurueck(post('back'), url('start'))); }
     switch ($typ) {
         case 'notiz':
             ins('notes', ['user_id' => $uid, 'datum' => $datum, 'titel' => mb_substr($text, 0, 160),
@@ -3939,7 +3998,7 @@ function a_neu(): void {
             ins('tasks', ['user_id' => $uid, 'titel' => mb_substr($text, 0, 200), 'faellig' => $datum]);
             flash('Aufgabe angelegt.'); break;
         case 'termin':
-            ins('events', ['user_id' => $uid, 'typ' => 'probe', 'titel' => mb_substr($text, 0, 200), 'datum' => $datum]);
+            ins('events', ['user_id' => $uid, 'typ' => 'termin', 'titel' => mb_substr($text, 0, 200), 'datum' => $datum]);
             flash('Termin eingetragen.'); break;
         case 'routine':
             if ($rid) {
@@ -3966,7 +4025,7 @@ function a_neu(): void {
                 'stunden' => $std, 'category_id' => kategorie_zu($text), 'ort' => 'betrieb', 'text' => $text]);
             flash('Ins Berichtsheft uebernommen.');
     }
-    redirect(post('back') ?: url('start'));
+    redirect(zurueck(post('back'), url('start')));
 }
 
 // --- Faecher: alles zu einem Fach an einem Ort ------------------------------
@@ -4047,6 +4106,7 @@ function p_faecher(): void {
             redirect(url('faecher', ['id' => $id]));
         }
         if ($a === 'note' && $id) {    // Note im Fachkontext
+            if (!is_numeric(str_replace(',', '.', post('wert')))) { flash('Wert muss eine Zahl sein.', 'err'); redirect(url('faecher', ['id' => $id])); }
             ins('grades', ['user_id' => $uid, 'subject_id' => $id,
                 'art' => in_array(post('art'), ['schulaufgabe','kurzarbeit','test','muendlich','projekt','referat','ihk'], true) ? post('art') : 'test',
                 'skala' => in_array(post('skala'), ['note','punkte','ihk'], true) ? post('skala') : 'note',
@@ -4402,7 +4462,7 @@ function p_start(): void {
         <?php if (!$an): ?><?= em('Nichts offen.') ?><?php else: ?>
         <ul class="li rows">
           <?php foreach ($an as $x):
-            $tage = $x['d'] === '9999-12-31' ? null : (int)floor((strtotime($x['d']) - strtotime(today())) / 86400);
+            $tage = $x['d'] === '9999-12-31' ? null : tage(today(), $x['d']);
             $wann = $tage === null ? 'ohne Termin'
                   : ($tage < 0 ? abs($tage) . ' Tage ueberfaellig'
                   : ($tage === 0 ? 'heute' : ($tage === 1 ? 'morgen' : dt($x['d'], 'D d.m.'))));
@@ -4521,7 +4581,11 @@ function plan_stundenplan(array $u): void {
           <?php endfor; ?>
         </div>
       <?php endif; ?>
-      <details class="add"<?= $letzte ? '' : ' open' ?>><summary>Bearbeiten</summary>
+      <?php if (!$letzte && !$import): ?>
+        <div class="em" style="padding-bottom:6px">Noch kein Stundenplan.
+          <a href="<?= url('einrichtung') ?>">Aus WebUntis laden</a> oder unten eintragen.</div>
+      <?php endif; ?>
+      <details class="add"><summary>Bearbeiten</summary>
       <form method="post">
         <?= csrf_field() ?>
         <div class="tw"><table><thead><tr><th></th>
@@ -4560,7 +4624,7 @@ function plan_block(array $u): void {
             if (!rl('bp:' . $uid, 5, 3600)) flash('Zu viele Versuche.', 'err');
             else {
                 $r = blockplan_und_ferien($u);
-                flash($r['fehler'] !== '' ? $r['fehler'] : $r['n'] . ' Eintraege uebernommen.',
+                flash($r['fehler'] !== '' ? $r['fehler'] : $r['n'] . ' Eintraege uebernommen' . $r['ferien'] . '.',
                       $r['fehler'] !== '' ? 'err' : 'ok');
             }
         } elseif ($a === 'import') {
@@ -4594,7 +4658,7 @@ function plan_block(array $u): void {
             <li<?= $b['bis'] < today() ? ' style="opacity:.5"' : '' ?>>
               <span class="tile" style="background:<?= $b['art'] === 'schule' ? '#0f5fa8' : ($b['art'] === 'ferien' ? '#00b894' : '#ff9500') ?>">
                 <?= ic($b['art'] === 'ferien' ? 'frei' : 'plan', 17) ?></span>
-              <span class="tx"><b><?= h($b['label'] ?: ucfirst((string)$b['art'])) ?></b>
+              <span class="tx"><b><?= h(block_label($b)) ?></b>
                 <span class="sm mu2"><?= h($zeit) ?></span></span>
               <?= $jetzt ? '<span class="tg a">jetzt</span>' : ((int)$b['id'] === $naechster ? '<span class="tg o">naechste</span>' : '') ?>
               <form method="post" style="flex:none"><?= csrf_field() ?>
@@ -4818,7 +4882,7 @@ function plan_aufgaben(array $u): void {
             elseif ($id) { upd('tasks', $d, 'id = :id AND user_id = :u', ['id' => $id, 'u' => $uid]); flash('Gespeichert.'); }
             else { $d['user_id'] = $uid; ins('tasks', $d); flash('Angelegt.'); }
         } elseif ($a === 'del' && $id) { del('tasks', 'id = ? AND user_id = ?', [$id, $uid]); flash('Geloescht.'); }
-        redirect(post('back') ?: url('plan', ['t' => 'aufgaben']));
+        redirect(zurueck(post('back'), url('plan', ['t' => 'aufgaben'])));
     }
     $st = get('status') ?: 'offen';
     $be = get('bereich');
@@ -5041,6 +5105,7 @@ function p_noten(): void {
         csrf_check();
         $a = post('a'); $id = (int)post('id', '0');
         if ($a === 'save') {
+            if (!is_numeric(str_replace(',', '.', post('wert')))) { flash('Wert muss eine Zahl sein.', 'err'); redirect(url('noten')); }
             $d = ['subject_id' => inull(postn('subject_id')), 'fach_text' => mb_substr(post('fach_text'), 0, 60),
                 'art' => in_array(post('art'), ['schulaufgabe','kurzarbeit','test','muendlich','projekt','referat','ihk'], true) ? post('art') : 'test',
                 'skala' => in_array(post('skala'), ['note','punkte','ihk'], true) ? post('skala') : 'note',
@@ -5490,6 +5555,7 @@ function bh_druck(array $u, array $rep, array $s): void {
     $ss = array_sum(array_map(fn($r) => (float)$r['stunden'], $schule));
     ob_start(); ?>
     <div class="rw np" style="justify-content:flex-end;margin-bottom:10px">
+      <button class="p s" type="button" data-print><?= ic('datei', 15) ?> Drucken</button>
       <a class="bt s g" href="<?= h($weiter) ?>&amp;dok=1">Angaben aendern</a>
       <a class="bt s g" href="<?= h($zurueck) ?>">&larr; zurueck</a></div>
     <div class="c"><div class="bo">
@@ -5566,7 +5632,7 @@ function bh_routinen(array $u): void {
                      AND id NOT IN (SELECT routine_id FROM routine_logs)", [$uid]);
             flash($n . ' entfernt.');
         }
-        redirect(post('back') ?: url('berichtsheft', ['t' => 'routinen']));
+        redirect(zurueck(post('back'), url('berichtsheft', ['t' => 'routinen'])));
     }
     $mo = date('Y-m-d', strtotime('monday this week'));
     $rt = all("SELECT r.*, c.name AS kat, (SELECT MAX(datum) FROM routine_logs l WHERE l.routine_id = r.id) AS letzte,
@@ -6235,7 +6301,7 @@ function p_pruefung(): void {
     $ihk = json_decode((string)val("SELECT v FROM meta WHERE k = ?", ['ihk' . $uid], '{}'), true) ?: [];
     $pg  = ihk_prognose($ihk);
     $pb  = ihk_probleme($ihk);
-    $cd  = function (?string $d): ?int { return $d ? (int)ceil((strtotime($d) - strtotime(today())) / 86400) : null; };
+    $cd  = function (?string $d): ?int { return $d ? tage(today(), $d) : null; };
     $a1 = $cd($u['ap1']); $a2 = $cd($u['ap2']);
     $tab = get('t');
     ob_start(); ?>
@@ -6312,7 +6378,7 @@ function p_pruefung(): void {
 function p_suche(): void {
     $u = need_login(); $uid = (int)$u['id']; $qs = get('q');
     $antwort = such_antwort($u, $qs);
-    $ziele   = mb_strlen($qs) >= 1 ? ziele_suchen($qs, 5) : [];
+    $ziele   = ziele_suchen($qs, $qs === '' ? 10 : 5);   // leer: die Ziele, die man am haeufigsten braucht
     $treffer = mb_strlen($qs) >= 2 ? suche($uid, $qs, 60) : [];
     ob_start(); ?>
 
@@ -6385,79 +6451,114 @@ function p_einrichtung(): void {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         csrf_check();
         $a = post('a');
+        $merken = function (array $w) { $_SESSION['einr'] = $w; };   // Eingaben ueber den Fehler hinweg behalten
         if ($a === 'untis') {
-            if (!rl('untis:' . $uid, 8, 600)) { flash('Zu viele Versuche.', 'err'); redirect(url('einrichtung')); }
-            $srv = preg_match('~^[a-z0-9.-]+\.webuntis\.com$~i', post('server')) ? post('server') : ($fs ? UNTIS_SERVER_FS : '');
-            $sch = mb_substr(preg_replace('/[^A-Za-z0-9._-]/', '', post('schule')) ?: ($fs ? UNTIS_SCHULE_FS : ''), 0, 60);
-            $ben = mb_substr(post('benutzer'), 0, 80);
+            if (!rl('untis:' . $uid, 8, 600)) { flash('Zu viele Versuche - kurz warten.', 'err'); redirect(url('einrichtung')); }
+            $alt = one("SELECT * FROM sources WHERE user_id = ? AND typ = 'webuntis' ORDER BY aktiv DESC, id DESC", [$uid]);
+            // Server: Schema und Pfad abschneiden, dann ein schlichter Hostname
+            $srv = strtolower(trim(preg_replace('~^https?://~i', '', post('server'))));
+            $srv = explode('/', $srv)[0];
+            if ($srv === '') $srv = $fs ? UNTIS_SERVER_FS : (string)($alt['server'] ?? '');
+            if (!preg_match('~^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$~', $srv)) $srv = '';
+            $sch = mb_substr(preg_replace('/[^A-Za-z0-9._-]/', '', post('schule')), 0, 60);
+            if ($sch === '') $sch = $fs ? UNTIS_SCHULE_FS : (string)($alt['schule'] ?? '');
+            $ben = mb_substr(post('benutzer'), 0, 80) ?: (string)($alt['benutzer'] ?? '');
             $pw  = (string)($_POST['pw'] ?? '');
-            if ($srv === '' || $sch === '' || $ben === '' || $pw === '') { flash('Server, Schule, Benutzer und Passwort noetig.', 'err'); redirect(url('einrichtung')); }
-            $c = verschluesseln($pw);
-            if ($c === null) { flash('Ohne die PHP-Extension sodium kann kein Passwort gespeichert werden.', 'err'); redirect(url('einrichtung')); }
-            $alt = one("SELECT id FROM sources WHERE user_id = ? AND typ = 'webuntis'", [$uid]);
+            $fehlt = [];
+            if (!$fs && $srv === '') $fehlt[] = 'Server';
+            if (!$fs && $sch === '') $fehlt[] = 'Schule';
+            if ($ben === '') $fehlt[] = 'Benutzer';
+            if ($pw === '' && empty($alt['secret'])) $fehlt[] = 'Passwort';
+            if ($fehlt) { $merken(['benutzer' => $ben, 'server' => $srv, 'schule' => $sch]); flash(implode(', ', $fehlt) . ' fehlt.', 'err'); redirect(url('einrichtung')); }
             $d = ['name' => 'WebUntis', 'typ' => 'webuntis', 'modus' => 'stundenplan',
-                  'server' => $srv, 'schule' => $sch, 'benutzer' => $ben, 'secret' => $c,
-                  'intervall' => 360, 'aktiv' => 1];
+                  'server' => $srv, 'schule' => $sch, 'benutzer' => $ben, 'intervall' => 360, 'aktiv' => 1];
+            if ($pw !== '') {
+                $c = verschluesseln($pw);
+                if ($c === null) { flash('Ohne die PHP-Extension sodium kann kein Passwort gespeichert werden.', 'err'); redirect(url('einrichtung')); }
+                $d['secret'] = $c;
+            }
             if ($alt) { upd('sources', $d, 'id = :id AND user_id = :u', ['id' => (int)$alt['id'], 'u' => $uid]); $sid = (int)$alt['id']; }
             else { $d['user_id'] = $uid; $sid = ins('sources', $d); }
-            $r = einr_sync($sid, $u);
-            flash($r['fehler'] !== '' ? 'WebUntis: ' . $r['fehler'] : 'WebUntis verbunden, ' . $r['n'] . ' Stunden geladen.',
-                  $r['fehler'] !== '' ? 'err' : 'ok');
+            $r = einr_sync($sid, $u, 15);
+            if ($r['fehler'] !== '') {
+                $m = str_contains($r['fehler'], 'bad credentials') ? 'Benutzername oder Passwort falsch.' : $r['fehler'];
+                $merken(['benutzer' => $ben, 'server' => $srv, 'schule' => $sch]);
+                flash('WebUntis: ' . $m, 'err');
+            } else flash('WebUntis verbunden, ' . $r['n'] . ' Stunden geladen.');
         } elseif ($a === 'block') {
-            if (!rl('bp:' . $uid, 5, 3600)) { flash('Zu viele Versuche.', 'err'); redirect(url('einrichtung')); }
+            if (!rl('bp:' . $uid, 5, 3600)) { flash('Zu viele Versuche - kurz warten.', 'err'); redirect(url('einrichtung')); }
             $r = blockplan_und_ferien($u);
-            flash($r['fehler'] !== '' ? $r['fehler'] : $r['n'] . ' Eintraege geladen, Ferien dazu.',
+            flash($r['fehler'] !== '' ? $r['fehler'] : $r['n'] . ' Eintraege geladen' . $r['ferien'] . '.',
                   $r['fehler'] !== '' ? 'err' : 'ok');
         } elseif ($a === 'moodle') {
-            if (!rl('untis:' . $uid, 8, 600)) { flash('Zu viele Versuche.', 'err'); redirect(url('einrichtung')); }
-            $m = moodle_teile(post('url'));
-            if ($m['fehler'] !== '') { flash($m['fehler'], 'err'); redirect(url('einrichtung')); }
+            if (!rl('untis:' . $uid, 8, 600)) { flash('Zu viele Versuche - kurz warten.', 'err'); redirect(url('einrichtung')); }
+            $alt = one("SELECT * FROM sources WHERE user_id = ? AND typ = 'moodle' ORDER BY aktiv DESC, id DESC", [$uid]);
+            $roh = trim(post('url'));
+            if ($roh === '' && $alt && !empty($alt['secret'])) {
+                // Nur neu laden, Adresse und Geheimnis bleiben
+                upd('sources', ['aktiv' => 1], 'id = :id', ['id' => (int)$alt['id']]);
+                $r = einr_sync((int)$alt['id'], $u, 15);
+                flash($r['fehler'] !== '' ? 'Moodle: ' . $r['fehler'] : 'Moodle: ' . $r['n'] . ' Termine geladen.', $r['fehler'] !== '' ? 'err' : 'ok');
+                redirect(url('einrichtung'));
+            }
+            $m = moodle_teile($roh);
+            if ($m['fehler'] !== '') { $merken(['url' => $roh]); flash($m['fehler'], 'err'); redirect(url('einrichtung')); }
             $c = verschluesseln($m['voll']);
             if ($c === null) { flash('Ohne die PHP-Extension sodium wird die Adresse nicht gespeichert.', 'err'); redirect(url('einrichtung')); }
-            $alt = one("SELECT id FROM sources WHERE user_id = ? AND typ = 'moodle'", [$uid]);
             $d = ['name' => 'Moodle', 'typ' => 'moodle', 'modus' => 'termine',
                   'url' => $m['anzeige'], 'secret' => $c, 'intervall' => 360, 'aktiv' => 1];
             if ($alt) { upd('sources', $d, 'id = :id AND user_id = :u', ['id' => (int)$alt['id'], 'u' => $uid]); $sid = (int)$alt['id']; }
             else { $d['user_id'] = $uid; $sid = ins('sources', $d); }
-            $r = einr_sync($sid, $u);
-            flash($r['fehler'] !== '' ? 'Moodle: ' . $r['fehler'] : 'Moodle verbunden, ' . $r['n'] . ' Termine geladen.',
-                  $r['fehler'] !== '' ? 'err' : 'ok');
+            $r = einr_sync($sid, $u, 15);
+            if ($r['fehler'] !== '') { $merken(['url' => $roh]); flash('Moodle: ' . $r['fehler'], 'err'); }
+            else flash('Moodle verbunden, ' . $r['n'] . ' Termine geladen.');
         } elseif ($a === 'alles') {
-            if (!rl('alles:' . $uid, 6, 600)) { flash('Zu viele Versuche.', 'err'); redirect(url('einrichtung')); }
-            $teile = [];
-            if ($fs && !val("SELECT 1 FROM blocks WHERE user_id = ? AND label LIKE 'Blockplan%'", [$uid])) {
+            if (!rl('alles:' . $uid, 6, 600)) { flash('Zu viele Versuche - kurz warten.', 'err'); redirect(url('einrichtung')); }
+            $teile = []; $fehl = false;
+            if ($fs && (int)$u['zeitgruppe'] > 0) {   // Blockplan gehoert immer dazu, auch zum Aktualisieren
                 $r = blockplan_und_ferien($u);
-                $teile[] = $r['fehler'] === '' ? $r['n'] . ' Blockeintraege' : 'Blockplan: ' . $r['fehler'];
+                if ($r['fehler'] === '') $teile[] = 'Blockplan ' . $r['n'];
+                else { $teile[] = 'Blockplan: ' . $r['fehler']; $fehl = true; }
             }
-            foreach (all("SELECT * FROM sources WHERE user_id = ? AND aktiv = 1 AND typ <> 'feiertage'", [$uid]) as $src) {
-                $r = einr_sync((int)$src['id'], $u);
+            foreach (all("SELECT * FROM sources WHERE user_id = ? AND aktiv = 1 AND typ <> 'feiertage' ORDER BY id", [$uid]) as $src) {
+                $r = einr_sync((int)$src['id'], $u, 12);
                 $einheit = $src['typ'] === 'webuntis' && $src['modus'] === 'stundenplan' ? ' Stunden' : ' Termine';
-                $teile[] = $src['name'] . ': ' . ($r['fehler'] === '' ? $r['n'] . $einheit : $r['fehler']);
+                if ($r['fehler'] === '') $teile[] = $src['name'] . ' ' . $r['n'] . $einheit;
+                else { $teile[] = $src['name'] . ': ' . $r['fehler']; $fehl = true; }
             }
-            flash($teile ? implode(' · ', $teile) : 'Noch nichts zum Laden - verbinde zuerst eine App.');
+            flash($teile ? implode(' · ', $teile) : 'Noch nichts verbunden.', $fehl ? 'err' : 'ok');
         } elseif ($a === 'trennen') {
             $id = (int)post('id', '0');
-            del('events', 'user_id = ? AND quelle = ?', [$uid, 'q' . $id]);
-            del('blocks', 'user_id = ? AND quelle = ?', [$uid, 'q' . $id]);
-            del('sources', 'id = ? AND user_id = ?', [$id, $uid]);
-            flash('Getrennt.', 'warn');
+            $n = del('sources', 'id = ? AND user_id = ?', [$id, $uid]);
+            if ($n) {
+                del('events', 'user_id = ? AND quelle = ?', [$uid, 'q' . $id]);
+                del('blocks', 'user_id = ? AND quelle = ?', [$uid, 'q' . $id]);
+                flash('Getrennt.', 'warn');
+            } else flash('Nichts zu trennen.', 'err');
         }
         redirect(url('einrichtung'));
     }
 
-    $untis  = one("SELECT * FROM sources WHERE user_id = ? AND typ = 'webuntis'", [$uid]);
-    $moodle = one("SELECT * FROM sources WHERE user_id = ? AND typ = 'moodle'", [$uid]);
+    $alt = $_SESSION['einr'] ?? []; unset($_SESSION['einr']);
+    $untis  = one("SELECT * FROM sources WHERE user_id = ? AND typ = 'webuntis' AND aktiv = 1 ORDER BY id DESC", [$uid]);
+    $moodle = one("SELECT * FROM sources WHERE user_id = ? AND typ = 'moodle' AND aktiv = 1 ORDER BY id DESC", [$uid]);
     $blocks = (int)val("SELECT COUNT(*) FROM blocks WHERE user_id = ? AND label LIKE 'Blockplan%'", [$uid], 0);
     $ferien = (bool)val("SELECT 1 FROM sources WHERE user_id = ? AND typ = 'feiertage'", [$uid]);
-    $verbunden = ($untis ? 1 : 0) + ($moodle ? 1 : 0) + ($blocks ? 1 : 0);
-    $anzahl = fn(?array $src) => $src ? (int)val("SELECT COUNT(*) FROM events WHERE user_id = ? AND quelle = ?", [$uid, 'q' . $src['id']], 0) : 0;
+    $gut = fn(?array $src) => $src && $src['status'] !== 'fehler';
+    $verbunden = ($gut($untis) ? 1 : 0) + ($gut($moodle) ? 1 : 0) + ($blocks ? 1 : 0);
+    $anzahl = fn(?array $src) => $src ? (int)$src['anzahl'] : 0;
     $stand = fn(?array $src) => $src && $src['letzter_sync'] ? date('d.m. H:i', (int)$src['letzter_sync']) : '';
-
+    // Eine Zeile Zustand je Karte: verbunden mit Stand und Zahl, oder der Fehler in Rot
+    $zeile = function (?array $src, string $einheit, string $sonst) use ($gut, $anzahl, $stand): string {
+        if (!$src) return h($sonst);
+        if (!$gut($src)) return '<span style="color:var(--er)">' . h($src['meldung'] ?: 'Abruf fehlgeschlagen.') . '</span>';
+        return 'verbunden' . ($stand($src) ? ' · ' . h($stand($src)) : '') . ' · ' . $anzahl($src) . ' ' . $einheit;
+    };
     ob_start(); ?>
-    <?php if ($verbunden): ?>
+    <?php if ($verbunden || $untis || $moodle): ?>
       <form method="post" class="c np"><div class="bo rw" style="padding:11px 15px">
         <?= csrf_field() ?><input type="hidden" name="a" value="alles">
-        <div><b>Verbunden</b><div class="sm mu2"><?= $verbunden ?> von 3 · <?= $blocks ?> Blockeintraege<?= $untis ? ' · ' . $anzahl($untis) . ' Stunden' : '' ?><?= $moodle ? ' · ' . $anzahl($moodle) . ' Termine' : '' ?></div></div>
+        <div><b>Verbunden</b><div class="sm mu2"><?= $verbunden ?> von 3<?= $blocks ? ' · ' . $blocks . ' Blockeintraege' : '' ?><?= $gut($untis) ? ' · ' . $anzahl($untis) . ' Stunden' : '' ?><?= $gut($moodle) ? ' · ' . $anzahl($moodle) . ' Termine' : '' ?><?= (($untis && !$gut($untis)) || ($moodle && !$gut($moodle))) ? ' · <span style="color:var(--er)">eine Quelle meldet einen Fehler</span>' : '' ?></div></div>
         <span class="sp"></span>
         <button class="p" type="submit">Alles aktualisieren</button>
       </div></form>
@@ -6475,8 +6576,9 @@ function p_einrichtung(): void {
             <div class="sm mu2"><?php if ($blocks): ?><?= $blocks ?> Eintraege<?= $ferien ? ', Ferien geladen' : '' ?><?php else: ?>Aus dem oeffentlichen Plan der Schule - ohne Zugangsdaten.<?php endif; ?></div></div>
         </div>
         <form method="post" style="margin-top:11px"><?= csrf_field() ?><input type="hidden" name="a" value="block">
-          <button class="<?= $blocks ? 'g s' : 'p' ?>" type="submit"><?= $blocks ? 'Aktualisieren' : 'Holen' ?></button>
-          <?php if (!$fs): ?><span class="sm mu2" style="margin-left:8px">Blockplan der BS FiSi Muenchen</span><?php endif; ?>
+          <button class="<?= $blocks ? 'g s' : 'p' ?>" type="submit"<?= (int)$u['zeitgruppe'] < 1 ? ' disabled' : '' ?>><?= $blocks ? 'Aktualisieren' : 'Holen' ?></button>
+          <?php if ((int)$u['zeitgruppe'] < 1): ?><span class="sm" style="margin-left:8px;color:var(--er)">Klasse ohne Zeitgruppe - im Profil ergaenzen.</span>
+          <?php elseif (!$fs): ?><span class="sm mu2" style="margin-left:8px">Blockplan der BS FiSi Muenchen</span><?php endif; ?>
         </form>
       </div></div>
 
@@ -6485,21 +6587,21 @@ function p_einrichtung(): void {
         <div class="rw" style="gap:10px;align-items:flex-start">
           <span class="tile" style="background:#e8500e"><?= ic('raster', 18) ?></span>
           <div style="flex:1;min-width:0"><b>Stundenplan (WebUntis)</b>
-            <div class="sm mu2"><?php if ($untis): ?>verbunden<?= $stand($untis) ? ' · ' . $stand($untis) : '' ?> · <?= $anzahl($untis) ?> Stunden<?php else: ?>Dein Stundenplan direkt aus WebUntis.<?php endif; ?></div></div>
+            <div class="sm mu2"><?= $zeile($untis, 'Stunden', 'Dein Stundenplan direkt aus WebUntis.') ?></div></div>
         </div>
         <form method="post" style="margin-top:11px"><?= csrf_field() ?><input type="hidden" name="a" value="untis">
           <?php if (!$fs): ?>
             <div class="fg">
-              <div class="f"><label for="us">Server</label><input id="us" name="server" value="<?= h($untis['server'] ?? '') ?>" placeholder="mese.webuntis.com"></div>
-              <div class="f"><label for="uc">Schule</label><input id="uc" name="schule" value="<?= h($untis['schule'] ?? '') ?>"></div>
+              <div class="f"><label for="us">Server</label><input id="us" name="server" value="<?= h($alt['server'] ?? $untis['server'] ?? '') ?>" placeholder="mese.webuntis.com"></div>
+              <div class="f"><label for="uc">Schule</label><input id="uc" name="schule" value="<?= h($alt['schule'] ?? $untis['schule'] ?? '') ?>"></div>
             </div>
           <?php endif; ?>
           <div class="fg">
-            <div class="f"><label for="ub">Benutzer</label><input id="ub" name="benutzer" value="<?= h($untis['benutzer'] ?? '') ?>" autocomplete="off"></div>
-            <div class="f"><label for="up">Passwort</label><input id="up" name="pw" type="password" autocomplete="new-password" placeholder="<?= $untis ? 'gespeichert' : '' ?>"></div>
+            <div class="f"><label for="ub">Benutzer</label><input id="ub" name="benutzer" value="<?= h($alt['benutzer'] ?? $untis['benutzer'] ?? '') ?>" autocomplete="off"></div>
+            <div class="f"><label for="up">Passwort</label><input id="up" name="pw" type="password" autocomplete="new-password" placeholder="<?= !empty($untis['secret']) ? 'gespeichert - leer lassen zum Behalten' : '' ?>"></div>
           </div>
-          <div class="rw"><button class="<?= $untis ? 'g s' : 'p' ?>" type="submit"><?= $untis ? 'Aktualisieren' : 'Verbinden' ?></button>
-            <?php if ($untis): ?><button class="g s d" name="a" value="trennen" type="submit" data-q="WebUntis trennen?" formnovalidate><input type="hidden" name="id" value="<?= (int)$untis['id'] ?>">Trennen</button><?php endif; ?></div>
+          <div class="rw"><button class="<?= $gut($untis) ? 'g s' : 'p' ?>" type="submit"><?= $untis ? 'Aktualisieren' : 'Verbinden' ?></button>
+            <?php if ($untis): ?><input type="hidden" name="id" value="<?= (int)$untis['id'] ?>"><button class="g s d" name="a" value="trennen" type="submit" data-q="WebUntis trennen? Geladene Stunden verschwinden." formnovalidate>Trennen</button><?php endif; ?></div>
         </form>
       </div></div>
 
@@ -6508,14 +6610,14 @@ function p_einrichtung(): void {
         <div class="rw" style="gap:10px;align-items:flex-start">
           <span class="tile" style="background:#f7931e"><?= ic('import', 18) ?></span>
           <div style="flex:1;min-width:0"><b>Moodle / mebis</b>
-            <div class="sm mu2"><?php if ($moodle): ?>verbunden<?= $stand($moodle) ? ' · ' . $stand($moodle) : '' ?> · <?= $anzahl($moodle) ?> Termine<?php else: ?>Abgabefristen und Termine aus dem Kurskalender.<?php endif; ?></div></div>
+            <div class="sm mu2"><?= $zeile($moodle, 'Termine', 'Abgabefristen und Termine aus dem Kurskalender.') ?></div></div>
         </div>
         <form method="post" style="margin-top:11px"><?= csrf_field() ?><input type="hidden" name="a" value="moodle">
           <div class="f"><label for="mu">Kalender-Adresse</label>
-            <input id="mu" name="url" placeholder="https://.../calendar/export_execute.php?...">
+            <input id="mu" name="url" value="<?= h($alt['url'] ?? '') ?>" placeholder="<?= $moodle ? 'leer lassen zum Behalten, neue Adresse zum Wechseln' : 'https://.../calendar/export_execute.php?...' ?>">
             <div class="sm mu2" style="margin-top:4px">In Moodle: Kalender &rsaquo; Kalender exportieren &rsaquo; Kalender-URL abfragen.</div></div>
-          <div class="rw"><button class="<?= $moodle ? 'g s' : 'p' ?>" type="submit"><?= $moodle ? 'Neu verbinden' : 'Verbinden' ?></button>
-            <?php if ($moodle): ?><button class="g s d" name="a" value="trennen" type="submit" data-q="Moodle trennen?" formnovalidate><input type="hidden" name="id" value="<?= (int)$moodle['id'] ?>">Trennen</button><?php endif; ?></div>
+          <div class="rw"><button class="<?= $gut($moodle) ? 'g s' : 'p' ?>" type="submit"><?= $moodle ? 'Aktualisieren' : 'Verbinden' ?></button>
+            <?php if ($moodle): ?><input type="hidden" name="id" value="<?= (int)$moodle['id'] ?>"><button class="g s d" name="a" value="trennen" type="submit" data-q="Moodle trennen? Geladene Termine verschwinden." formnovalidate>Trennen</button><?php endif; ?></div>
         </form>
       </div></div>
 
@@ -6534,10 +6636,10 @@ function p_einrichtung(): void {
 }
 
 /** Eine Quelle sofort abrufen und den Status setzen. */
-function einr_sync(int $sid, array $u): array {
+function einr_sync(int $sid, array $u, int $timeout = 20): array {
     $src = one("SELECT * FROM sources WHERE id = ? AND user_id = ?", [$sid, (int)$u['id']]);
-    if (!$src) return ['fehler' => 'Quelle weg.', 'n' => 0];
-    try { return quelle_sync($src, $u); }
+    if (!$src) return ['fehler' => 'Quelle nicht gefunden.', 'n' => 0];
+    try { return quelle_sync($src, $u, $timeout); }
     catch (Throwable $ex) { quelle_status($sid, 'fehler', $ex->getMessage()); return ['fehler' => $ex->getMessage(), 'n' => 0]; }
 }
 
@@ -6556,7 +6658,8 @@ function p_einstellungen(): void {
                 'kl_kuerzel' => $teile['kuerzel'], 'kl_nr' => $teile['nr'], 'verkuerzt' => $teile['verkuerzt'],
                 'zeitgruppe' => max(0, min(9, (int)$teile['zeitgruppe'])), 'klasse' => $kl,
                 'beruf' => mb_substr(post('beruf'), 0, 100),
-                'start' => post('start') ?: null, 'ende' => post('ende') ?: null];
+                'start' => isodate(post('start')) ? post('start') : null,
+                'ende'  => isodate(post('ende'))  ? post('ende')  : null];
             // Die abgeleitete Stufe altert nur mit, wenn die Klasse gleich bleibt
             if ($kl !== (string)$u['klasse'] && $teile['stufe'] !== null) {
                 $d['kl_stufe'] = max(1, min(3, (int)$teile['stufe']));
@@ -6617,12 +6720,15 @@ function p_einstellungen(): void {
                     $d['modus'] = 'termine';
                 }
             }
-            if ($d['typ'] === 'ics' && !filter_var($d['url'], FILTER_VALIDATE_URL)) flash('iCal-Adresse fehlt.', 'err');
-            elseif ($id) { upd('sources', $d, 'id = :id AND user_id = :u', ['id' => $id, 'u' => $uid]); flash('Gespeichert.'); }
+            if ($d['typ'] === 'ics' && !str_starts_with($d['url'], 'https://')) {
+                flash('iCal-Adresse muss mit https:// beginnen.', 'err');
+                redirect(url('einstellungen', ['t' => 'quellen'] + ($id ? ['id' => $id] : ['neu' => 1])));
+            }
+            if ($id) { upd('sources', $d, 'id = :id AND user_id = :u', ['id' => $id, 'u' => $uid]); flash('Gespeichert.'); }
             else { $d['user_id'] = $uid; $id = ins('sources', $d); flash('Quelle angelegt.'); }
             // Verbinden heisst laden: die frische Quelle gleich abrufen
             if ((int)($d['aktiv'] ?? 1) === 1 && in_array($d['typ'], ['webuntis','moodle','ics'], true)) {
-                $r = einr_sync($id, $u);
+                $r = einr_sync($id, $u, 15);
                 if ($r['fehler'] !== '') flash($r['fehler'], 'err');
                 elseif ($r['n'] > 0) flash($r['n'] . ' geladen.');
             }
@@ -7401,7 +7507,7 @@ function a_api(): void {
 }
 
 // --- Router ----------------------------------------------------------------
-$p = $_GET['p'] ?? 'start';
+$p = is_string($_GET['p'] ?? null) ? $_GET['p'] : 'start';
 if (!is_string($p)) $p = 'start';
 if ($p === 'ics') a_ics();
 session_check();
@@ -7414,7 +7520,8 @@ switch ($p) {
     case 'konto':         p_konto(); break;
     case 'abbruch':       unset($_SESSION['2fa']); redirect(url('login'));
     case 'logout':
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') csrf_check();
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') redirect(url('start'));   // kein Abmelden per Link
+        csrf_check();
         logout();
     case 'theme':
         need_login(); csrf_check();
